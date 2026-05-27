@@ -80,6 +80,7 @@ export function buildNodeTooOldBanner(nodeVersion: string): string {
  * `node:sqlite` is unavailable. True on Node < 22.5.
  */
 export function needsWasmFallback(): boolean {
+  if (process.env.CODEGRAPH_FORCE_WASM) return true;
   try {
     require('node:sqlite');
     return false;

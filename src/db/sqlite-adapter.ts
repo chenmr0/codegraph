@@ -184,6 +184,7 @@ class SqlJsAdapter implements SqliteDatabase {
   private _db: any;
   private _dbPath: string;
   private _open = true;
+  private _stmts: any[] = [];
 
   constructor(dbPath: string) {
     if (!SqlJsDatabase) {
@@ -208,52 +209,82 @@ class SqlJsAdapter implements SqliteDatabase {
 
   prepare(sql: string): SqliteStatement {
     const stmt = this._db.prepare(sql);
+    this._stmts.push(stmt);
     const db = this._db;
+
+    // Bind params to sql.js statement.
+    // Named params: single object → pass as-is (sql.js binds by name).
+    // Positional params: array of values → pass the array.
+    function bindParams(rawParams: any[]): boolean {
+      if (rawParams.length === 0) return true;
+      // Single object (named params after prefix transformation)
+      if (
+        rawParams.length === 1 &&
+        rawParams[0] !== null &&
+        typeof rawParams[0] === 'object' &&
+        !Array.isArray(rawParams[0])
+      ) {
+        return stmt.bind(rawParams[0]);
+      }
+      // Positional params — spread into an array for sql.js
+      return stmt.bind(rawParams);
+    }
+
     return {
       run(...params: any[]) {
         const bound = prefixNamedParams(params);
-        if (bound.length > 0) {
-          stmt.bind(bound[0]);
+        const ok = bindParams(bound);
+        if (!ok) throw new Error(`sql.js bind() failed for SQL: ${sql.substring(0, 120)}`);
+        try {
+          stmt.step();
+        } catch (e: any) {
+          throw new Error(`sql.js step() failed: ${e.message}\n  SQL: ${sql.substring(0, 120)}`);
         }
-        stmt.step();
         stmt.reset();
         const changes = db.getRowsModified();
         const rowidResult = db.exec('SELECT last_insert_rowid()');
         const lastInsertRowid = rowidResult?.[0]?.values?.[0]?.[0] ?? 0;
-        stmt.free();
         return { changes, lastInsertRowid };
       },
       get(...params: any[]) {
         const bound = prefixNamedParams(params);
-        if (bound.length > 0) {
-          stmt.bind(bound[0]);
-        }
+        const ok = bindParams(bound);
+        if (!ok) throw new Error(`sql.js bind() failed for SQL: ${sql.substring(0, 120)}`);
         let result: any = undefined;
-        if (stmt.step()) {
-          result = stmt.getAsObject();
+        try {
+          if (stmt.step()) {
+            result = stmt.getAsObject();
+          }
+        } catch (e: any) {
+          throw new Error(`sql.js get() step failed: ${e.message}\n  SQL: ${sql.substring(0, 120)}`);
         }
         stmt.reset();
-        stmt.free();
         return result;
       },
       all(...params: any[]) {
         const bound = prefixNamedParams(params);
-        if (bound.length > 0) {
-          stmt.bind(bound[0]);
-        }
+        const ok = bindParams(bound);
+        if (!ok) throw new Error(`sql.js bind() failed for SQL: ${sql.substring(0, 120)}`);
         const results: any[] = [];
-        while (stmt.step()) {
-          results.push(stmt.getAsObject());
+        try {
+          while (stmt.step()) {
+            results.push(stmt.getAsObject());
+          }
+        } catch (e: any) {
+          throw new Error(`sql.js all() step failed: ${e.message}\n  SQL: ${sql.substring(0, 120)}`);
         }
         stmt.reset();
-        stmt.free();
         return results;
       },
     };
   }
 
   exec(sql: string): void {
-    this._db.run(sql);
+    try {
+      this._db.run(sql);
+    } catch (e: any) {
+      throw new Error(`sql.js exec() failed: ${e.message}\n  SQL: ${sql.substring(0, 200)}`);
+    }
   }
 
   pragma(str: string, options?: { simple?: boolean }): any {
@@ -317,6 +348,10 @@ class SqlJsAdapter implements SqliteDatabase {
 
   close(): void {
     if (!this._open) return;
+    for (const s of this._stmts) {
+      try { s.free(); } catch { /* already freed */ }
+    }
+    this._stmts = [];
     this.flush();
     this._db.close();
     this._open = false;
@@ -334,10 +369,13 @@ class SqlJsAdapter implements SqliteDatabase {
  * For the WASM path, call `ensureSqlJsReady()` before this function.
  */
 export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
-  // Try node:sqlite first (full performance, WAL, native)
-  try {
-    return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
-  } catch { /* unavailable, try fallback */ }
+  // Try node:sqlite first (full performance, WAL, native).
+  // CODEGRAPH_FORCE_WASM=1 skips node:sqlite to test the WASM fallback.
+  if (!process.env.CODEGRAPH_FORCE_WASM) {
+    try {
+      return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
+    } catch { /* unavailable, try fallback */ }
+  }
 
   // Fallback: sql.js WASM backend (no native deps, no WAL)
   if (SqlJsDatabase) {
