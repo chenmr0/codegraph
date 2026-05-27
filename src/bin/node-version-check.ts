@@ -45,7 +45,7 @@ export function buildNode25BlockBanner(nodeVersion: string): string {
  * *warns* on install (unless the user set `engine-strict`), so the CLI bootstrap
  * also hard-blocks here to actually enforce the floor.
  */
-export const MIN_NODE_MAJOR = 20;
+export const MIN_NODE_MAJOR = 18;
 
 /**
  * Build the bordered banner shown when CodeGraph detects a Node.js major below
@@ -73,4 +73,17 @@ export function buildNodeTooOldBanner(nodeVersion: string): string {
     '  CODEGRAPH_ALLOW_UNSAFE_NODE=1 codegraph ...',
     sep,
   ].join('\n');
+}
+
+/**
+ * Check whether the WASM SQLite fallback (sql.js) is needed because
+ * `node:sqlite` is unavailable. True on Node < 22.5.
+ */
+export function needsWasmFallback(): boolean {
+  try {
+    require('node:sqlite');
+    return false;
+  } catch {
+    return true;
+  }
 }

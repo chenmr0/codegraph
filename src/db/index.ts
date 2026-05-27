@@ -26,14 +26,16 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
  */
-function configureConnection(db: SqliteDatabase): void {
+function configureConnection(db: SqliteDatabase, backend: SqliteBackend): void {
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
-  db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
+  db.pragma('journal_mode = WAL');       // silently ignored by sql.js (stays delete)
   db.pragma('synchronous = NORMAL');     // safe with WAL mode
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
-  db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+  if (backend === 'node-sqlite') {
+    db.pragma('mmap_size = 268435456');  // 256 MB memory-mapped I/O — WASM can't do this
+  }
 }
 
 /**
@@ -63,7 +65,7 @@ export class DatabaseConnection {
     // Create and configure database
     const { db, backend } = createDatabase(dbPath);
 
-    configureConnection(db);
+    configureConnection(db, backend);
 
     // Run schema initialization
     const schemaPath = path.join(__dirname, 'schema.sql');
@@ -91,7 +93,7 @@ export class DatabaseConnection {
 
     const { db, backend } = createDatabase(dbPath);
 
-    configureConnection(db);
+    configureConnection(db, backend);
 
     // Check and run migrations if needed
     const conn = new DatabaseConnection(db, dbPath, backend);
@@ -213,6 +215,10 @@ export class DatabaseConnection {
       this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
     } catch {
       // ignore (e.g., not in WAL mode)
+    }
+    // sql.js is in-memory — persist to disk after bulk writes
+    if (this.backend === 'sql-js') {
+      (this.db as any).flush?.();
     }
   }
 

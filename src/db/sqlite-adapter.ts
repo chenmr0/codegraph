@@ -5,9 +5,9 @@
  * through a small better-sqlite3-shaped interface so the rest of the codebase
  * is storage-agnostic.
  *
- * CodeGraph ships with a bundled Node runtime, so `node:sqlite` (real SQLite,
- * with WAL + FTS5) is always available — there is no native build step and no
- * wasm fallback. When run from source instead, it requires Node >= 22.5.
+ * When `node:sqlite` is unavailable (Node < 22.5), falls back to sql.js
+ * (WASM-based SQLite). The WASM backend lacks WAL and mmap but supports FTS5
+ * and all query features needed by CodeGraph.
  */
 
 export interface SqliteStatement {
@@ -26,19 +26,18 @@ export interface SqliteDatabase {
 }
 
 /**
- * The active SQLite backend. Only one now (`node:sqlite`); kept as a named type
- * so `codegraph status` and the per-instance reporting have a stable shape.
+ * The active SQLite backend. `node-sqlite` is the primary (full features);
+ * `sql-js` is the WASM fallback (no WAL/mmap, but FTS5 works).
  */
-export type SqliteBackend = 'node-sqlite';
+export type SqliteBackend = 'node-sqlite' | 'sql-js';
+
+// ---------------------------------------------------------------------------
+// node:sqlite adapter (primary)
+// ---------------------------------------------------------------------------
 
 /**
  * Wraps Node's built-in `node:sqlite` (`DatabaseSync`) to match the
  * better-sqlite3 interface the rest of the code expects.
- *
- * node:sqlite is real SQLite compiled into Node, so it supports WAL, FTS5,
- * mmap, and `@named` params natively — the only shims needed are the
- * better-sqlite3 conveniences node:sqlite omits: a `.pragma()` helper, a
- * `.transaction()` helper, and `open` (node:sqlite exposes `isOpen`).
  */
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
@@ -54,9 +53,6 @@ class NodeSqliteAdapter implements SqliteDatabase {
   }
 
   prepare(sql: string): SqliteStatement {
-    // node:sqlite matches better-sqlite3's calling convention (variadic
-    // positional args, or a single object for @named params), so params forward
-    // through unchanged.
     const stmt = this._db.prepare(sql);
     return {
       run(...params: any[]) {
@@ -81,14 +77,10 @@ class NodeSqliteAdapter implements SqliteDatabase {
 
   pragma(str: string, options?: { simple?: boolean }): any {
     const trimmed = str.trim();
-    // Write pragma ("key = value"): node:sqlite is real SQLite, so every pragma
-    // (WAL, mmap, synchronous, …) applies as-is.
     if (trimmed.includes('=')) {
       this._db.exec(`PRAGMA ${trimmed}`);
       return;
     }
-    // Read pragma. Default: the row object (e.g. { journal_mode: 'wal' }).
-    // `{ simple: true }` returns just the single column value, like better-sqlite3.
     const row = this._db.prepare(`PRAGMA ${trimmed}`).get();
     if (options?.simple) {
       return row && typeof row === 'object' ? Object.values(row)[0] : row;
@@ -111,29 +103,252 @@ class NodeSqliteAdapter implements SqliteDatabase {
   }
 
   close(): void {
-    // node:sqlite's DatabaseSync.close() throws if already closed; make it
-    // idempotent to match better-sqlite3 (callers may close more than once).
     if (this._db.isOpen) this._db.close();
   }
 }
 
+// ---------------------------------------------------------------------------
+// sql.js WASM adapter (fallback for old Node / old glibc)
+// ---------------------------------------------------------------------------
+
+let SqlJsDatabase: any = null;
+
 /**
- * Create a database connection backed by `node:sqlite`.
+ * Pre-initialize the sql.js WASM backend. Must be called (and awaited) before
+ * `createDatabase()` when `node:sqlite` is unavailable. Idempotent — safe to
+ * call multiple times.
+ */
+export async function ensureSqlJsReady(): Promise<void> {
+  if (SqlJsDatabase) return;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require('fs');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const path = require('path');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const initSqlJs = require('sql.js-fts5');
+  // Load the WASM binary from disk (synchronous read) so sql.js init doesn't
+  // need to fetch it over the network.
+  const wasmCandidates = [
+    path.join(__dirname, 'sql-wasm.wasm'),                          // dist/db/
+    path.join(__dirname, '..', 'node_modules', 'sql.js-fts5', 'dist', 'sql-wasm.wasm'),
+  ];
+  let wasmBinary: Buffer | undefined;
+  for (const candidate of wasmCandidates) {
+    try {
+      wasmBinary = fs.readFileSync(candidate);
+      break;
+    } catch { /* try next */ }
+  }
+  const SQL = wasmBinary
+    ? await initSqlJs({ wasmBinary })
+    : await initSqlJs();
+  SqlJsDatabase = SQL.Database;
+}
+
+/**
+ * sql.js requires `@`-prefixed keys in named-param objects, but CodeGraph
+ * passes bare keys (e.g. `{ id: 1 }` for SQL `@id`). This helper adds the
+ * prefix when the SQL likely uses `@named` parameters and the first param is
+ * an object.
+ */
+function prefixNamedParams(params: any[]): any[] {
+  if (
+    params.length === 1 &&
+    params[0] !== null &&
+    typeof params[0] === 'object' &&
+    !Array.isArray(params[0])
+  ) {
+    const obj: Record<string, any> = {};
+    for (const [key, value] of Object.entries(params[0])) {
+      const prefixed =
+        key.startsWith('@') || key.startsWith('$') || key.startsWith(':')
+          ? key
+          : `@${key}`;
+      obj[prefixed] = value;
+    }
+    return [obj];
+  }
+  return params;
+}
+
+/** PRAGMAs that sql.js cannot honor — silently swallow them. */
+const UNSUPPORTED_WRITE_PRAGMAS = new Set([
+  'journal_mode',
+  'mmap_size',
+]);
+const UNSUPPORTED_READ_PRAGMAS = new Set([
+  'wal_checkpoint',
+]);
+
+class SqlJsAdapter implements SqliteDatabase {
+  private _db: any;
+  private _dbPath: string;
+  private _open = true;
+
+  constructor(dbPath: string) {
+    if (!SqlJsDatabase) {
+      throw new Error(
+        'sql.js WASM backend not initialized. Call ensureSqlJsReady() first.',
+      );
+    }
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs');
+    this._dbPath = dbPath;
+    if (fs.existsSync(dbPath)) {
+      const buf = fs.readFileSync(dbPath);
+      this._db = new SqlJsDatabase(buf);
+    } else {
+      this._db = new SqlJsDatabase();
+    }
+  }
+
+  get open(): boolean {
+    return this._open;
+  }
+
+  prepare(sql: string): SqliteStatement {
+    const stmt = this._db.prepare(sql);
+    const db = this._db;
+    return {
+      run(...params: any[]) {
+        const bound = prefixNamedParams(params);
+        if (bound.length > 0) {
+          stmt.bind(bound[0]);
+        }
+        stmt.step();
+        stmt.reset();
+        const changes = db.getRowsModified();
+        const rowidResult = db.exec('SELECT last_insert_rowid()');
+        const lastInsertRowid = rowidResult?.[0]?.values?.[0]?.[0] ?? 0;
+        stmt.free();
+        return { changes, lastInsertRowid };
+      },
+      get(...params: any[]) {
+        const bound = prefixNamedParams(params);
+        if (bound.length > 0) {
+          stmt.bind(bound[0]);
+        }
+        let result: any = undefined;
+        if (stmt.step()) {
+          result = stmt.getAsObject();
+        }
+        stmt.reset();
+        stmt.free();
+        return result;
+      },
+      all(...params: any[]) {
+        const bound = prefixNamedParams(params);
+        if (bound.length > 0) {
+          stmt.bind(bound[0]);
+        }
+        const results: any[] = [];
+        while (stmt.step()) {
+          results.push(stmt.getAsObject());
+        }
+        stmt.reset();
+        stmt.free();
+        return results;
+      },
+    };
+  }
+
+  exec(sql: string): void {
+    this._db.run(sql);
+  }
+
+  pragma(str: string, options?: { simple?: boolean }): any {
+    const trimmed = str.trim();
+
+    // Unsupported read pragmas — return undefined
+    for (const u of UNSUPPORTED_READ_PRAGMAS) {
+      if (trimmed.toLowerCase().startsWith(u)) return undefined;
+    }
+
+    if (trimmed.includes('=')) {
+      const key = (trimmed.split('=')[0] ?? '').trim().toLowerCase();
+      if (UNSUPPORTED_WRITE_PRAGMAS.has(key)) return undefined;
+      this._db.run(`PRAGMA ${trimmed}`);
+      return undefined;
+    }
+
+    // Read pragma
+    const result = this._db.exec(`PRAGMA ${trimmed}`);
+    if (!result || !result.length || !result[0].values?.length) {
+      return options?.simple ? null : null;
+    }
+    const row = result[0].values[0];
+    if (options?.simple) return row?.[0];
+    const columns = result[0].columns;
+    const obj: Record<string, any> = {};
+    columns.forEach((col: string, i: number) => {
+      obj[col] = row[i];
+    });
+    return obj;
+  }
+
+  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
+    return (...args: any[]) => {
+      this._db.run('BEGIN');
+      try {
+        const result = fn(...args);
+        this._db.run('COMMIT');
+        return result;
+      } catch (error) {
+        this._db.run('ROLLBACK');
+        throw error;
+      }
+    };
+  }
+
+  /** Persist in-memory DB to disk. */
+  flush(): void {
+    if (!this._open) return;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('path');
+    const data = this._db.export();
+    const dir = path.dirname(this._dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(this._dbPath, Buffer.from(data));
+  }
+
+  close(): void {
+    if (!this._open) return;
+    this.flush();
+    this._db.close();
+    this._open = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a database connection. Tries `node:sqlite` first; falls back to the
+ * sql.js WASM backend when the native module is unavailable.
  *
- * Returns the active backend alongside the db so each `DatabaseConnection` can
- * report it per-instance — MCP can open multiple project DBs in one process, so
- * a process-global would race.
+ * For the WASM path, call `ensureSqlJsReady()` before this function.
  */
 export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+  // Try node:sqlite first (full performance, WAL, native)
   try {
     return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      'Failed to open SQLite via the built-in node:sqlite module.\n' +
-      'CodeGraph requires node:sqlite (Node.js 22.5+). Install the self-contained\n' +
-      'CodeGraph release (it bundles a compatible Node), or run on Node 22.5+.\n' +
-      `Underlying error: ${msg}`
-    );
+  } catch { /* unavailable, try fallback */ }
+
+  // Fallback: sql.js WASM backend (no native deps, no WAL)
+  if (SqlJsDatabase) {
+    return { db: new SqlJsAdapter(dbPath), backend: 'sql-js' };
   }
+
+  throw new Error(
+    'Failed to open SQLite.\n' +
+    'node:sqlite is unavailable (requires Node.js 22.5+), and the sql.js\n' +
+    'WASM fallback has not been initialized. When running on Node < 22.5,\n' +
+    'the CLI and MCP server entry points call ensureSqlJsReady() before\n' +
+    'opening any database.',
+  );
 }

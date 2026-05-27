@@ -30,7 +30,7 @@ import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/wo
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR, needsWasmFallback } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
@@ -87,17 +87,36 @@ if (nodeMajor < MIN_NODE_MAJOR) {
 // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
 relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
+// When node:sqlite is unavailable (Node < 22.5), eagerly initialize the
+// sql.js WASM fallback so any database open later works transparently.
+// Must complete before main() or the installer runs.
+const wasmReady = needsWasmFallback()
+  ? import('../db/sqlite-adapter').then(async ({ ensureSqlJsReady }) => {
+      await ensureSqlJsReady();
+      process.stderr.write(
+        '[CodeGraph] Using sql.js WASM SQLite backend (node:sqlite unavailable on Node ' +
+        process.version + ').\n' +
+        '[CodeGraph] WAL mode disabled; index writes may be slower.\n',
+      );
+    })
+  : Promise.resolve();
+
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
-  import('../installer').then(({ runInstaller }) =>
-    runInstaller()
+  wasmReady.then(() =>
+    import('../installer').then(({ runInstaller }) =>
+      runInstaller()
+    )
   ).catch((err) => {
     console.error('Installation failed:', err instanceof Error ? err.message : String(err));
     process.exit(1);
   });
 } else {
   // Normal CLI flow
-  main();
+  wasmReady.then(() => main()).catch((err) => {
+    console.error('Startup failed:', err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
 }
 
 process.on('uncaughtException', (error) => {
@@ -760,9 +779,10 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
-      // Surface the active SQLite backend (node:sqlite — Node's built-in real
-      // SQLite, full WAL + FTS5, no native build).
-      const backendLabel = chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`);
+      // Surface the active SQLite backend.
+      const backendLabel = backend === 'node-sqlite'
+        ? chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`)
+        : chalk.yellow(`sql.js ${getGlyphs().dash} WASM fallback (no WAL)`);
       console.log(`  Backend:   ${backendLabel}`);
       // Effective journal mode: 'wal' means concurrent reads never block on a
       // writer; anything else means they can ("database is locked"). node:sqlite

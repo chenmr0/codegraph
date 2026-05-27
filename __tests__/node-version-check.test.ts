@@ -50,7 +50,7 @@ describe('buildNodeTooOldBanner', () => {
   });
 
   it('states the supported floor matching MIN_NODE_MAJOR', () => {
-    expect(MIN_NODE_MAJOR).toBe(20);
+    expect(MIN_NODE_MAJOR).toBe(18);
     expect(buildNodeTooOldBanner('18.0.0')).toContain(
       `requires Node.js ${MIN_NODE_MAJOR} or newer`
     );
