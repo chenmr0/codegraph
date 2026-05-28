@@ -18,10 +18,10 @@ import { geminiTarget } from './gemini';
 // import { kiroTarget } from './kiro';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
+  opencodeTarget,
   claudeTarget,
   // cursorTarget,
   // codexTarget,
-  opencodeTarget,
   // hermesTarget,
   geminiTarget,
   // antigravityTarget,

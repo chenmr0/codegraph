@@ -443,7 +443,7 @@ async function resolveTargets(
     .map(({ target }) => target.id);
   // If nothing detected, default to Claude alone (matches the
   // historical default and the smallest-surprise outcome).
-  const initial = initialValues.length > 0 ? initialValues : ['claude'];
+  const initial = initialValues.length > 0 ? initialValues : ['opencode'];
 
   const choice = await clack.multiselect<string>({
     message: 'Which agents should CodeGraph configure?',
