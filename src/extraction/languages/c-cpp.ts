@@ -59,9 +59,32 @@ export const cExtractor: LanguageExtractor = {
   importTypes: ['preproc_include'],
   callTypes: ['call_expression'],
   variableTypes: ['declaration'],
+  fieldTypes: ['field_declaration'],
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  isConst: (node) => {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'type_qualifier' && c.text === 'const') return true;
+    }
+    return false;
+  },
+  isStatic: (node) => {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'storage_class_specifier' && c.text === 'static') return true;
+    }
+    return false;
+  },
+  isExported: (node) => {
+    // C file-scope symbols have external linkage by default, internal with `static`
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'storage_class_specifier' && c.text === 'static') return false;
+    }
+    return true;
+  },
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
     // The inner enum_specifier/struct_specifier is anonymous, but we want the typedef name
@@ -104,9 +127,32 @@ export const cppExtractor: LanguageExtractor = {
   importTypes: ['preproc_include'],
   callTypes: ['call_expression'],
   variableTypes: ['declaration'],
+  fieldTypes: ['field_declaration'],
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  isConst: (node) => {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'type_qualifier' && c.text === 'const') return true;
+      if (c?.text === 'constexpr') return true;
+    }
+    return false;
+  },
+  isStatic: (node) => {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'storage_class_specifier' && c.text === 'static') return true;
+    }
+    return false;
+  },
+  isExported: (node) => {
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c?.type === 'storage_class_specifier' && c.text === 'static') return false;
+    }
+    return true;
+  },
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
   getVisibility: (node) => {

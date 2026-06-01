@@ -1053,6 +1053,42 @@ export class TreeSitterExtractor {
       }
     }
 
+    // C/C++ field_declaration: `struct S { int x, *p; };` → field_identifier(s)
+    // Declarators may be wrapped in pointer_declarator / array_declarator.
+    // Multiple field_identifiers can appear as siblings (comma-separated).
+    if (declarators.length === 0 && (this.language === 'c' || this.language === 'cpp')) {
+      const fieldEntries: Array<{ name: string; posNode: SyntaxNode }> = [];
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (!child) continue;
+        // Unwrap pointer/array declarators to reach the field_identifier
+        let current: SyntaxNode | null = child;
+        while (current && (current.type === 'pointer_declarator' || current.type === 'array_declarator')) {
+          const inner: SyntaxNode | null = getChildByField(current, 'declarator') || current.namedChild(0) || null;
+          current = inner;
+        }
+        if (current && current.type === 'field_identifier') {
+          fieldEntries.push({ name: getNodeText(current, this.source), posNode: current });
+        }
+      }
+      if (fieldEntries.length > 0) {
+        // Build type text from the type-child for the signature
+        const typeNode = getChildByField(node, 'type');
+        const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+
+        for (const { name, posNode } of fieldEntries) {
+          const signature = typeText ? `${typeText} ${name}` : name;
+          this.createNode('field', name, posNode, {
+            docstring,
+            signature,
+            visibility,
+            isStatic,
+          });
+        }
+        return;
+      }
+    }
+
     if (declarators.length > 0) {
       // Get field type from the type child
       // Java: type is a direct child of field_declaration
@@ -1268,6 +1304,86 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'c' || this.language === 'cpp') {
+      // C/C++ declaration: type specifier + declarator(s).
+      //
+      // Each declarator may appear as init_declarator (when there is an initializer,
+      // e.g. `int x = 5`), as identifier directly (no initializer, `int x`), or
+      // wrapped in pointer_declarator / array_declarator (`int *p`, `int arr[10]`).
+      // Multiple declarators are comma-separated siblings (`int x, y, z`).
+      //
+      // Skip declarators that contain function_declarator (forward declarations like
+      // `int foo();` — these are function declarations, not variables).
+
+      /** Descend through declarator wrappers to find the identifier. Returns the
+       *  identifier node, or the deepest unwrapped node if no identifier found. */
+      const unwrapDeclarator = (n: SyntaxNode): SyntaxNode | null => {
+        if (n.type === 'identifier') return n;
+        if (n.type === 'init_declarator') {
+          const d = getChildByField(n, 'declarator');
+          return d ? unwrapDeclarator(d) : null;
+        }
+        if (n.type === 'pointer_declarator' || n.type === 'array_declarator' ||
+            n.type === 'reference_declarator') {
+          const inner = getChildByField(n, 'declarator') || n.namedChild(0);
+          return inner ? unwrapDeclarator(inner) : null;
+        }
+        if (n.type === 'parenthesized_declarator') {
+          for (let i = 0; i < n.namedChildCount; i++) {
+            const child = n.namedChild(i);
+            if (child) {
+              const result = unwrapDeclarator(child);
+              if (result) return result;
+            }
+          }
+          return null;
+        }
+        // function_declarator or unrecognized — stop here
+        return n;
+      };
+
+      const hasFunctionDeclarator = (n: SyntaxNode): boolean => {
+        if (n.type === 'function_declarator') return true;
+        for (let i = 0; i < n.namedChildCount; i++) {
+          const child = n.namedChild(i);
+          if (child && hasFunctionDeclarator(child)) return true;
+        }
+        return false;
+      };
+
+      // Node types that are declarators (not type specifiers / qualifiers)
+      const DECLARATOR_TYPES = new Set([
+        'init_declarator', 'identifier', 'pointer_declarator',
+        'array_declarator', 'reference_declarator', 'function_declarator',
+        'parenthesized_declarator',
+      ]);
+
+      for (const child of node.namedChildren) {
+        if (!DECLARATOR_TYPES.has(child.type)) continue;
+
+        const resolved = unwrapDeclarator(child);
+        if (!resolved || resolved.type !== 'identifier') continue;
+
+        // A function_declarator was encountered during unwrapping — skip
+        if (hasFunctionDeclarator(child)) continue;
+
+        const name = getNodeText(resolved, this.source);
+        if (!name) continue;
+
+        // Initializer only lives on init_declarator
+        const valueNode = child.type === 'init_declarator'
+          ? getChildByField(child, 'value') : null;
+        const initValue = valueNode
+          ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+        const initSignature = initValue
+          ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+
+        this.createNode(kind, name, resolved, {
+          docstring,
+          signature: initSignature,
+          isExported,
+        });
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
