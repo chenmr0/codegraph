@@ -37,6 +37,38 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reach overrides hidden in `new T() { ... }` blocks (including lambda
   bodies). An agent investigating `Splitter.SplittingIterator.separatorStart`
   now sees the four anonymous overrides in its trail without a Read.
+- **C/C++ variables and struct/class fields are now indexed as graph nodes.**
+  Top-level and file-scope variable declarations (`int g_counter`,
+  `static int s_count`, `const int MAX = 100`, `int *ptr`, `int x, y, z`,
+  `constexpr int N`) are extracted as `variable` / `constant` nodes;
+  struct/class member declarations (`struct S { int field; };`) are
+  extracted as `field` nodes. Forward declarations (`int foo();`) are
+  correctly skipped (not misidentified as variables), and local variables
+  inside function bodies are intentionally excluded to avoid node explosion.
+  `extern` declarations in headers are skipped — only the definition
+  produces a node, ensuring single-source-of-truth for cross-file references.
+  Searching for variable names (`codegraph search g_counter`) now works for
+  C and C++ codebases.
+- **C/C++ cross-file call resolution now follows `#include` directives to
+  find function definitions.** When the import resolver matches a call
+  reference (e.g. `foo()`) to an `#include` whose basename matches
+  (`#include "foo.h"`), it derives candidate source file paths (`foo.c`,
+  `foo.cpp`, `foo.cc`, `foo.cxx`) from the header path and searches each
+  for the exported function definition. Handles both same-directory
+  (`src/foo.h` ↔ `src/foo.c`) and split-layout (`include/foo.h` ↔
+  `src/foo.c`) conventions. The `#include`-derived resolution carries
+  0.9 confidence, outranking path-proximity name-matching (0.4–0.7) so
+  ambiguous names resolve to the correct translation unit. Falls back to
+  name-matching when the call name does not match any include basename.
+- **C/C++ global variable reference tracking (`codegraph_callers` now
+  returns functions that read/write each variable).** During function body
+  traversal, bare `identifier` nodes that are not shadowed by local
+  variables or parameters and not part of a `call_expression` emit a
+  `references` edge. The resolver matches these to the variable's definition
+  node. Works across files — a variable defined in `a.c` and read in `b.c`
+  produces a `references` edge from `b.c`'s function to `a.c`'s variable.
+  Local shadowing (`int g_var;` inside a function hides the file-scope
+  `int g_var`) is correctly suppressed. Only active for C and C++.
 
 ### Fixed
 - **`codegraph index` / `init -i` summary now reports the true edge count.**
