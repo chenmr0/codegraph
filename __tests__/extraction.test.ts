@@ -2265,6 +2265,160 @@ end
     });
   });
 
+  describe('C/C++ variable extraction', () => {
+    it('extracts a global int variable', () => {
+      const result = extractFromSource('foo.c', 'int g_counter = 0;');
+      const varNode = result.nodes.find(n => n.kind === 'variable' && n.name === 'g_counter');
+      expect(varNode).toBeDefined();
+      expect(varNode?.signature).toBe('= 0');
+      expect(varNode?.isExported).toBe(true);
+    });
+
+    it('extracts a static int variable as non-exported', () => {
+      const result = extractFromSource('foo.c', 'static int s_counter = 0;');
+      const varNode = result.nodes.find(n => n.kind === 'variable' && n.name === 's_counter');
+      expect(varNode).toBeDefined();
+      expect(varNode?.isExported).toBe(false);
+    });
+
+    it('extracts a const int as constant', () => {
+      const result = extractFromSource('foo.c', 'const int MAX = 100;');
+      const constNode = result.nodes.find(n => n.kind === 'constant' && n.name === 'MAX');
+      expect(constNode).toBeDefined();
+    });
+
+    it('extracts multi-declarator variables', () => {
+      const result = extractFromSource('foo.c', 'int x, y, z;');
+      expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'x')).toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'y')).toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'z')).toBeDefined();
+    });
+
+    it('extracts pointer variable', () => {
+      const result = extractFromSource('foo.c', 'int *ptr = 0;');
+      const varNode = result.nodes.find(n => n.kind === 'variable' && n.name === 'ptr');
+      expect(varNode).toBeDefined();
+    });
+
+    it('skips forward function declaration', () => {
+      const result = extractFromSource('foo.c', 'int forwardDeclared(int a, int b);');
+      const varNode = result.nodes.find(n => n.kind === 'variable');
+      expect(varNode).toBeUndefined();
+    });
+
+    it('skips extern declaration', () => {
+      const result = extractFromSource('foo.h', 'extern int g_barcode;');
+      const varNode = result.nodes.find(n => n.kind === 'variable');
+      expect(varNode).toBeUndefined();
+    });
+
+    it('does not extract local variable inside function', () => {
+      const result = extractFromSource('foo.c', 'void foo() { int local = 5; }');
+      const varNode = result.nodes.find(n => n.kind === 'variable' && n.name === 'local');
+      expect(varNode).toBeUndefined();
+    });
+  });
+
+  describe('C/C++ struct/class field extraction', () => {
+    it('extracts struct fields', () => {
+      const result = extractFromSource('foo.c', 'struct S { int id; char name[32]; };');
+      expect(result.nodes.find(n => n.kind === 'field' && n.name === 'id')).toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'field' && n.name === 'name')).toBeDefined();
+    });
+
+    it('extracts pointer fields', () => {
+      const result = extractFromSource('foo.c', 'struct S { int *data; };');
+      expect(result.nodes.find(n => n.kind === 'field' && n.name === 'data')).toBeDefined();
+    });
+
+    it('extracts C++ class member fields', () => {
+      const result = extractFromSource('foo.cpp', 'class Widget { int m_width; int *m_data; };');
+      expect(result.nodes.find(n => n.kind === 'field' && n.name === 'm_width')).toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'field' && n.name === 'm_data')).toBeDefined();
+    });
+  });
+
+  describe('C/C++ global variable reference tracking', () => {
+    it('emits references edge for global variable read in same file', () => {
+      const result = extractFromSource('foo.c', 'int g_counter = 0;\nint get(void) { return g_counter; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_counter'
+      );
+      expect(refs.length).toBe(1);
+    });
+
+    it('emits references edge for global variable write in same file', () => {
+      const result = extractFromSource('foo.c', 'int g_counter = 0;\nvoid set(int v) { g_counter = v; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_counter'
+      );
+      expect(refs.length).toBe(1);
+    });
+
+    it('does NOT emit references edge for local variable', () => {
+      const result = extractFromSource('foo.c', 'int g_var = 0;\nvoid test(void) { int g_var; g_var = 5; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_var'
+      );
+      expect(refs.length).toBe(0);
+    });
+
+    it('does NOT emit references edge for parameter that shadows global', () => {
+      const result = extractFromSource('foo.c', 'int g_val = 0;\nvoid set(int g_val) { g_val = 42; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_val'
+      );
+      expect(refs.length).toBe(0);
+    });
+
+    it('does NOT emit references edge for callee inside call_expression', () => {
+      const result = extractFromSource('foo.c', 'void helper(void) {}\nvoid caller(void) { helper(); }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'helper'
+      );
+      expect(refs.length).toBe(0);
+    });
+
+    it('emits references for global, not for shadowed local, in mixed function', () => {
+      const result = extractFromSource('foo.c', 'int g_x = 0;\nvoid foo(void) { int g_x; g_x = 1; }\nvoid bar(void) { g_x = 2; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_x'
+      );
+      expect(refs.length).toBe(1); // only bar, not foo
+    });
+
+    it('preserves local names across nested function extraction', () => {
+      const result = extractFromSource('foo.c',
+        'int g_x = 0;\nvoid outer(void) { int outer_var; void inner(void) {} outer_var = 1; g_x = 2; }');
+      // g_x should have a references edge (from outer, after nested inner returns)
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_x'
+      );
+      expect(refs.length).toBe(1);
+      // outer_var should NOT emit a references edge (it's a local, not a global)
+      const outerRefs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'outer_var'
+      );
+      expect(outerRefs.length).toBe(0);
+    });
+
+    it('collects multi-declarator local names for shadow detection', () => {
+      const result = extractFromSource('foo.c', 'int g_a = 0;\nint g_b = 0;\nvoid foo(void) { int g_a, g_b; g_a = 1; g_b = 2; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references'
+      );
+      expect(refs.length).toBe(0);
+    });
+
+    it('does not emit references for non-C/C++ files', () => {
+      const result = extractFromSource('foo.ts', 'let g_counter = 0;\nfunction get() { return g_counter; }');
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_counter'
+      );
+      expect(refs.length).toBe(0);
+    });
+  });
+
   describe('Dart imports', () => {
     it('should extract dart: import', () => {
       const code = `import 'dart:async';`;

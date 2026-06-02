@@ -675,20 +675,35 @@ export class TreeSitterExtractor {
     // annotations on free functions).
     this.extractDecoratorsFor(node, funcNode.id);
 
-    // Resolve body so we can scan it for local variable names before visiting
-    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-
-    // Collect parameter + local variable names so global-variable reference
-    // tracking can skip shadowed names (e.g. `int g_var;` inside the body
-    // hides the file-scope `int g_var`). Only needed for C/C++ — other
-    // languages don't emit global-var references from function bodies.
+    // Collect parameter names into currentLocalNames before visiting the
+    // body. Local variable names are collected incrementally during the
+    // visitFunctionBody traversal itself (when declaration nodes are
+    // encountered). Only needed for C/C++ — other languages don't emit
+    // global-var references from function bodies.
     if (this.language === 'c' || this.language === 'cpp') {
-      this.currentLocalNames = this.collectLocalNames(node, body);
+      this.currentLocalNames.clear();
+      // C/C++: parameters live inside function_declarator, not directly on
+      // function_definition. Unwrap: function_definition → declarator →
+      // parameters → parameter_declaration → declarator → identifier.
+      const funcDecl = getChildByField(node, this.extractor.nameField);
+      const params = funcDecl ? getChildByField(funcDecl, this.extractor.paramsField) : null;
+      if (params) {
+        for (let i = 0; i < params.namedChildCount; i++) {
+          const param = params.namedChild(i);
+          if (!param) continue;
+          const d = getChildByField(param, 'declarator');
+          if (d) {
+            const name = this.extractVarNameFromDeclarator(d);
+            if (name) this.currentLocalNames.add(name);
+          }
+        }
+      }
     }
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
       this.visitFunctionBody(body, funcNode.id);
     }
@@ -2168,7 +2183,12 @@ export class TreeSitterExtractor {
       if (this.extractor!.functionTypes.includes(nodeType)) {
         const nestedName = extractName(node, this.source, this.extractor!);
         if (nestedName && nestedName !== '<anonymous>') {
+          // extractFunction clears currentLocalNames internally, so save
+          // the outer function's set and restore it after the nested
+          // function completes.
+          const savedLocalNames = new Set(this.currentLocalNames);
           this.extractFunction(node);
+          this.currentLocalNames = savedLocalNames;
           return;
         }
       }
@@ -2195,6 +2215,25 @@ export class TreeSitterExtractor {
       if (this.extractor!.interfaceTypes.includes(nodeType)) {
         this.extractInterface(node);
         return;
+      }
+
+      // Collect local variable names from declarations encountered during
+      // the body traversal. When a `declaration` node is visited before its
+      // children, the extracted names are already in currentLocalNames by
+      // the time identifier children are checked — so `int x = g_var;`
+      // correctly adds "x" before checking "g_var" against the shadow set.
+      if (
+        nodeType === 'declaration' &&
+        (this.language === 'c' || this.language === 'cpp')
+      ) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (!child) continue;
+          const name = this.extractVarNameFromDeclarator(child);
+          if (name) this.currentLocalNames.add(name);
+        }
+        // Don't return — children (initializers, etc.) may contain
+        // identifiers that still need reference tracking.
       }
 
       // Global variable reference tracking (C/C++ only): bare `identifier`
@@ -2241,73 +2280,6 @@ export class TreeSitterExtractor {
     };
 
     visitForCallsAndStructure(body);
-  }
-
-  /**
-   * Collect parameter and local variable names that shadow file-scope globals
-   * inside a function. Called before visitFunctionBody so the global-var
-   * reference tracker can avoid emitting edges for shadowed names (e.g.
-   * `int g_var;` inside the function hides an outer `int g_var`).
-   */
-  private collectLocalNames(
-    funcNode: SyntaxNode,
-    bodyNode: SyntaxNode | null,
-  ): Set<string> {
-    const names = new Set<string>();
-
-    // 1. Collect parameter names
-    const paramsField = this.extractor?.paramsField || 'parameters';
-    const params = getChildByField(funcNode, paramsField);
-    if (params) {
-      for (let i = 0; i < params.namedChildCount; i++) {
-        const param = params.namedChild(i);
-        if (!param) continue;
-        // C/C++: parameter_declaration → declarator → identifier
-        // Other languages: parameter → pattern/name field
-        const declarator = getChildByField(param, 'declarator')
-          || getChildByField(param, 'name')
-          || getChildByField(param, 'pattern');
-        if (declarator) {
-          const name = this.extractVarNameFromDeclarator(declarator);
-          if (name) names.add(name);
-        }
-      }
-    }
-
-    // 2. Recursively scan body for local variable declarations
-    if (bodyNode) {
-      this.collectLocalNamesFromBody(bodyNode, names, this.extractor?.functionTypes || []);
-    }
-
-    return names;
-  }
-
-  /**
-   * Recursively walk a subtree finding `declaration` nodes and extracting
-   * variable names. Skips nested function bodies so that inner-function
-   * locals don't shadow the outer function's reference tracking.
-   */
-  private collectLocalNamesFromBody(
-    node: SyntaxNode,
-    names: Set<string>,
-    functionTypes: string[],
-  ): void {
-    if (functionTypes.includes(node.type)) return; // skip nested function bodies
-
-    if (node.type === 'declaration') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
-        if (!child) continue;
-        const name = this.extractVarNameFromDeclarator(child);
-        if (name) names.add(name);
-      }
-      return; // declaration children won't contain more declarations
-    }
-
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child) this.collectLocalNamesFromBody(child, names, functionTypes);
-    }
   }
 
   /**
