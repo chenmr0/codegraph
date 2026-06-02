@@ -1409,6 +1409,38 @@ export class QueryBuilder {
   }
 
   /**
+   * Find files that should be re-resolved when the given files change.
+   *
+   * Strategy: for each changed file, find the headers it imports (outgoing
+   * `imports` edges to file nodes), then find every other file that imports
+   * those same headers. These co-importers share the same declaration surface
+   * as the changed file — when a definition moves, their cross-file edges
+   * (calls → function, references → variable) are cascade-deleted during
+   * re-index and need to be restored.
+   *
+   * Returns file paths distinct from the input set.
+   */
+  getCoImporters(changedFilePaths: string[]): string[] {
+    if (changedFilePaths.length === 0) return [];
+    const fpPlaceholders = changedFilePaths.map(() => '?').join(',');
+    const sql = `SELECT DISTINCT n.file_path
+FROM edges e
+JOIN nodes n ON n.id = e.source
+WHERE e.kind = 'imports'
+  AND e.target IN (
+    SELECT DISTINCT e2.target
+    FROM edges e2
+    JOIN nodes s2 ON s2.id = e2.source
+    WHERE e2.kind = 'imports'
+      AND s2.file_path IN (${fpPlaceholders})
+  )
+  AND n.file_path NOT IN (${fpPlaceholders})`;
+    const allPaths = changedFilePaths.concat(changedFilePaths); // for two IN clauses
+    const rows = this.db.prepare(sql).all(...allPaths) as Array<{ file_path: string }>;
+    return rows.map(r => r.file_path);
+  }
+
+  /**
    * Delete all unresolved references (after resolution)
    */
   clearUnresolvedReferences(): void {

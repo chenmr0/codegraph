@@ -1127,7 +1127,7 @@ export class ExtractionOrchestrator {
   /**
    * Index a single file
    */
-  async indexFile(relativePath: string): Promise<ExtractionResult> {
+  async indexFile(relativePath: string, options?: { force?: boolean }): Promise<ExtractionResult> {
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
 
     if (!fullPath) {
@@ -1163,7 +1163,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    return this.indexFileWithContent(relativePath, content, stats);
+    return this.indexFileWithContent(relativePath, content, stats, options);
   }
 
   /**
@@ -1173,7 +1173,8 @@ export class ExtractionOrchestrator {
   async indexFileWithContent(
     relativePath: string,
     content: string,
-    stats: fs.Stats
+    stats: fs.Stats,
+    options?: { force?: boolean }
   ): Promise<ExtractionResult> {
     // Prevent path traversal
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
@@ -1226,7 +1227,7 @@ export class ExtractionOrchestrator {
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {
-      this.storeExtractionResult(relativePath, content, language, stats, result);
+      this.storeExtractionResult(relativePath, content, language, stats, result, options);
     }
 
     return result;
@@ -1240,13 +1241,14 @@ export class ExtractionOrchestrator {
     content: string,
     language: Language,
     stats: fs.Stats,
-    result: ExtractionResult
+    result: ExtractionResult,
+    options?: { force?: boolean }
   ): void {
     const contentHash = hashContent(content);
 
     // Check if file already exists and hasn't changed
     const existingFile = this.queries.getFileByPath(filePath);
-    if (existingFile && existingFile.contentHash === contentHash) {
+    if (!options?.force && existingFile && existingFile.contentHash === contentHash) {
       return; // No changes
     }
 

@@ -427,42 +427,74 @@ export class CodeGraph {
           this.resolver.runPostExtract();
         }
 
-        // Resolve references if files were updated
+        // Resolve references for changed files first. This restores their
+        // import edges (e.g. `a.c --imports--> a.h`), which the co-importer
+        // query in the next step relies on.
         if (result.filesAdded > 0 || result.filesModified > 0) {
           if (result.changedFilePaths) {
-            // Scope resolution to changed files (git fast path — bounded set)
-            const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
-
-            options.onProgress?.({
-              phase: 'resolving',
-              current: 0,
-              total: unresolvedRefs.length,
-            });
-
-            this.resolver.resolveAndPersist(unresolvedRefs, (current, total) => {
-              options.onProgress?.({
-                phase: 'resolving',
-                current,
-                total,
-              });
-            });
+            this.resolver.resolveAndPersist(
+              this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths),
+              (current, total) => {
+                options.onProgress?.({ phase: 'resolving', current, total });
+              }
+            );
           } else {
-            // No git info — use batched resolution to avoid OOM
-            const unresolvedCount = this.queries.getUnresolvedReferencesCount();
-
-            options.onProgress?.({
-              phase: 'resolving',
-              current: 0,
-              total: unresolvedCount,
-            });
-
             await this.resolveReferencesBatched((current, total) => {
-              options.onProgress?.({
-                phase: 'resolving',
-                current,
-                total,
-              });
+              options.onProgress?.({ phase: 'resolving', current, total });
             });
+          }
+        }
+
+        // Re-index co-importers. When a changed file (e.g. a.c) is re-indexed,
+        // its old nodes are cascade-deleted, which drops incoming cross-file
+        // edges from other files (e.g. b.c → a.c:g_counter). To restore them,
+        // we find files that import the same headers as the changed files
+        // (co-importers), re-extract them (repopulating unresolved_refs), and
+        // run a second scoped resolution pass.
+        if (
+          result.changedFilePaths &&
+          result.changedFilePaths.length > 0 &&
+          (result.filesAdded > 0 || result.filesModified > 0)
+        ) {
+          const coImporterFiles = this.queries.getCoImporters(result.changedFilePaths);
+          if (coImporterFiles.length > 0) {
+            options.onProgress?.({
+              phase: 'parsing',
+              current: 0,
+              total: coImporterFiles.length,
+              currentFile: coImporterFiles[0],
+            });
+
+            for (let i = 0; i < coImporterFiles.length; i++) {
+              const fp = coImporterFiles[i]!;
+              try {
+                await this.orchestrator.indexFile(fp, { force: true });
+                result.filesModified++;
+              } catch {
+                // File may have been deleted since the import edge was created
+                continue;
+              }
+              options.onProgress?.({
+                phase: 'parsing',
+                current: i + 1,
+                total: coImporterFiles.length,
+              });
+            }
+
+            // Resolve co-importers' refs (restores their cross-file edges)
+            const coImportRefs = this.queries.getUnresolvedReferencesByFiles(
+              coImporterFiles.filter(fp => !result.changedFilePaths!.includes(fp))
+            );
+            if (coImportRefs.length > 0) {
+              this.resolver.resolveAndPersist(coImportRefs, (current, total) => {
+                options.onProgress?.({ phase: 'resolving', current, total });
+              });
+            }
+
+            // Merge into changedFilePaths for the result report
+            result.changedFilePaths = result.changedFilePaths.concat(
+              coImporterFiles.filter(fp => !result.changedFilePaths!.includes(fp))
+            );
           }
         }
 

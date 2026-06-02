@@ -303,4 +303,122 @@ describe('Sync Module', () => {
       expect(result.changedFilePaths).toBeUndefined();
     });
   });
+
+  describe('C/C++ sync preserves cross-file references', () => {
+    let testDir: string;
+    let cg: CodeGraph;
+
+    beforeEach(async () => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-cpp-'));
+    });
+
+    afterEach(async () => {
+      if (cg) await cg.close();
+      if (fs.existsSync(testDir)) {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('preserves cross-file callers after definition file is modified', async () => {
+      // Setup: a.h (extern decl), a.c (definition + same-file caller), b.c (cross-file caller)
+      fs.writeFileSync(path.join(testDir, 'a.h'), 'extern int g_counter;');
+      fs.writeFileSync(path.join(testDir, 'a.c'),
+        '#include "a.h"\nint g_counter = 0;\nint get(void) { return g_counter; }');
+      fs.writeFileSync(path.join(testDir, 'b.c'),
+        '#include "a.h"\nint read(void) { return g_counter; }');
+
+      cg = await CodeGraph.init(testDir);
+      await cg.indexAll();
+
+      // Verify initial callers
+      const varNode1 = (await cg.searchNodes('g_counter', { limit: 10 }))
+        .find(r => r.node.kind === 'variable');
+      expect(varNode1).toBeDefined();
+      const callers1 = await cg.getCallers(varNode1!.node.id);
+      const callerNames1 = callers1.map(c => c.node.name);
+      expect(callerNames1).toContain('get');
+      expect(callerNames1).toContain('read');
+
+      // Modify a.c (change g_counter initializer)
+      const now = new Date();
+      const acPath = path.join(testDir, 'a.c');
+      let content = fs.readFileSync(acPath, 'utf8');
+      content = content.replace('int g_counter = 0', 'int g_counter = 1');
+      fs.writeFileSync(acPath, content);
+      fs.utimesSync(acPath, now, now);
+
+      // Sync should re-index a.c and b.c (co-importer of a.h)
+      const result = await cg.sync();
+      expect(result.filesModified).toBeGreaterThanOrEqual(2);
+
+      // Verify cross-file caller is still present after sync
+      const varNode2 = (await cg.searchNodes('g_counter', { limit: 10 }))
+        .find(r => r.node.kind === 'variable');
+      expect(varNode2).toBeDefined();
+      const callers2 = await cg.getCallers(varNode2!.node.id);
+      const callerNames2 = callers2.map(c => c.node.name);
+      expect(callerNames2).toContain('get');
+      expect(callerNames2).toContain('read');
+    });
+
+    it('preserves cross-file callers when only the header is modified', async () => {
+      fs.writeFileSync(path.join(testDir, 'a.h'), 'extern int g_counter;');
+      fs.writeFileSync(path.join(testDir, 'a.c'),
+        '#include "a.h"\nint g_counter = 0;');
+      fs.writeFileSync(path.join(testDir, 'b.c'),
+        '#include "a.h"\nint read(void) { return g_counter; }');
+
+      cg = await CodeGraph.init(testDir);
+      await cg.indexAll();
+
+      const varNode1 = (await cg.searchNodes('g_counter', { limit: 10 }))
+        .find(r => r.node.kind === 'variable');
+      const callers1 = await cg.getCallers(varNode1!.node.id);
+      expect(callers1.map(c => c.node.name)).toContain('read');
+
+      // Modify a.h (add a new extern declaration)
+      const now = new Date();
+      const ahPath = path.join(testDir, 'a.h');
+      fs.writeFileSync(ahPath, 'extern int g_counter;\nextern int g_other;');
+      fs.utimesSync(ahPath, now, now);
+
+      const result = await cg.sync();
+      expect(result.filesModified).toBeGreaterThanOrEqual(1);
+
+      const varNode2 = (await cg.searchNodes('g_counter', { limit: 10 }))
+        .find(r => r.node.kind === 'variable');
+      const callers2 = await cg.getCallers(varNode2!.node.id);
+      expect(callers2.map(c => c.node.name)).toContain('read');
+    });
+
+    it('does not lose function call edges after sync', async () => {
+      // a.c defines foo(), b.c calls foo() via #include "a.h"
+      fs.writeFileSync(path.join(testDir, 'a.h'), 'void foo(void);');
+      fs.writeFileSync(path.join(testDir, 'a.c'),
+        '#include "a.h"\nvoid foo(void) {}');
+      fs.writeFileSync(path.join(testDir, 'b.c'),
+        '#include "a.h"\nvoid caller(void) { foo(); }');
+
+      cg = await CodeGraph.init(testDir);
+      await cg.indexAll();
+
+      const fooNode = (await cg.searchNodes('foo', { limit: 10 }))
+        .find(r => r.node.kind === 'function' && r.node.name === 'foo');
+      const callers1 = await cg.getCallers(fooNode!.node.id);
+      expect(callers1.map(c => c.node.name)).toContain('caller');
+
+      // Modify a.c
+      const now = new Date();
+      const acPath = path.join(testDir, 'a.c');
+      fs.writeFileSync(acPath, '#include "a.h"\nvoid foo(void) { /* updated */ }');
+      fs.utimesSync(acPath, now, now);
+
+      await cg.sync();
+
+      const fooNode2 = (await cg.searchNodes('foo', { limit: 10 }))
+        .find(r => r.node.kind === 'function' && r.node.name === 'foo');
+      const callers2 = await cg.getCallers(fooNode2!.node.id);
+      expect(callers2.map(c => c.node.name)).toContain('caller');
+    });
+  });
 });
