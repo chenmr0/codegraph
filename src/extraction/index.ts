@@ -17,7 +17,8 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
@@ -159,6 +160,78 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
 ];
 
+/** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
+function isValidUtf8(buf: Buffer): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a `.gitignore` and return patterns safe to hand to the `ignore` matcher —
+ * never throwing, even when the file isn't real gitignore text. Two failure
+ * modes, both seen in the wild (issue #682):
+ *
+ *  - The file isn't valid UTF-8 — e.g. transparently encrypted in place by
+ *    corporate DLP / endpoint-security software, leaving a UTF-16 header plus
+ *    ciphertext. None of it is meaningful patterns, so the whole file is skipped.
+ *  - The file is text but a single line can't be compiled to a regex by the
+ *    `ignore` library — `\\[` and friends throw "Unterminated character class".
+ *    Crucially the throw is LAZY (at match time, not `.add()`), so it would
+ *    otherwise escape mid-scan. That one pattern is dropped; the rest are kept.
+ *
+ * Either way a warning that NAMES the file is logged (the reporter couldn't tell
+ * which `.gitignore` was at fault) and indexing continues instead of aborting.
+ * Returns '' when there's nothing usable.
+ */
+function readGitignorePatterns(giPath: string): string {
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(giPath);
+  } catch {
+    return ''; // unreadable (permissions / race) — treat as absent
+  }
+  // A NUL byte never appears in real gitignore text, and a fatal UTF-8 decode
+  // catches the rest. Such a file isn't ignore patterns at all.
+  if (buf.includes(0) || !isValidUtf8(buf)) {
+    logWarn(
+      'Ignoring a .gitignore that is not valid UTF-8 text — it may have been encrypted ' +
+        'in place by endpoint-security software. Indexing continues without it.',
+      { file: giPath },
+    );
+    return '';
+  }
+  const content = buf.toString('utf-8');
+  // Fast path: one `.ignores()` call forces the library to compile EVERY rule,
+  // so if it doesn't throw, the whole file is safe to use verbatim.
+  try {
+    ignore().add(content).ignores('.codegraph-probe');
+    return content;
+  } catch {
+    // Fall through: a line is uncompilable — keep the good ones, drop the bad.
+  }
+  const kept: string[] = [];
+  let dropped = 0;
+  for (const line of content.split(/\r?\n/)) {
+    try {
+      ignore().add(line).ignores('.codegraph-probe');
+      kept.push(line);
+    } catch {
+      dropped++;
+    }
+  }
+  if (dropped > 0) {
+    logWarn(
+      `Skipped ${dropped} unparseable pattern(s) in a .gitignore; the rest are applied.`,
+      { file: giPath },
+    );
+  }
+  return kept.join('\n');
+}
+
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
@@ -168,12 +241,8 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
-  try {
-    const rootGitignore = path.join(rootDir, '.gitignore');
-    if (fs.existsSync(rootGitignore)) ig.add(fs.readFileSync(rootGitignore, 'utf-8'));
-  } catch {
-    // Unreadable root .gitignore — the built-in defaults still apply.
-  }
+  const rootGitignore = path.join(rootDir, '.gitignore');
+  if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
   return ig;
 }
 
@@ -191,39 +260,39 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
  * (See issue #193.)
  */
 function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): void {
-  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'] };
+  const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
   // which the index would otherwise represent only as a commit pointer.
   // Without this, monorepos using submodules index 0 files. (See issue #147.)
   // Note: --recurse-submodules only supports -c/--cached and --stage modes — it
   // can't be combined with -o, so untracked files are gathered separately below.
-  const tracked = execFileSync('git', ['ls-files', '-c', '--recurse-submodules'], gitOpts);
-  for (const line of tracked.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed) {
-      files.add(normalizePath(prefix + trimmed));
-    }
+  // -z gives NUL-separated, unquoted output so non-ASCII (e.g. CJK) paths
+  // survive verbatim. Without it git octal-escapes and double-quotes such paths
+  // (the core.quotepath default), and the quoted form never matches a real file
+  // on disk → those files are silently dropped from the index. (#541)
+  const tracked = execFileSync('git', ['ls-files', '-z', '-c', '--recurse-submodules'], gitOpts);
+  for (const rel of tracked.split('\0')) {
+    if (rel) files.add(normalizePath(prefix + rel));
   }
 
   // Untracked files (submodules manage their own untracked state). Embedded git
   // repos surface here as a single "subdir/" entry that git refuses to descend
   // into — recurse into those as their own repos so their source gets indexed.
-  const untracked = execFileSync('git', ['ls-files', '-o', '--exclude-standard'], gitOpts);
-  for (const line of untracked.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.endsWith('/')) {
+  const untracked = execFileSync('git', ['ls-files', '-z', '-o', '--exclude-standard'], gitOpts);
+  for (const rel of untracked.split('\0')) {
+    if (!rel) continue;
+    if (rel.endsWith('/')) {
       // git only emits a trailing-slash directory entry for an embedded repo.
       // Guard with a .git check anyway, and skip anything else exactly as git
       // itself skips it (we never descend into a non-repo opaque dir).
-      const childDir = path.join(repoDir, trimmed);
+      const childDir = path.join(repoDir, rel);
       if (fs.existsSync(path.join(childDir, '.git'))) {
-        collectGitFiles(childDir, prefix + trimmed, files);
+        collectGitFiles(childDir, prefix + rel, files);
       }
       continue;
     }
-    files.add(normalizePath(prefix + trimmed));
+    files.add(normalizePath(prefix + rel));
   }
 }
 
@@ -241,7 +310,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     const gitRoot = execFileSync(
       'git',
       ['rev-parse', '--show-toplevel'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     ).trim();
 
     if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
@@ -250,7 +319,7 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
         execFileSync(
           'git',
           ['check-ignore', '-q', path.resolve(rootDir)],
-          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }
+          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
         );
         // Directory is gitignored by parent repo — fall back to filesystem walk
         return null;
@@ -291,7 +360,7 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
     const output = execFileSync(
       'git',
       ['status', '--porcelain', '--no-renames'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] }
+      { cwd: rootDir, encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
     const modified: string[] = [];
@@ -403,15 +472,13 @@ function scanDirectoryWalk(
   }
 
   const loadIgnore = (dir: string): ScopedIgnore | null => {
-    try {
-      const giPath = path.join(dir, '.gitignore');
-      if (fs.existsSync(giPath)) {
-        return { dir, ig: ignore().add(fs.readFileSync(giPath, 'utf-8')) };
-      }
-    } catch {
-      // Unreadable .gitignore — treat as absent.
-    }
-    return null;
+    const giPath = path.join(dir, '.gitignore');
+    if (!fs.existsSync(giPath)) return null;
+    // readGitignorePatterns is defensive: a non-UTF-8 (DLP-encrypted) or
+    // uncompilable .gitignore is skipped/filtered with a warning, never thrown
+    // (issue #682) — so the per-file `.ignores()` calls below can't crash.
+    const patterns = readGitignorePatterns(giPath);
+    return patterns ? { dir, ig: ignore().add(patterns) } : null;
   };
 
   const isIgnored = (fullPath: string, isDir: boolean, matchers: ScopedIgnore[]): boolean => {
@@ -454,8 +521,9 @@ function scanDirectoryWalk(
     }
 
     for (const entry of entries) {
-      // Never descend into git internals or our own data directory.
-      if (entry.name === '.git' || entry.name === '.codegraph') continue;
+      // Never descend into git internals or any CodeGraph data directory
+      // (the active one or a sibling another environment created — #636).
+      if (entry.name === '.git' || isCodeGraphDataDir(entry.name)) continue;
 
       const fullPath = path.join(dir, entry.name);
       const relativePath = normalizePath(path.relative(rootDir, fullPath));
@@ -942,7 +1010,15 @@ export class ExtractionOrchestrator {
         } else if (result.errors.some((e) => e.severity === 'error')) {
           filesErrored++;
         } else {
-          filesSkipped++;
+          // Files with no symbols but no errors (yaml, twig, properties) are
+          // tracked at the file level — count them as indexed so the CLI
+          // doesn't misleadingly report "No files found to index".
+          const lang = detectLanguage(filePath, content);
+          if (isFileLevelOnlyLanguage(lang)) {
+            filesIndexed++;
+          } else {
+            filesSkipped++;
+          }
         }
       }
     }
@@ -1108,7 +1184,12 @@ export class ExtractionOrchestrator {
       } else if (result.errors.some((e) => e.severity === 'error')) {
         filesErrored++;
       } else {
-        filesSkipped++;
+        const tracked = this.queries.getFileByPath(filePath);
+        if (tracked && isFileLevelOnlyLanguage(tracked.language)) {
+          filesIndexed++;
+        } else {
+          filesSkipped++;
+        }
       }
     }
 

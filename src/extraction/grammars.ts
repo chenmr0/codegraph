@@ -10,7 +10,7 @@ import * as path from 'path';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -46,9 +46,15 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
+  '.mts': 'typescript',
+  '.cts': 'typescript',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
+  // SAP HANA XS Classic server-side JavaScript. (#556)
+  '.xsjs': 'javascript',
+  '.xsjslib': 'javascript',
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
@@ -63,6 +69,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.hpp': 'cpp',
   '.hxx': 'cpp',
   '.cs': 'csharp',
+  // ASP.NET Razor / Blazor markup — custom RazorExtractor (links @model/@inject/
+  // component tags to their C# types; markup isn't a tree-sitter grammar).
+  '.cshtml': 'razor',
+  '.razor': 'razor',
   '.php': 'php',
   // Drupal-specific PHP file extensions
   '.module': 'php',
@@ -111,9 +121,21 @@ export const EXTENSION_MAP: Record<string, Language> = {
  */
 export function isSourceFile(filePath: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
+  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+}
+
+/**
+ * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
+ * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
+ * extractor links them. (config/ + locales/ JSON have no section refs.)
+ */
+export function isShopifyLiquidJson(filePath: string): boolean {
+  // Allow nested template dirs (`templates/customers/login.json`), not just
+  // top-level (`templates/product.json`).
+  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
 }
 
 /**
@@ -178,8 +200,12 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
+      // build (ABI 13) has no primary-constructor support and parses
+      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+      // primary constructors natively.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -236,6 +262,9 @@ export function detectLanguage(filePath: string, source?: string): Language {
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
+  // links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath)) return 'liquid';
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -272,6 +301,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'liquid') return true; // custom regex extractor
+  if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
   if (language === 'twig') return true; // file-level tracking only
   if (language === 'xml') return true; // MyBatis mapper extractor
@@ -284,10 +314,23 @@ export function isLanguageSupported(language: Language): boolean {
  * Check if a grammar has been loaded and is ready for parsing.
  */
 export function isGrammarLoaded(language: Language): boolean {
-  if (language === 'svelte' || language === 'vue' || language === 'liquid') return true;
+  if (language === 'svelte' || language === 'vue' || language === 'liquid' || language === 'razor') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
   if (language === 'xml' || language === 'properties') return true; // no WASM grammar needed
   return languageCache.has(language);
+}
+
+/**
+ * Languages tracked at the file-record level only: parsing emits zero symbol
+ * nodes, but the file is still stored (and framework resolvers may add per-file
+ * references later, e.g. Drupal routing yml, Spring `@Value` against
+ * application.properties). This is the canonical set behind the no-symbol
+ * branch in `tree-sitter.ts`; `xml` is intentionally excluded because its
+ * MyBatis extractor emits a file node. Callers use this to count such files as
+ * indexed rather than skipped, so it must stay in sync with that branch.
+ */
+export function isFileLevelOnlyLanguage(language: Language): boolean {
+  return language === 'yaml' || language === 'twig' || language === 'properties';
 }
 
 /**
@@ -352,6 +395,7 @@ export function getLanguageDisplayName(language: Language): string {
     c: 'C',
     cpp: 'C++',
     csharp: 'C#',
+    razor: 'Razor/Blazor',
     php: 'PHP',
     ruby: 'Ruby',
     swift: 'Swift',

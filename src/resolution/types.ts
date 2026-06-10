@@ -81,6 +81,16 @@ export interface ResolutionContext {
   getAllFiles(): string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
+  /**
+   * Direct supertypes of the type named `typeName` (same language): the classes
+   * it extends and the interfaces / protocols / traits it implements/conforms to,
+   * by simple name. Backed by the resolved `implements`/`extends` edges, so it is
+   * EMPTY during the first resolution pass (edges aren't built yet) and populated
+   * afterward — the conformance pass uses it to resolve a chained method defined
+   * on a supertype the receiver type conforms to (e.g. a protocol-extension
+   * method). Optional so external/test contexts compile without it.
+   */
+  getSupertypes?(typeName: string, language: Language): string[];
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**
@@ -99,6 +109,13 @@ export interface ResolutionContext {
    * cross-package imports from third-party packages.
    */
   getGoModule?(): import('./go-module').GoModule | null;
+  /**
+   * Monorepo workspace member packages, keyed by declared package name.
+   * Returns `null` for single-package repos (no `workspaces` field).
+   * Lets the resolver treat `@scope/ui/sub` as a local import into the
+   * member's directory instead of an external npm package (#629).
+   */
+  getWorkspacePackages?(): import('./workspace-packages').WorkspacePackages | null;
   /**
    * Re-exports declared by a file (`export { x } from './other'`,
    * `export * from './other'`). Empty array when the file has none.

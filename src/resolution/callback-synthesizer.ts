@@ -21,9 +21,11 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node } from '../types';
+import type { Edge, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
+import { isGeneratedFile } from '../extraction/generated-detection';
+import { stripCommentsForRegex } from './strip-comments';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -40,13 +42,54 @@ const MAX_JSX_CHILDREN = 30;
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
 // are already caught by JSX_TAG_RE via the SFC component node.
 const VUE_KEBAB_RE = /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]/g;
+// PascalCase component tags — `<MediaCard ...>`, `<NavBar/>`. HTML elements are
+// lowercase, so an uppercase-initial tag is a component usage; built-ins
+// (`<NuxtLink>`, `<Transition>`) simply resolve to nothing and emit no edge.
+const VUE_PASCAL_RE = /<([A-Z][A-Za-z0-9]*)[\s/>]/g;
 const VUE_HANDLER_RE = /(?:@|v-on:)([a-zA-Z][\w-]*)(?:\.[\w]+)*\s*=\s*"([^"]+)"/g;
 // Composable/hook destructure: `const { close: closeSidebar } = useSidebarControl()`.
 // Captures the destructure body + the called composable; only `use*` calls qualify.
 const VUE_DESTRUCTURE_RE = /(?:const|let|var)\s*\{([^}]+)\}\s*=\s*(\w+)\s*\(/g;
 
+// Closure-collection dynamic dispatch (language-agnostic, Swift-first). A method
+// appends a closure to a collection property; another method iterates that
+// property *invoking each element* (`coll.forEach { $0() }` / `{ it() }`). The
+// element-invoke (`$0(` / `it(`) PROVES the collection holds closures, so pairing
+// a dispatcher to same-named registrars (`.append`/`.add`/`.push`/`.insert`,
+// incl. Swift `prop.write { $0.append }`) is high-precision. Cross-file/class by
+// design: Alamofire appends in `DataRequest.validate` but iterates in the base
+// `Request.didCompleteTask` — neither same-file nor same-class pairing reaches it.
+const CC_DISPATCH_RE = /(\w+)\.forEach\s*\{\s*(?:\$0|it)\s*\(/g;
+const CC_APPEND_WRITE_RE = /(\w+)\.write\s*\{\s*\$0(?:\.(\w+))?\.(?:append|add|push|insert)\s*\(/g;
+const CC_APPEND_DIRECT_RE = /(\w+)\.(?:append|add|push|insert)\s*\(/g;
+const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars than this (too generic to pair confidently)
+
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+}
+
+/**
+ * Nuxt auto-import name for a component, derived from its path UNDER `components/`:
+ * `components/media/Card.vue` → `MediaCard`, `components/base/foo/Bar.vue` →
+ * `BaseFooBar`. Each directory segment and the filename is PascalCased and
+ * concatenated; a directory whose PascalCase name prefixes the next segment is
+ * collapsed (Nuxt's de-dup: `base/BaseButton.vue` → `BaseButton`, not
+ * `BaseBaseButton`). Returns null for a flat component (`components/NavBar.vue`)
+ * — its node is already named by basename, so a direct tag match finds it.
+ */
+function nuxtComponentName(filePath: string): string | null {
+  const marker = filePath.lastIndexOf('components/');
+  if (marker === -1) return null;
+  const rel = filePath.slice(marker + 'components/'.length).replace(/\.(vue|ts|tsx|js|jsx)$/i, '');
+  const segs = rel.split('/').filter(Boolean).map(kebabToPascal);
+  if (segs.length < 2) return null;
+  const out: string[] = [];
+  for (const s of segs) {
+    const prev = out[out.length - 1];
+    if (prev && s.startsWith(prev)) out[out.length - 1] = s;
+    else out.push(s);
+  }
+  return out.join('');
 }
 
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
@@ -82,13 +125,23 @@ function enclosingFn(nodesInFile: Node[], line: number): Node | null {
   return best;
 }
 
+/**
+ * Stream method + function nodes lazily. The synthesizers only scan-and-filter
+ * down to a tiny matched subset, so materializing every function/method (which
+ * is gigabytes on a symbol-dense project) just to iterate it once is what OOM'd
+ * #610. Iterating keeps memory O(1) in the node count.
+ */
+function* methodAndFunctionNodes(queries: QueryBuilder): IterableIterator<Node> {
+  yield* queries.iterateNodesByKind('method');
+  yield* queries.iterateNodesByKind('function');
+}
+
 /** Phase 1: field-backed observer channels (registrar/dispatcher share a store). */
 function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
-  const candidates = [...queries.getNodesByKind('method'), ...queries.getNodesByKind('function')];
   const registrars: Array<{ node: Node; field: string }> = [];
   const dispatchers: Array<{ node: Node; field: string }> = [];
 
-  for (const m of candidates) {
+  for (const m of methodAndFunctionNodes(queries)) {
     const isReg = REGISTRAR_NAME.test(m.name);
     const isDisp = DISPATCHER_NAME.test(m.name);
     if (!isReg && !isDisp) continue;
@@ -136,6 +189,80 @@ function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
         });
         added++;
       }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Closure-collection dispatch: dispatcher iterates a closure-collection property
+ * invoking each element; registrar appends a closure to the same-named property.
+ * Emits dispatcher → registrar so a flow reaches the registration site (where the
+ * appended closure's body — and its callers — live). High-precision: the
+ * dispatcher's element-invoke is the gate (a `.forEach` that does NOT invoke its
+ * element is ignored), so a repo with no closure-collection dispatch yields zero
+ * edges regardless of how many `.append`/`.push` sites it has.
+ *
+ * Pairs globally by field name (cross-file/class is required — see Alamofire's
+ * base-class `Request.didCompleteTask` iterating `validators` appended by the
+ * subclass `DataRequest.validate`), bounded by a fan-out cap so a generic field
+ * name shared across unrelated classes can't fan out into noise.
+ */
+function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const dispatchers = new Map<string, Array<{ node: Node; line: number }>>(); // field → dispatcher methods + forEach line
+  const registrars = new Map<string, Array<{ node: Node; line: number }>>();   // field → registrar methods + append line
+
+  const addReg = (field: string | undefined, node: Node, absLine: number) => {
+    if (!field || /^\d+$/.test(field)) return; // `$0.append` mis-captures the `0`; the write-RE owns that field
+    const arr = registrars.get(field) ?? [];
+    if (!arr.some((r) => r.node.id === node.id)) arr.push({ node, line: absLine });
+    registrars.set(field, arr);
+  };
+
+  for (const m of methodAndFunctionNodes(queries)) {
+    const content = ctx.readFile(m.filePath);
+    const src = content && sliceLines(content, m.startLine, m.endLine);
+    if (!src) continue;
+    const hasForEach = src.includes('.forEach');
+    const hasAppend = src.includes('.append(') || src.includes('.add(') || src.includes('.push(') || src.includes('.insert(');
+    if (!hasForEach && !hasAppend) continue;
+    const lineAt = (idx: number) => (m.startLine ?? 1) + src.slice(0, idx).split('\n').length - 1;
+
+    if (hasForEach) {
+      CC_DISPATCH_RE.lastIndex = 0;
+      let d: RegExpExecArray | null;
+      while ((d = CC_DISPATCH_RE.exec(src))) {
+        const arr = dispatchers.get(d[1]!) ?? [];
+        if (!arr.some((n) => n.node.id === m.id)) arr.push({ node: m, line: lineAt(d.index) });
+        dispatchers.set(d[1]!, arr);
+      }
+    }
+    if (hasAppend) {
+      CC_APPEND_WRITE_RE.lastIndex = 0;
+      let w: RegExpExecArray | null;
+      while ((w = CC_APPEND_WRITE_RE.exec(src))) addReg(w[2] || w[1], m, lineAt(w.index)); // nested `$0.streams` else the `.write` receiver
+      CC_APPEND_DIRECT_RE.lastIndex = 0;
+      let a: RegExpExecArray | null;
+      while ((a = CC_APPEND_DIRECT_RE.exec(src))) addReg(a[1], m, lineAt(a.index));
+    }
+  }
+
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const [field, disps] of dispatchers) {
+    const regs = registrars.get(field);
+    if (!regs || regs.length === 0) continue;
+    if (disps.length > CC_FANOUT_CAP || regs.length > CC_FANOUT_CAP) continue; // generic field — can't pair confidently
+    for (const disp of disps) for (const reg of regs) {
+      if (disp.node.id === reg.node.id) continue;
+      const key = `${disp.node.id}>${reg.node.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: disp.node.id, target: reg.node.id, kind: 'calls', line: disp.line,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'closure-collection', field, registeredAt: `${reg.node.filePath}:${reg.line}` },
+      });
     }
   }
   return edges;
@@ -337,7 +464,210 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
  * trace/callees reach the implementation. Over-approximation accepted
  * (reachability-correct); capped per class, gated to JVM languages.
  */
-const IFACE_OVERRIDE_LANGS = new Set(['java', 'kotlin']);
+// Languages whose static `implements`/`extends` edges should bridge an
+// interface (or abstract base) method to the matching concrete-class method.
+// The set is "languages with explicit nominal subtyping and a single class
+// kind that holds methods" — i.e. the shape this loop expects. Swift and
+// Scala fit shape-wise (Swift `protocol`/`class`, Scala `trait`/`class`)
+// and are added below; their concrete-side nodes can be a `struct` (Swift)
+// or an `object` (Scala) so the loop also iterates those kinds.
+const IFACE_OVERRIDE_LANGS = new Set([
+  'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'swift', 'scala', 'go', 'rust',
+]);
+/**
+ * Go implicit interface satisfaction (#584). Go has no `implements` keyword — a
+ * struct satisfies an interface structurally when its method set covers the
+ * interface's. Synthesize the missing `implements` edge (struct → interface) by
+ * matching method-NAME sets, so impl-navigation works and the interface-dispatch
+ * bridge ({@link interfaceOverrideEdges}, now 'go'-enabled) can link an interface
+ * method call to the concrete overrides.
+ *
+ * Name-only matching (signatures ignored) — over-approximation accepted, in line
+ * with the other dispatch synthesizers; capped per interface. Empty interfaces
+ * (`any`) are skipped so they don't match every struct.
+ */
+function goImplementsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const methodNameSet = (id: string): Set<string> =>
+    new Set(
+      queries
+        .getOutgoingEdges(id, ['contains'])
+        .map((e) => queries.getNodeById(e.target))
+        .filter((n): n is Node => !!n && n.kind === 'method')
+        .map((n) => n.name),
+    );
+
+  const goStructs = queries.getNodesByKind('struct').filter((s) => s.language === 'go');
+  const structMethods = new Map<string, Set<string>>();
+  for (const s of goStructs) structMethods.set(s.id, methodNameSet(s.id));
+
+  for (const iface of queries.getNodesByKind('interface')) {
+    if (iface.language !== 'go') continue;
+    const want = methodNameSet(iface.id);
+    if (want.size === 0) continue; // empty interface (`any`) — would match everything
+    let added = 0;
+    for (const s of goStructs) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const have = structMethods.get(s.id);
+      if (!have || have.size < want.size) continue;
+      let all = true;
+      for (const m of want) {
+        if (!have.has(m)) { all = false; break; }
+      }
+      if (!all) continue;
+      const key = `${s.id}>${iface.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: s.id,
+        target: iface.id,
+        kind: 'implements',
+        line: s.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'go-implements', via: iface.name, registeredAt: `${s.filePath}:${s.startLine}` },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+/**
+ * Cross-file Go method → receiver-type `contains` edges. In Go a type's methods
+ * are commonly declared in a different file from the `type` declaration itself
+ * (`type User struct{…}` in `user.go`, `func (u *User) Save()` in
+ * `user_store.go`). Extraction attaches the struct→method `contains` edge only
+ * when the receiver type is in the SAME file — the owner lookup in
+ * `tree-sitter.ts` is scoped to the file being parsed — so a cross-file method
+ * is left orphaned from its type (it's still `contains`ed by its file, just not
+ * its struct). That breaks `codegraph_node` member outlines, any
+ * callers/callees/impact traversal that goes through the type's `contains`
+ * edges, and the {@link goImplementsEdges} method-set computation (which derives
+ * a struct's method set from those same edges, so it under-counts interfaces a
+ * cross-file struct satisfies).
+ *
+ * Go guarantees a method's receiver type is declared in the SAME PACKAGE as the
+ * method, and a Go package is a single directory — so this is a deterministic
+ * structural link, not a heuristic: find the same-named type in the method's own
+ * directory and add the missing `contains` edge (no `provenance: 'heuristic'`,
+ * matching the same-file edges extraction already emits). Skips methods that
+ * already have a type parent (the same-file case). (#583, cross-file half)
+ */
+function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const TYPE_KINDS = new Set<NodeKind>(['struct', 'class', 'interface', 'enum', 'type_alias']);
+  const dirOf = (p: string): string => {
+    const i = p.replace(/\\/g, '/').lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+
+  for (const method of queries.getNodesByKind('method')) {
+    if (method.language !== 'go') continue;
+    // The receiver type is encoded in the method's qualifiedName as `Recv::name`
+    // (extraction sets `${receiverType}::${name}` for receiver methods).
+    const qn = method.qualifiedName;
+    if (!qn) continue;
+    const sep = qn.lastIndexOf('::');
+    if (sep <= 0) continue;
+    const receiver = qn.slice(0, sep);
+    if (!receiver) continue;
+
+    // Already attached to its type (same-file case handled at extraction)?
+    const hasTypeParent = queries
+      .getIncomingEdges(method.id, ['contains'])
+      .some((e) => {
+        const src = queries.getNodeById(e.source);
+        return src != null && TYPE_KINDS.has(src.kind);
+      });
+    if (hasTypeParent) continue;
+
+    // Find the receiver type in the SAME directory (= same Go package). Go forbids
+    // duplicate type names within a package, so a same-name same-dir match is
+    // unambiguous; scoping to the directory avoids linking to a same-named type
+    // in another package.
+    const dir = dirOf(method.filePath);
+    const owner = queries
+      .getNodesByName(receiver)
+      .find((n) => n.language === 'go' && TYPE_KINDS.has(n.kind) && dirOf(n.filePath) === dir);
+    if (!owner) continue;
+
+    const key = `${owner.id}>${method.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({ source: owner.id, target: method.id, kind: 'contains', line: method.startLine });
+  }
+  return edges;
+}
+
+/**
+ * Kotlin Multiplatform `expect`/`actual` linking. A `common` source set declares
+ * `expect fun foo()` / `expect class Bar`; each platform source set (jvm, native,
+ * js, …) provides an `actual` implementation with the IDENTICAL fully-qualified
+ * name in a different file. Callers in common code resolve to the `expect`
+ * declaration, so every `actual` impl ends up with zero dependents — invisible to
+ * impact/affected even though editing it can break every caller of the API.
+ *
+ * Synthesize a `calls` edge from the common declaration to each platform `actual`
+ * (mirroring the interface-impl bridge: abstract → concrete), so editing a
+ * platform impl surfaces the common `expect` and its callers, and the impl file
+ * participates in the graph.
+ *
+ * `expect`/`actual` are captured onto the node's `decorators` list at extraction
+ * (kotlin.ts `extractModifiers`). Members of an `expect class` are NOT themselves
+ * keyword-marked, so the declaration side is matched as the same-FQN, same-kind
+ * node that is NOT marked `actual`. Requiring an `actual`-marked counterpart also
+ * gates out plain cross-file overloads (neither side is marked).
+ */
+// Kinds that an `expect`/`actual` pair may legitimately straddle. `expect class`
+// is routinely fulfilled by an `actual typealias` (e.g. `actual typealias
+// CancellationException = …`, `actual typealias SchedulerTask = Task`), so a
+// strict kind match would miss those one-line alias files. Same-FQN + the
+// `actual` marker already gates out unrelated symbols, so widening to the
+// type-like kinds is safe.
+const KMP_TYPE_KINDS = new Set(['class', 'interface', 'struct', 'enum', 'type_alias']);
+function kmpKindsCompatible(a: string, b: string): boolean {
+  return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
+}
+
+function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const actuals = queries
+    .getAllNodes()
+    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
+  for (const act of actuals) {
+    let added = 0;
+    for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      // The declaration side: same FQN + compatible kind, a different file, NOT
+      // itself an `actual` (that would be a sibling platform impl, not the decl).
+      if (cand.language !== 'kotlin' || cand.id === act.id) continue;
+      if (!kmpKindsCompatible(cand.kind, act.kind) || cand.filePath === act.filePath) continue;
+      if (cand.decorators?.includes('actual')) continue;
+      const key = `${cand.id}>${act.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: cand.id,
+        target: act.id,
+        kind: 'calls',
+        line: cand.startLine,
+        provenance: 'heuristic',
+        metadata: {
+          synthesizedBy: 'kotlin-expect-actual',
+          via: act.name,
+          registeredAt: `${act.filePath}:${act.startLine}`,
+        },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -346,7 +676,12 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
-  for (const cls of queries.getNodesByKind('class')) {
+  // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
+  // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
+  // types that conform to protocols. Iterate both.
+  const concreteKinds = ['class', 'struct'] as const;
+  for (const kind of concreteKinds) {
+  for (const cls of queries.getNodesByKind(kind)) {
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
     if (implMethods.length === 0) continue;
     for (const sup of queries.getOutgoingEdges(cls.id, ['implements', 'extends'])) {
@@ -377,6 +712,116 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
             line: bm.startLine,
             provenance: 'heuristic',
             metadata: { synthesizedBy: 'interface-impl', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+          });
+          added++;
+        }
+      }
+    }
+  }
+  }
+  return edges;
+}
+
+/**
+ * Go gRPC stub → impl bridge. The protoc-gen-go-grpc codegen emits an
+ * `UnimplementedXxxServer` struct in `*_grpc.pb.go` carrying one method
+ * per service RPC; the real handler is a hand-written struct in another
+ * file (`x/bank/keeper/msg_server.go::msgServer.Send` in cosmos-sdk).
+ * Go's structural typing means no `implements` edge exists for our
+ * resolver to follow, so `trace("Send","SendCoins")` lands on the
+ * empty stub and reports "no path" (validated empirically — the cosmos
+ * Q1 r1 trace failure that drove this work).
+ *
+ * Bridge: for each `UnimplementedXxxServer` whose RPC-method names are
+ * a SUBSET of some other Go struct's method names, emit `calls` edges
+ * `stub.method → impl.method` (paired by name). Excludes the gRPC
+ * internal markers `mustEmbedUnimplementedXxxServer` and
+ * `testEmbeddedByValue`, and skips candidate impls that themselves
+ * live in a generated file (their `xxxClient` / sibling stubs would
+ * otherwise look like impls).
+ *
+ * Multiple candidates is allowed and capped at MAX_CALLBACKS_PER_CHANNEL —
+ * a service often has both a production impl and one or more test
+ * mocks; linking to all preserves trace utility without false-favoring.
+ *
+ * Provenance: `heuristic`, `synthesizedBy: 'go-grpc-stub-impl'`. The
+ * stub's source line is the wiring site shown in the trace trail.
+ */
+function goGrpcStubImplEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  const STUB_RE = /^Unimplemented.*Server$/;
+  // gRPC internal-helper methods that appear on every Unimplemented*Server;
+  // not part of the service contract, so exclude when computing the RPC-method
+  // signature used to match impls.
+  const isInternalMarker = (n: string) => n.startsWith('mustEmbed') || n === 'testEmbeddedByValue';
+
+  // Methods directly contained by each Go struct, name-only. Built once.
+  const methodNamesByStruct = new Map<string, Set<string>>();
+  const methodNodesByStruct = new Map<string, Node[]>();
+  const goStructs: Node[] = [];
+  for (const s of queries.getNodesByKind('struct')) {
+    if (s.language !== 'go') continue;
+    goStructs.push(s);
+    const ms = queries
+      .getOutgoingEdges(s.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+    methodNodesByStruct.set(s.id, ms);
+    methodNamesByStruct.set(s.id, new Set(ms.map((m) => m.name)));
+  }
+
+  for (const stub of goStructs) {
+    if (!STUB_RE.test(stub.name)) continue;
+    // The stub MUST live in a generated file — that's what tells us this is
+    // a protoc-emitted scaffold rather than someone naming a struct
+    // `UnimplementedXxxServer` by hand. Without this gate we'd also bridge
+    // such hand-written structs and create misleading edges.
+    if (!isGeneratedFile(stub.filePath)) continue;
+
+    const stubMethods = (methodNodesByStruct.get(stub.id) ?? []).filter(
+      (m) => !isInternalMarker(m.name),
+    );
+    if (stubMethods.length === 0) continue;
+    const stubMethodNames = stubMethods.map((m) => m.name);
+
+    for (const cand of goStructs) {
+      if (cand.id === stub.id) continue;
+      // Skip generated-file candidates — they're siblings (msgClient,
+      // UnsafeMsgServer, …) whose method sets coincidentally match.
+      if (isGeneratedFile(cand.filePath)) continue;
+
+      const candNames = methodNamesByStruct.get(cand.id);
+      if (!candNames) continue;
+      // Subset: every RPC method must exist on the candidate by name.
+      // Signature-level match would tighten this further, but name-match
+      // alone already gives one-to-one pairing in real codebases because
+      // gRPC method-name sets are highly distinctive (Send + MultiSend +
+      // UpdateParams + SetSendEnabled is unique to bank's MsgServer).
+      if (!stubMethodNames.every((n) => candNames.has(n))) continue;
+
+      const candMethods = methodNodesByStruct.get(cand.id) ?? [];
+      let added = 0;
+      for (const sm of stubMethods) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        for (const cm of candMethods) {
+          if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+          if (cm.name !== sm.name) continue;
+          const key = `${sm.id}>${cm.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: sm.id,
+            target: cm.id,
+            kind: 'calls',
+            line: sm.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'go-grpc-stub-impl',
+              via: cm.name,
+              registeredAt: `${cm.filePath}:${cm.startLine}`,
+            },
           });
           added++;
         }
@@ -452,6 +897,16 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
   // A composable's returned member may be a fn (`function close(){}`) or an
   // arrow assigned to a const (`const close = () => {}`).
   const RETURN_KINDS = new Set(['method', 'function', 'variable', 'constant']);
+  // Nuxt auto-imports nested components by a DIRECTORY-PREFIXED name —
+  // `components/media/Card.vue` is used as `<MediaCard/>`, not `<Card/>` — but
+  // the component node is named by basename (`Card`), so a direct tag match
+  // misses it (flat components match by basename and don't need this). Map each
+  // nested component's Nuxt name → node so those template usages resolve.
+  const nuxtComponents = new Map<string, Node>();
+  for (const c of ctx.getNodesByKind('component')) {
+    const nn = nuxtComponentName(c.filePath);
+    if (nn && !nuxtComponents.has(nn)) nuxtComponents.set(nn, c);
+  }
   for (const file of ctx.getAllFiles()) {
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
@@ -493,7 +948,18 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
-    while ((m = VUE_KEBAB_RE.exec(tpl))) addEdge(resolve(kebabToPascal(m[1]!), COMPONENT_KINDS), { synthesizedBy: 'jsx-render', via: m[1] });
+    while ((m = VUE_KEBAB_RE.exec(tpl))) {
+      const tag = kebabToPascal(m[1]!);
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+    }
+    // PascalCase component tags. Try a direct name match first (flat components
+    // and explicit registrations), then the Nuxt dir-prefixed auto-import name
+    // (`<MediaCard>` → components/media/Card.vue). Built-ins match neither → no edge.
+    VUE_PASCAL_RE.lastIndex = 0;
+    while ((m = VUE_PASCAL_RE.exec(tpl))) {
+      const tag = m[1]!;
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+    }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
       const event = m[1]!;
@@ -557,6 +1023,14 @@ const RN_SWIFT_SEND_RE = /\bsendEvent\s*\(\s*withName\s*:\s*"([^"]+)"/g;
 // JVM source files in the consumer so we don't re-process JS emits
 // (which `eventEmitterEdges` already handles).
 const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
+// Custom `sendEvent(reactContext, "X", body)` wrapper — extremely common
+// (react-native-device-info and many libs wrap `DeviceEventManagerModule…emit`
+// behind a helper whose `.emit(eventName, …)` uses a VARIABLE, so RN_JVM_EMIT_RE
+// misses it; the literal lives in the wrapper CALL instead). Captures the first
+// string literal inside a `sendEvent(...)` call. `[^;{}]*?` keeps it on one
+// statement and stops at a block boundary, so the wrapper DEFINITION (whose `(`
+// is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
+const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
 function rnEventEdges(ctx: ResolutionContext): Edge[] {
   // Native dispatchers (source = the native method whose body sends the
@@ -596,15 +1070,24 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
       while ((m = RN_SWIFT_SEND_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
     }
 
-    // JVM side: `.emit("X", …)` in Java/Kotlin. (We pattern-match
-    // anywhere in the file; the JS in-language path uses a separate
-    // emitter object pattern and is already handled by eventEmitterEdges.)
+    // JVM side: `.emit("X", …)` in Java/Kotlin, plus the common
+    // `sendEvent(ctx, "X", body)` wrapper. (We pattern-match anywhere in the
+    // file; the JS in-language path uses a separate emitter object pattern and
+    // is already handled by eventEmitterEdges.)
     if (file.endsWith('.java') || file.endsWith('.kt')) {
-      RN_JVM_EMIT_RE.lastIndex = 0;
       let m: RegExpExecArray | null;
+      RN_JVM_EMIT_RE.lastIndex = 0;
       while ((m = RN_JVM_EMIT_RE.exec(content))) {
+        if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
+      while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
     }
@@ -728,6 +1211,130 @@ function rnEventEdges(ctx: ResolutionContext): Edge[] {
  */
 const FABRIC_NATIVE_SUFFIXES = ['', 'View', 'ViewManager', 'ComponentView', 'Manager'];
 
+/**
+ * Expo Modules cross-platform pairing. An Expo Module exposes the SAME
+ * JS-visible method (`AsyncFunction("getBatteryLevelAsync")`) from BOTH an iOS
+ * (Swift) and an Android (Kotlin) implementation. A JS callsite name-resolves to
+ * only ONE of them, so the other platform's impl looked like nothing called it
+ * (and editing it showed no blast radius). Link the iOS and Android impls of the
+ * same `<module>.<method>` to each other (both directions), so a JS call that
+ * reaches one platform reaches the other, and editing either surfaces the JS
+ * caller. The Expo method nodes are id-prefixed `expo-module:` and qualified
+ * `<file>::<module>.<method>` by the framework extractor.
+ */
+function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const byKey = new Map<string, Node[]>();
+  for (const m of queries.getNodesByKind('method')) {
+    if (!m.id.startsWith('expo-module:')) continue;
+    const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
+    if (!key) continue;
+    const arr = byKey.get(key);
+    if (arr) arr.push(m);
+    else byKey.set(key, [m]);
+  }
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    for (const a of group) {
+      for (const b of group) {
+        if (a.id === b.id || a.language === b.language) continue; // cross-platform only
+        const key = `${a.id}>${b.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: a.id,
+          target: b.id,
+          kind: 'calls',
+          line: a.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'expo-cross-platform', via: a.name },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Classic React Native NativeModules cross-platform pairing. A native module
+ * method (`@ReactMethod` on Android, `RCT_EXPORT_METHOD` on iOS) is implemented
+ * on BOTH platforms, but a JS callsite name-resolves to only ONE — so the other
+ * platform's impl looked like nothing called it. A native method that HAS a JS
+ * caller is a confirmed bridge method; link it to the same-named native method
+ * in another language (the other platform's impl) so a JS call reaching one
+ * platform reaches the other, and editing either surfaces the JS caller.
+ *
+ * Names are normalized to the first selector keyword (`getFreeDiskStorage:` →
+ * `getFreeDiskStorage`) — that's the JS-visible name, and how the iOS selector
+ * lines up with the bare Android method name.
+ */
+function rnCrossPlatformEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const NATIVE = new Set(['java', 'kotlin', 'objc', 'cpp']);
+  const JS = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+  // RN module INFRASTRUCTURE methods exist on every native module (called by the
+  // RN runtime, not user JS), so pairing them by name would cross-link unrelated
+  // modules in a multi-module repo. Skip them — they aren't user-facing methods.
+  const RN_INFRA = new Set([
+    'addListener', 'removeListeners', 'getConstants', 'constantsToExport', 'getName',
+    'invalidate', 'initialize', 'getDefaultEventTypes', 'supportedEvents',
+    'requiresMainQueueSetup', 'methodQueue',
+  ]);
+  const norm = (name: string): string => {
+    const i = name.indexOf(':');
+    return i >= 0 ? name.slice(0, i) : name;
+  };
+
+  // Index native methods by their JS-visible (normalized) name. Only names with
+  // impls in ≥2 native languages can pair, so the per-method JS-caller check
+  // below only runs for genuine cross-platform candidates.
+  const byName = new Map<string, Node[]>();
+  for (const m of queries.iterateNodesByKind('method')) {
+    if (!NATIVE.has(m.language)) continue;
+    const key = norm(m.name);
+    const arr = byName.get(key);
+    if (arr) arr.push(m);
+    else byName.set(key, [m]);
+  }
+
+  for (const [groupName, group] of byName) {
+    if (RN_INFRA.has(groupName)) continue;
+    const langs = new Set(group.map((m) => m.language));
+    if (langs.size < 2) continue; // single-platform — nothing to pair
+    for (const m of group) {
+      // Is m a bridge method? (a JS-language `calls` edge points at it)
+      const incoming = queries.getIncomingEdges(m.id, ['calls']);
+      if (incoming.length === 0) continue;
+      const sources = queries.getNodesByIds(incoming.map((e) => e.source));
+      const isBridge = incoming.some((e) => {
+        const s = sources.get(e.source);
+        return !!s && JS.has(s.language);
+      });
+      if (!isBridge) continue;
+      // Link to the other-platform impls (both directions).
+      for (const sib of group) {
+        if (sib.id === m.id || sib.language === m.language) continue;
+        for (const [a, b] of [[m, sib], [sib, m]] as const) {
+          const key = `${a.id}>${b.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: a.id,
+            target: b.id,
+            kind: 'calls',
+            line: a.startLine,
+            provenance: 'heuristic',
+            metadata: { synthesizedBy: 'rn-cross-platform', via: norm(m.name) },
+          });
+        }
+      }
+    }
+  }
+  return edges;
+}
+
 function fabricNativeImplEdges(ctx: ResolutionContext): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -795,7 +1402,7 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
   const seen = new Set<string>();
   // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
   const javaIndex = new Map<string, Node[]>();
-  for (const m of queries.getNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKind('method')) {
     if (m.language !== 'java' && m.language !== 'kotlin') continue;
     const parts = m.qualifiedName.split('::');
     const last = parts[parts.length - 1];
@@ -806,7 +1413,7 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
     if (arr) arr.push(m); else javaIndex.set(key, [m]);
   }
 
-  for (const xml of queries.getNodesByKind('method')) {
+  for (const xml of queries.iterateNodesByKind('method')) {
     if (xml.language !== 'xml') continue;
     // Qualified name: `<namespace>::<id>`. Extract the simple class name.
     const colonIdx = xml.qualifiedName.lastIndexOf('::');
@@ -842,38 +1449,267 @@ function mybatisJavaXmlEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * Gin middleware chain. Gin runs its entire handler chain through one dynamic
+ * line in `(*Context).Next`:
+ *     for c.index < len(c.handlers) { c.handlers[c.index](c); c.index++ }
+ * `c.handlers` is a `HandlersChain` (`[]HandlerFunc`) assembled at registration
+ * time by `combineHandlers` from the funcs passed to `r.Use(...)` /
+ * `r.GET("/path", h...)` / `r.Handle(...)`. Because the call is a computed index
+ * into a runtime-built slice, tree-sitter resolves `c.handlers[c.index](c)` to
+ * NOTHING — so `callees(Next)` is just the `len()` helper and the flow
+ * `ServeHTTP → handleHTTPRequest → Next` dead-ends at the exact symbol the
+ * "how do requests flow through the middleware chain" question is about. The
+ * agent then re-queries Next and falls back to Read/grep (validated: the gin
+ * WITH-arm rabbit-holed on precisely this dead-end).
+ *
+ * Bridge it: find the chain DISPATCHER (a Go method whose body invokes a
+ * `handlers` slice by index) and link it → every HandlerFunc registered via a
+ * gin registration call, so `callees(Next)` and `trace(ServeHTTP, <handler>)`
+ * connect end-to-end. Named handlers only (`gin.Logger()` → `Logger`,
+ * `authMiddleware`); inline closures are anonymous and skipped. Like
+ * react-render / interface-impl this is a deliberate over-approximation —
+ * reachability-correct (any registered handler CAN run for some route), capped,
+ * and gated on the dispatcher existing so it never runs on non-gin Go repos.
+ * Provenance `heuristic`, `synthesizedBy:'gin-middleware-chain'`; `registeredAt`
+ * is the `.Use`/`.GET` site an agent would otherwise grep for.
+ */
+const GIN_DISPATCH_RE = /\.handlers\s*\[[^\]]*\]\s*\(/;                 // c.handlers[c.index](c)
+const GIN_REG_RE = /\.(?:Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/g;
+
+/** Balanced `(...)` body starting at the '(' index; null if unbalanced. */
+function goBalancedArgs(s: string, openIdx: number): string | null {
+  let depth = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return s.slice(openIdx + 1, i); }
+  }
+  return null;
+}
+/** Split a top-level comma list, respecting nested () [] {}. */
+function goSplitArgs(args: string): string[] {
+  const out: string[] = [];
+  let depth = 0, cur = '';
+  for (const c of args) {
+    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
+    else if (c === ',' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+/** Tail ident of a handler arg: `gin.Logger()`→`Logger`, `mw`→`mw`; null for string paths / closures. */
+function goHandlerIdent(expr: string): string | null {
+  const cleaned = expr.trim().replace(/\(\s*\)$/, '');                  // drop a trailing call ()
+  if (!cleaned || cleaned.startsWith('"') || cleaned.startsWith('`') || cleaned.startsWith('func')) return null;
+  const m = cleaned.match(/(?:\.|^)([A-Za-z_]\w*)$/);
+  return m ? m[1]! : null;
+}
+
+function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  // 1. Find the chain dispatcher(s): a Go method that invokes a `handlers` slice by index.
+  const dispatchers: Node[] = [];
+  for (const n of queries.iterateNodesByKind('method')) {
+    if (n.language !== 'go') continue;
+    const content = ctx.readFile(n.filePath);
+    const src = content && sliceLines(content, n.startLine, n.endLine);
+    if (src && GIN_DISPATCH_RE.test(src)) dispatchers.push(n);
+  }
+  if (dispatchers.length === 0) return [];                              // not a gin repo — bail
+
+  // 2. Collect handler identifiers registered via gin registration calls
+  //    (.Use / .GET / … / .Handle). String args (paths/methods) and inline
+  //    closures are dropped by goHandlerIdent; the rest are HandlerFuncs.
+  const registered = new Map<string, string>();                         // name → registeredAt (file:line)
+  for (const file of ctx.getAllFiles()) {
+    if (!file.endsWith('.go')) continue;
+    const content = ctx.readFile(file);
+    if (!content || (!content.includes('.Use(') && !/\.(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\(/.test(content))) continue;
+    const safe = stripCommentsForRegex(content, 'go');
+    GIN_REG_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = GIN_REG_RE.exec(safe))) {
+      const parenIdx = m.index + m[0].length - 1;
+      const argStr = goBalancedArgs(safe, parenIdx);
+      if (!argStr) continue;
+      const line = safe.slice(0, m.index).split('\n').length;
+      for (const arg of goSplitArgs(argStr)) {
+        const name = goHandlerIdent(arg);
+        if (name && !registered.has(name)) registered.set(name, `${file}:${line}`);
+      }
+    }
+  }
+  if (registered.size === 0) return [];
+
+  // 3. Link each dispatcher → each registered handler node (dedup, capped).
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const disp of dispatchers) {
+    let added = 0;
+    for (const [name, registeredAt] of registered) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      const handler = ctx.getNodesByName(name).find(
+        (n) => (n.kind === 'function' || n.kind === 'method') && n.language === 'go'
+      );
+      if (!handler || handler.id === disp.id) continue;
+      const key = `${disp.id}>${handler.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: disp.id, target: handler.id, kind: 'calls', line: disp.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'gin-middleware-chain', via: name, registeredAt },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
+/**
+ * Delphi form code-behind: a form unit `UFRMAbout.pas` owns its visual form
+ * definition `UFRMAbout.dfm` (VCL) / `.fmx` (FireMonkey) — paired by basename in
+ * the same directory, wired by the `{$R *.dfm}` directive rather than a `uses`
+ * clause. Link the unit → its form so a `.dfm`/`.fmx` used only as a form
+ * definition isn't orphaned, and editing the form surfaces its code-behind unit.
+ */
+function pascalFormEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const allFiles = new Set(ctx.getAllFiles());
+  for (const file of allFiles) {
+    if (!/\.(dfm|fmx)$/i.test(file)) continue;
+    const pasFile = file.replace(/\.(dfm|fmx)$/i, '.pas');
+    if (!allFiles.has(pasFile)) continue;
+    const formNode = ctx.getNodesInFile(file).find((n) => n.kind === 'file');
+    const unitNode = ctx.getNodesInFile(pasFile).find((n) => n.kind === 'file');
+    if (!formNode || !unitNode) continue;
+    edges.push({
+      source: unitNode.id,
+      target: formNode.id,
+      kind: 'references',
+      line: unitNode.startLine,
+      provenance: 'heuristic',
+      metadata: { synthesizedBy: 'pascal-form', registeredAt: pasFile },
+    });
+  }
+  return edges;
+}
+
+/**
+ * SvelteKit file-convention data flow. A route directory's `+page.svelte` (a
+ * `component` node) receives its `data` from the sibling `+page.server.{ts,js}`
+ * / `+page.{ts,js}` `load` function and posts forms to its `actions` — wired by
+ * the framework BY FILE PATH, with no static import between them. So editing a
+ * `load` shows no impact on the page it feeds, and the page looks like it has no
+ * server-side dependency. Link the page component to its sibling loader's
+ * `load` / `actions` (same for `+layout`). The pairing is path-deterministic
+ * (same directory, matching `+page`/`+layout` prefix), so it's precise — but
+ * it's a framework-convention edge, so provenance stays `heuristic`.
+ *
+ * Direction: page → load, so `getImpactRadius(load)` surfaces the page (editing
+ * a loader's data shows the page it feeds) and the page's dependencies include
+ * its loader.
+ */
+function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const allFiles = new Set(ctx.getAllFiles());
+  const HOOKS = new Set(['load', 'actions']);
+  const HOOK_KINDS = new Set(['function', 'method', 'constant', 'variable']);
+  for (const file of allFiles) {
+    const m = file.match(/(.*\/)(\+(?:page|layout))\.svelte$/);
+    if (!m) continue;
+    const dir = m[1]!;
+    const prefix = m[2]!;
+    const page = ctx.getNodesInFile(file).find((n) => n.kind === 'component');
+    if (!page) continue;
+    for (const ext of ['.server.ts', '.server.js', '.ts', '.js']) {
+      const loaderFile = `${dir}${prefix}${ext}`;
+      if (!allFiles.has(loaderFile)) continue;
+      for (const hook of ctx.getNodesInFile(loaderFile)) {
+        if (!HOOK_KINDS.has(hook.kind) || !HOOKS.has(hook.name)) continue;
+        edges.push({
+          source: page.id,
+          target: hook.id,
+          kind: 'references',
+          line: page.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'sveltekit-load',
+            via: hook.name,
+            registeredAt: `${loaderFile}:${hook.startLine ?? 0}`,
+          },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children + Vue templates + RN event channel +
- * Fabric native-impl + MyBatis Java↔XML). Returns the count added. Never
- * throws into indexing — callers wrap in try/catch.
+ * React re-render + JSX children + Vue templates + SvelteKit load + RN event
+ * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain).
+ * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+  // Cross-file Go method→type `contains` edges must be synthesized AND persisted
+  // FIRST: a method declared in a different file from its receiver type is
+  // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
+  // struct's method set from its `contains` edges — so without this it would
+  // under-count the interfaces a cross-file struct satisfies. (#583)
+  const goMethodContains = goCrossFileMethodContainsEdges(queries);
+  if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+
+  // Go implicit `implements` edges must be synthesized AND persisted next: the
+  // interface-dispatch bridge below reads `implements` edges from the DB, and
+  // Go has none statically. (Other languages already have static implements
+  // edges from extraction, so they don't need this pre-pass.)
+  const goImpl = goImplementsEdges(queries);
+  if (goImpl.length > 0) queries.insertEdges(goImpl);
+
   const fieldEdges = fieldChannelEdges(queries, ctx);
+  const closureCollEdges = closureCollectionEdges(queries, ctx);
   const emitterEdges = eventEmitterEdges(ctx);
   const renderEdges = reactRenderEdges(queries, ctx);
   const jsxEdges = reactJsxChildEdges(ctx);
   const vueEdges = vueTemplateEdges(ctx);
+  const svelteKitEdges = svelteKitLoadEdges(ctx);
+  const pascalEdges = pascalFormEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const kotlinExpectActual = kotlinExpectActualEdges(queries);
+  const goGrpcEdges = goGrpcStubImplEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
+  const expoXPlatEdges = expoCrossPlatformEdges(queries);
+  const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
+  const ginEdges = ginMiddlewareChainEdges(queries, ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
   for (const e of [
     ...fieldEdges,
+    ...closureCollEdges,
     ...emitterEdges,
     ...renderEdges,
     ...jsxEdges,
     ...vueEdges,
+    ...svelteKitEdges,
+    ...pascalEdges,
     ...flutterEdges,
     ...cppEdges,
     ...ifaceEdges,
+    ...kotlinExpectActual,
+    ...goGrpcEdges,
     ...rnEventEdgesList,
     ...fabricNativeEdges,
+    ...expoXPlatEdges,
+    ...rnXPlatEdges,
     ...mybatisEdges,
+    ...ginEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
@@ -881,5 +1717,5 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     merged.push(e);
   }
   if (merged.length > 0) queries.insertEdges(merged);
-  return merged.length;
+  return merged.length + goImpl.length + goMethodContains.length;
 }

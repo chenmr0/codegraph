@@ -56,3 +56,10 @@ nul
 release/
 
 .antigravitycli/
+
+# Local-only: browser-based tmux session launcher (see tmux-web/README.md)
+tmux-web/
+
+assets/__pycache__/
+
+assets/generate-waitlist.py
