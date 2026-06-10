@@ -94,11 +94,18 @@ export function hashContent(content: string): string {
 }
 
 /**
- * Skip files larger than this (bytes). Generated bundles, minified JS, and
- * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
- * symbols. 1 MB covers essentially all hand-written source.
+ * Absolute upper bound for parse timeout (ms). The per-file timeout scales with
+ * file size (base 10s + 10s per 100KB), but is clamped at this ceiling so a
+ * single pathological 50MB file can't stall indexing for hours.
  */
-const MAX_FILE_SIZE = 1024 * 1024;
+const PARSE_TIMEOUT_MAX_MS = 180_000;
+
+/**
+ * Files above this size (bytes) log a warning. The preemptive size-based skip
+ * was removed — large files are now parsed and only skipped if they actually
+ * time out or OOM in the worker. This threshold is diagnostic only.
+ */
+const FILE_SIZE_WARN_THRESHOLD = 5 * 1024 * 1024;
 
 /**
  * Directory names that are dependency, build, cache, or tooling output across the
@@ -862,8 +869,11 @@ export class ExtractionOrchestrator {
       const id = nextId++;
       workerParseCount++;
 
-      // Scale timeout for large files: base 10s + 10s per 100KB
-      const timeoutMs = PARSE_TIMEOUT_MS + Math.floor(content.length / 100_000) * 10_000;
+      // Scale timeout for large files: base 10s + 10s per 100KB, capped at 3 min
+      const timeoutMs = Math.min(
+        PARSE_TIMEOUT_MS + Math.floor(content.length / 100_000) * 10_000,
+        PARSE_TIMEOUT_MAX_MS,
+      );
 
       return new Promise<ExtractionResult>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -953,22 +963,8 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_FILE_SIZE. Without this check, vendored generated
-        // headers, minified bundles, and other multi-MB files get indexed,
-        // wasting WASM heap and the worker recycle budget on inputs with no
-        // useful symbols. The single-file extractFile path already enforces
-        // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_FILE_SIZE) {
-          processed++;
-          filesSkipped++;
-          errors.push({
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
-            filePath,
-            severity: 'warning',
-            code: 'size_exceeded',
-          });
-          onProgress?.({ phase: 'parsing', current: processed, total });
-          continue;
+        if (stats.size > FILE_SIZE_WARN_THRESHOLD) {
+          logWarn(`Large file may take longer to parse: ${filePath} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
         }
 
         // Parse in worker thread (main thread stays unblocked).
@@ -1270,22 +1266,8 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Check file size
-    if (stats.size > MAX_FILE_SIZE) {
-      return {
-        nodes: [],
-        edges: [],
-        unresolvedReferences: [],
-        errors: [
-          {
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
-            filePath: relativePath,
-            severity: 'warning',
-            code: 'size_exceeded',
-          },
-        ],
-        durationMs: 0,
-      };
+    if (stats.size > FILE_SIZE_WARN_THRESHOLD) {
+      logWarn(`Large file may take longer to parse: ${relativePath} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
     }
 
     // Detect language
