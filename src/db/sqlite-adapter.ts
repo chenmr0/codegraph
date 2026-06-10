@@ -286,6 +286,33 @@ class SqlJsAdapter implements SqliteDatabase {
         stmt.reset();
         return results;
       },
+      iterate(...params: any[]) {
+        const bound = prefixNamedParams(params);
+        // Create a fresh statement so the iterator's step() doesn't
+        // conflict with the outer bind/step state.
+        const iterStmt = db.prepare(sql);
+        const ok = iterStmt.bind(bound);
+        if (!ok) throw new Error(`sql.js bind() failed for SQL: ${sql.substring(0, 120)}`);
+        let done = false;
+        return {
+          [Symbol.iterator]() {
+            return this;
+          },
+          next() {
+            if (done) return { value: undefined, done: true };
+            try {
+              if (iterStmt.step()) {
+                return { value: iterStmt.getAsObject(), done: false };
+              }
+            } catch (e: any) {
+              throw new Error(`sql.js iterate() step failed: ${e.message}\n  SQL: ${sql.substring(0, 120)}`);
+            }
+            done = true;
+            iterStmt.free();
+            return { value: undefined, done: true };
+          },
+        };
+      },
     };
   }
 
