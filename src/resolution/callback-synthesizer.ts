@@ -564,7 +564,7 @@ function goCrossFileMethodContainsEdges(queries: QueryBuilder): Edge[] {
     return i >= 0 ? p.slice(0, i) : '';
   };
 
-  for (const method of queries.getNodesByKind('method')) {
+  for (const method of queries.iterateNodesByKind('method')) {
     if (method.language !== 'go') continue;
     // The receiver type is encoded in the method's qualifiedName as `Recv::name`
     // (extraction sets `${receiverType}::${name}` for receiver methods).
@@ -1226,7 +1226,7 @@ function expoCrossPlatformEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
   const byKey = new Map<string, Node[]>();
-  for (const m of queries.getNodesByKind('method')) {
+  for (const m of queries.iterateNodesByKind('method')) {
     if (!m.id.startsWith('expo-module:')) continue;
     const key = m.qualifiedName.split('::').pop(); // `<module>.<method>`
     if (!key) continue;
