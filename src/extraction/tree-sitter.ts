@@ -572,6 +572,29 @@ export class TreeSitterExtractor {
       }
       // don't skipChildren — nested signatures still need traversal
     }
+    // C/C++ global variable reference tracking. Identifiers matching the
+    // `g_xxx` naming convention inside a function/method body are collected
+    // as `references` edges so codegraph_callers/codegraph_impact can answer
+    // "who uses this global variable".
+    else if (
+      nodeType === 'identifier' &&
+      (this.language === 'c' || this.language === 'cpp') &&
+      this.nodeStack.length > 0
+    ) {
+      const name = getNodeText(node, this.source);
+      if (name.length > 3 && name.startsWith('g_') && /^g_[a-zA-Z]/.test(name)) {
+        const parentId = this.nodeStack[this.nodeStack.length - 1];
+        if (parentId) {
+          this.unresolvedReferences.push({
+            fromNodeId: parentId,
+            referenceName: name,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+      }
+    }
 
     // Visit children (unless the extract method already visited them)
     if (!skipChildren) {

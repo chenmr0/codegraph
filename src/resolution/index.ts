@@ -933,12 +933,6 @@ export class ReferenceResolver {
       // Yield so progress UI can render between batches
       await new Promise(resolve => setImmediate(resolve));
 
-      // If nothing was resolved or removed in this batch, we'd loop forever
-      // on the same rows. Break to avoid infinite loop.
-      if (result.resolved.length === 0 && result.unresolved.length === batch.length) {
-        break;
-      }
-
       // Non-progress guard (defense-in-depth). Because we re-read from offset 0
       // each pass, the unresolved_refs table MUST shrink every iteration — both
       // resolved and unresolved refs are deleted above. If it didn't shrink, a
@@ -947,6 +941,13 @@ export class ReferenceResolver {
       // re-insert the same rows forever (the runaway that grew a 99-file repo to
       // 5M edges / 1.4 GB before the Go-fallback fix). Stop rather than grow the
       // graph without bound.
+      //
+      // NOTE: We do NOT break when the entire batch is unresolvable — those refs
+      // are already deleted above, so the next read from offset 0 slides in a
+      // fresh set of refs. Breaking on an all-unresolvable batch would leave
+      // millions of later (resolvable) refs unprocessed (regression on C/C++
+      // codebases where ~2.5M references-kind refs match node names but appear
+      // after a "cold" region of unresolvable calls).
       const remaining = this.queries.getUnresolvedReferencesCount();
       if (remaining >= prevRemaining) break;
       prevRemaining = remaining;
