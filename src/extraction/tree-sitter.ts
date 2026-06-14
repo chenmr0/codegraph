@@ -53,7 +53,24 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
       const innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
-      return innerName ? getNodeText(innerName, source) : getNodeText(resolved, source);
+      if (innerName) {
+        // Unwrap parenthesized_declarator: int (foo)(int) → foo
+        if (innerName.type === 'parenthesized_declarator') {
+          const innermost = getChildByField(innerName, 'declarator') || innerName.namedChild(0);
+          return innermost ? getNodeText(innermost, source) : getNodeText(innerName, source);
+        }
+        return getNodeText(innerName, source);
+      }
+      return getNodeText(resolved, source);
+    }
+    // When a function_definition's declarator is a bare parenthesized_declarator
+    // (no nested function_declarator), tree-sitter has misparsed due to
+    // unrecognized macros appearing before the function name.  The actual name
+    // is in the type field, not the declarator.
+    // e.g.  RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 realFuncName(VOS_VOID) { }
+    if (resolved.type === 'parenthesized_declarator' && node.type === 'function_definition') {
+      const typeNode = getChildByField(node, 'type');
+      if (typeNode) return getNodeText(typeNode, source);
     }
     // Lua: `function t.f()` / `function t:m()` — the name node is a dot/method
     // index expression; the simple name is the trailing field/method (the table

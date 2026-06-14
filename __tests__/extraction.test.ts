@@ -2465,6 +2465,55 @@ std::unique_ptr<Widget> makeWidget() { return nullptr; }
     });
   });
 
+  describe('C/C++ function with unrecognized macros before name', () => {
+    it('extracts function name from type field when multiple macros confuse tree-sitter', () => {
+      // tree-sitter misparses 2+ unknown identifiers before the function name:
+      // the first two tokens become a spurious declaration, and the real
+      // function name ends up in the type field with parameters wrapped in a
+      // parenthesized_declarator.
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 ctraRegisterClassAcl6(VOS_VOID)
+{
+    return VOS_OK;
+}
+`;
+      const result = extractFromSource('eacl_acl6.c', code);
+
+      const func = result.nodes.find((n) => n.kind === 'function'
+        && n.name === 'ctraRegisterClassAcl6');
+      expect(func).toBeDefined();
+      // In the misparse the type field holds the function name, not the real
+      // return type — tree-sitter already misplaced VOS_UINT32 into a separate
+      // spurious declaration node.  The key win is that the function node now
+      // carries the correct name.
+    });
+
+    it('does not regress single-macro parsing', () => {
+      // One unknown macro is handled correctly by tree-sitter
+      const code = `
+VOS_UINT32 normalFunc(VOS_VOID)
+{
+    return VOS_OK;
+}
+`;
+      const result = extractFromSource('normal.c', code);
+
+      const func = result.nodes.find((n) => n.kind === 'function'
+        && n.name === 'normalFunc');
+      expect(func).toBeDefined();
+    });
+
+    it('extracts function name when parenthesized_declarator wraps function_declarator', () => {
+      // Valid C: parenthesized function name
+      const code = `int (legit)(int a) { return a; }`;
+      const result = extractFromSource('legit.c', code);
+
+      const func = result.nodes.find((n) => n.kind === 'function'
+        && n.name === 'legit');
+      expect(func).toBeDefined();
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;
