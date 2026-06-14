@@ -225,6 +225,21 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Node types whose presence among a C/C++ function body's direct named
+ * children indicates tree-sitter has misparsed the compound_statement
+ * boundary due to preprocessor directives inside the function. These
+ * are top-level constructs that should not appear as statements inside
+ * a valid C/C++ compound_statement.
+ */
+const C_CPP_BODY_LEAK_TYPES: ReadonlySet<string> = new Set([
+  'function_definition',
+  'class_specifier',
+  'struct_specifier',
+  'enum_specifier',
+  'type_definition',
+]);
+
+/**
  * TreeSitterExtractor - Main extraction class
  */
 export class TreeSitterExtractor {
@@ -469,8 +484,16 @@ export class TreeSitterExtractor {
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
-    // Only extract top-level variables (not inside functions/methods)
-    else if (this.extractor.variableTypes.includes(nodeType) && !this.isInsideClassLikeNode()) {
+    // Only extract top-level / namespace-scope variables — not locals inside
+    // functions, methods, class-like bodies, or orphaned compound_statements
+    // (tree-sitter misparses K&R C definitions and macro-expanded test
+    //  bodies, leaking their locals to the translation_unit level).
+    else if (
+      this.extractor.variableTypes.includes(nodeType) &&
+      !this.isInsideClassLikeNode() &&
+      !this.isInsideFunctionNode() &&
+      !this.isInsideCompoundStatement(node)
+    ) {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
@@ -793,6 +816,59 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Check if the current node stack indicates we are inside a function-like
+   * node (function or method). Used to prevent local variable extraction
+   * when a declaration node sits inside a recognized function body.
+   */
+  private isInsideFunctionNode(): boolean {
+    if (this.nodeStack.length === 0) return false;
+    return this.nodeStack.some((id) => {
+      const node = this.nodes.find((n) => n.id === id);
+      return node?.kind === 'function' || node?.kind === 'method';
+    });
+  }
+
+  /**
+   * Check if a declaration node is a local variable inside an orphaned
+   * compound_statement (a function body whose enclosing function_definition
+   * tree-sitter failed to parse).  K&R-style C, cpp macros, and Google Test
+   * macros routinely produce compound_statements at translation_unit level;
+   * their declarations are locals and must not be extracted as global vars.
+   *
+   * We guard |this.language| so we never affect block-scoped `let` / `const`
+   * in JS/TS/Go/Rust — those languages enter declarations through
+   * language-specific branches that are already correct.
+   */
+  private isInsideCompoundStatement(node: SyntaxNode): boolean {
+    if (
+      this.language !== 'c' &&
+      this.language !== 'cpp' &&
+      this.language !== 'objc'
+    ) {
+      return false;
+    }
+    // Walk up one level: is the declaration directly inside a compound_statement?
+    // compound_statement is always a block { … } — its declarations are locals.
+    let parent: SyntaxNode | null = node.parent;
+    while (parent) {
+      if (parent.type === 'compound_statement') return true;
+      // Stop at file-level containers; a declaration whose nearest enclosing
+      // scope is a namespace / class / translation_unit is genuinely top-level.
+      if (
+        parent.type === 'translation_unit' ||
+        parent.type === 'namespace_definition' ||
+        parent.type === 'class_specifier' ||
+        parent.type === 'struct_specifier' ||
+        parent.type === 'enum_specifier'
+      ) {
+        return false;
+      }
+      parent = parent.parent;
+    }
+    return false;
+  }
+
+  /**
    * Extract a function
    */
   private extractFunction(node: SyntaxNode, nameOverride?: string): void {
@@ -909,7 +985,57 @@ export class TreeSitterExtractor {
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
     if (body) {
-      this.visitFunctionBody(body, funcNode.id);
+      // Layer 1: Detect body leakage from C preprocessor misparse.
+      // When tree-sitter encounters unrecognized macros inside a function,
+      // the compound_statement boundary breaks and swallows subsequent
+      // file-level declarations. Look for node types that cannot
+      // legitimately appear as first-level body children in C/C++.
+      if (this.language === 'c' || this.language === 'cpp') {
+        let firstLeakIndex = -1;
+        for (let i = 0; i < body.namedChildCount; i++) {
+          const child = body.namedChild(i);
+          if (child && C_CPP_BODY_LEAK_TYPES.has(child.type)) {
+            firstLeakIndex = i;
+            break;
+          }
+        }
+
+        if (firstLeakIndex >= 0) {
+          // Collect names from leaked declarations so visitFunctionBody
+          // can exclude them from currentLocalNames (they're globals).
+          const leakedGlobalNames = new Set<string>();
+          const preVisitedNodes = new Set<number>();
+
+          this.nodeStack.pop(); // remove funcNode — process at file scope
+
+          for (let i = firstLeakIndex; i < body.namedChildCount; i++) {
+            const child = body.namedChild(i);
+            if (!child) continue;
+            if (
+              child.type === 'declaration' ||
+              C_CPP_BODY_LEAK_TYPES.has(child.type)
+            ) {
+              if (child.type === 'declaration') {
+                for (let j = 0; j < child.namedChildCount; j++) {
+                  const decl = child.namedChild(j);
+                  if (!decl) continue;
+                  const vn = this.extractVarNameFromDeclarator(decl);
+                  if (vn) leakedGlobalNames.add(vn);
+                }
+              }
+              preVisitedNodes.add(child.startIndex);
+              this.visitNode(child);
+            }
+          }
+
+          this.nodeStack.push(funcNode.id); // restore func scope
+          this.visitFunctionBody(body, funcNode.id, leakedGlobalNames, preVisitedNodes);
+        } else {
+          this.visitFunctionBody(body, funcNode.id);
+        }
+      } else {
+        this.visitFunctionBody(body, funcNode.id);
+      }
     }
     this.currentLocalNames.clear();
     this.nodeStack.pop();
@@ -1711,6 +1837,25 @@ export class TreeSitterExtractor {
           }
           return null;
         }
+        // C++ qualified_identifier: `ClassName::static_member` or
+        // `NS::Class::member` — extract the last identifier (the member
+        // name after the final `::`). Recurse to handle nested qualified
+        // identifiers where the deepest identifier may be 2+ levels down.
+        if (n.type === 'qualified_identifier') {
+          const findLastId = (qn: SyntaxNode): SyntaxNode | null => {
+            let last: SyntaxNode | null = null;
+            for (let i = 0; i < qn.namedChildCount; i++) {
+              const c = qn.namedChild(i);
+              if (c?.type === 'identifier') last = c;
+              if (c?.type === 'qualified_identifier') {
+                const nested = findLastId(c);
+                if (nested) last = nested;
+              }
+            }
+            return last;
+          };
+          return findLastId(n) ?? n;
+        }
         // function_declarator or unrecognized — stop here
         return n;
       };
@@ -1728,7 +1873,7 @@ export class TreeSitterExtractor {
       const DECLARATOR_TYPES = new Set([
         'init_declarator', 'identifier', 'pointer_declarator',
         'array_declarator', 'reference_declarator', 'function_declarator',
-        'parenthesized_declarator',
+        'parenthesized_declarator', 'qualified_identifier',
       ]);
 
       // Skip `extern` declarations — they're just declarations, not definitions.
@@ -3246,7 +3391,12 @@ export class TreeSitterExtractor {
     flush();
   }
 
-  private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
+  private visitFunctionBody(
+    body: SyntaxNode,
+    _functionId: string,
+    leakedGlobalNames?: Set<string>,
+    preVisitedNodes?: Set<number>,
+  ): void {
     if (!this.extractor) return;
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
@@ -3317,40 +3467,46 @@ export class TreeSitterExtractor {
       // function: this bounds the new nodes to NAMED functions only (no explosion,
       // no lost edges). extractFunction walks the nested body itself, so we return.
       if (this.extractor!.functionTypes.includes(nodeType)) {
-        const nestedName = extractName(node, this.source, this.extractor!);
-        if (nestedName && nestedName !== '<anonymous>') {
-          // extractFunction clears currentLocalNames internally, so save
-          // the outer function's set and restore it after the nested
-          // function completes.
-          const savedLocalNames = new Set(this.currentLocalNames);
-          this.extractFunction(node);
-          this.currentLocalNames = savedLocalNames;
-          return;
+        // Skip if already extracted at file scope by body-leak handling (Layer 1)
+        if (!preVisitedNodes?.has(node.startIndex)) {
+          const nestedName = extractName(node, this.source, this.extractor!);
+          if (nestedName && nestedName !== '<anonymous>') {
+            // extractFunction clears currentLocalNames internally, so save
+            // the outer function's set and restore it after the nested
+            // function completes.
+            const savedLocalNames = new Set(this.currentLocalNames);
+            this.extractFunction(node);
+            this.currentLocalNames = savedLocalNames;
+            return;
+          }
         }
       }
 
       // Extract structural nodes found inside function bodies.
       // Each extract method visits its own children, so we return after extracting.
-      if (this.extractor!.classTypes.includes(nodeType)) {
-        const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
-        if (classification === 'struct') this.extractStruct(node);
-        else if (classification === 'enum') this.extractEnum(node);
-        else if (classification === 'interface') this.extractInterface(node);
-        else if (classification === 'trait') this.extractClass(node, 'trait');
-        else this.extractClass(node);
-        return;
-      }
-      if (this.extractor!.structTypes.includes(nodeType)) {
-        this.extractStruct(node);
-        return;
-      }
-      if (this.extractor!.enumTypes.includes(nodeType)) {
-        this.extractEnum(node);
-        return;
-      }
-      if (this.extractor!.interfaceTypes.includes(nodeType)) {
-        this.extractInterface(node);
-        return;
+      // Skip if already extracted at file scope by body-leak handling (Layer 1).
+      if (!preVisitedNodes?.has(node.startIndex)) {
+        if (this.extractor!.classTypes.includes(nodeType)) {
+          const classification = this.extractor!.classifyClassNode?.(node) ?? 'class';
+          if (classification === 'struct') this.extractStruct(node);
+          else if (classification === 'enum') this.extractEnum(node);
+          else if (classification === 'interface') this.extractInterface(node);
+          else if (classification === 'trait') this.extractClass(node, 'trait');
+          else this.extractClass(node);
+          return;
+        }
+        if (this.extractor!.structTypes.includes(nodeType)) {
+          this.extractStruct(node);
+          return;
+        }
+        if (this.extractor!.enumTypes.includes(nodeType)) {
+          this.extractEnum(node);
+          return;
+        }
+        if (this.extractor!.interfaceTypes.includes(nodeType)) {
+          this.extractInterface(node);
+          return;
+        }
       }
 
       // Collect local variable names from declarations encountered during
@@ -3362,12 +3518,41 @@ export class TreeSitterExtractor {
         nodeType === 'declaration' &&
         (this.language === 'c' || this.language === 'cpp')
       ) {
+        let hasG_PrefixVar = false;
         for (let i = 0; i < node.namedChildCount; i++) {
           const child = node.namedChild(i);
           if (!child) continue;
           const name = this.extractVarNameFromDeclarator(child);
-          if (name) this.currentLocalNames.add(name);
+          if (!name) continue;
+
+          // Layer 2: g_ prefix global variable fallback.  When a function
+          // body is known to be leaked (leakedGlobalNames was passed by
+          // Layer 1), a variable named like g_xxx is almost certainly a
+          // global that tree-sitter misplaced.  Extract it at file scope
+          // and don't shadow it for reference tracking.
+          // Only applies when the body is confirmed leaked — in a normal
+          // body, g_ locals are legitimate shadowing declarations.
+          if (
+            leakedGlobalNames !== undefined &&
+            name.length > 3 && name.startsWith('g_') && /^g_[a-zA-Z]/.test(name)
+          ) {
+            hasG_PrefixVar = true;
+            continue; // don't add to currentLocalNames — it's a global
+          }
+
+          // Don't add leaked global names (Layer 1) to currentLocalNames
+          if (!leakedGlobalNames?.has(name)) {
+            this.currentLocalNames.add(name);
+          }
         }
+
+        // Extract g_ prefixed variables even inside function bodies
+        if (hasG_PrefixVar) {
+          const saved = this.nodeStack.pop();
+          this.extractVariable(node);
+          if (saved) this.nodeStack.push(saved);
+        }
+
         // Don't return — children (initializers, etc.) may contain
         // identifiers that still need reference tracking.
       }

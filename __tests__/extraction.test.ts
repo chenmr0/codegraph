@@ -2745,6 +2745,203 @@ VOS_UINT32 normalFunc(VOS_VOID)
     });
   });
 
+  describe('C/C++ global variable extraction with misparsed function body', () => {
+    // Layer 1: ob_backtrace.cpp pattern — function with macros leaks
+    // subsequent global variable declarations past the compound_statement
+    it('extracts global variable after function with preprocessor directives', () => {
+      const result = extractFromSource('test.c',
+        'void light_backtrace(int fd) {\n' +
+        '  int level = 0;\n' +
+        '  #define LIGHT(flag) ((flag) & 1)\n' +
+        '  level = LIGHT(fd);\n' +
+        '  (void)level;\n' +
+        '}\n' +
+        'int g_backtrace_fd = -1;\n'
+      );
+      const varNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'g_backtrace_fd'
+      );
+      expect(varNode).toBeDefined();
+      expect(varNode?.signature).toBe('= -1');
+    });
+
+    // Layer 1: genuine local variables inside the same function should
+    // still NOT be extracted
+    it('does not extract genuine local variable inside leaked function body', () => {
+      const result = extractFromSource('test.c',
+        'void light_backtrace(int fd) {\n' +
+        '  int local_level = 0;\n' +
+        '  #define LIGHT(flag) ((flag) & 1)\n' +
+        '  local_level = LIGHT(fd);\n' +
+        '}\n' +
+        'int g_backtrace_fd = -1;\n'
+      );
+      const localNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'local_level'
+      );
+      expect(localNode).toBeUndefined();
+    });
+
+    // Layer 1: multiple leaked globals after a misparsed function
+    it('extracts multiple global variables after misparsed function', () => {
+      const result = extractFromSource('test.c',
+        'void broken_func(void) {\n' +
+        '  #define MACRO(x) (x)\n' +
+        '  int a = MACRO(1);\n' +
+        '}\n' +
+        'int g_x = 1;\n' +
+        'int g_y = 2;\n'
+      );
+      expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'g_x')).toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'g_y')).toBeDefined();
+    });
+
+    // Layer 1: leaked function_definition after misparsed body
+    it('extracts leaked function definition after misparsed body', () => {
+      const result = extractFromSource('test.c',
+        'void first(void) {\n' +
+        '  #define WRAP(x) (x)\n' +
+        '  WRAP(1);\n' +
+        '}\n' +
+        'int second(void) { return 0; }\n'
+      );
+      const funcNode = result.nodes.find(
+        n => n.kind === 'function' && n.name === 'second'
+      );
+      expect(funcNode).toBeDefined();
+    });
+
+    // Layer 2: g_ prefix variable extracted inside leaked body (safety net)
+    it('extracts g_ prefixed variable inside leaked function body (Layer 2)', () => {
+      const result = extractFromSource('test.c',
+        'void broken(void) {\n' +
+        '  #define M(x) (x)\n' +
+        '  M(1);\n' +
+        '}\n' +
+        'int g_config = 42;\n'
+      );
+      const varNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'g_config'
+      );
+      expect(varNode).toBeDefined();
+    });
+
+    // Regression: non-g_ local variable inside NORMAL function still suppressed
+    it('does not extract non-g_ local variable inside normal function', () => {
+      const result = extractFromSource('test.c',
+        'void normal_func(void) {\n' +
+        '  int local = 5;\n' +
+        '}\n'
+      );
+      const varNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'local'
+      );
+      expect(varNode).toBeUndefined();
+    });
+
+    // Regression: nested named function inside normal body still works
+    it('still extracts nested named function inside normal body', () => {
+      const result = extractFromSource('test.c',
+        'void outer(void) {\n' +
+        '  void inner(void) {}\n' +
+        '}\n'
+      );
+      const funcNode = result.nodes.find(
+        n => n.kind === 'function' && n.name === 'inner'
+      );
+      expect(funcNode).toBeDefined();
+    });
+
+    // Regression: g_ reference from normal function still tracked
+    it('still emits references edge for g_ variable in same file', () => {
+      const result = extractFromSource('test.c',
+        'int g_counter = 0;\n' +
+        'int get(void) { return g_counter; }\n'
+      );
+      const refs = result.unresolvedReferences.filter(
+        r => r.referenceKind === 'references' && r.referenceName === 'g_counter'
+      );
+      expect(refs.length).toBe(1);
+    });
+
+    // Edge case: extern declaration in leaked body — still skipped
+    it('skips extern declaration in leaked body', () => {
+      const result = extractFromSource('test.c',
+        'void broken(void) {\n' +
+        '  #define M(x) (x)\n' +
+        '}\n' +
+        'extern int g_external;\n'
+      );
+      const varNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'g_external'
+      );
+      expect(varNode).toBeUndefined();
+    });
+
+    // Edge case: static global variable in leaked body
+    it('extracts static global variable as non-exported in leaked body', () => {
+      const result = extractFromSource('test.c',
+        'void broken(void) {\n' +
+        '  #define M(x) (x)\n' +
+        '}\n' +
+        'static int s_internal = 0;\n'
+      );
+      const varNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 's_internal'
+      );
+      expect(varNode).toBeDefined();
+      expect(varNode?.isExported).toBe(false);
+    });
+
+    // Regression: orphaned compound_statement at file scope (K&R C, Google Test
+    // macros, or preprocessor-confused function bodies). Tree-sitter does not
+    // recognise the enclosing function_definition, so the compound_statement and
+    // its declarations land at the translation_unit level. The extractor must
+    // NOT treat those declarations as global variables.
+    it('does not extract declaration inside orphaned compound_statement', () => {
+      const result = extractFromSource('test.c',
+        // K&R-style function signature that tree-sitter won't recognize as
+        // function_definition, followed by the orphaned compound_statement.
+        'int syncsearch(have, buf, len)\n' +
+        'unsigned FAR *have;\n' +
+        'const unsigned char FAR *buf;\n' +
+        'unsigned len;\n' +
+        '{\n' +
+        '    unsigned got;\n' +
+        '    unsigned next;\n' +
+        '}\n'
+      );
+      const gotNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'got'
+      );
+      const nextNode = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'next'
+      );
+      expect(gotNode).toBeUndefined();
+      expect(nextNode).toBeUndefined();
+    });
+
+    it('does not extract declaration inside macro-expanded compound_statement (C++)', () => {
+      const result = extractFromSource('test.cpp',
+        // Google Test macro: tree-sitter sees a macro_invocation followed by
+        // an orphaned compound_statement whose declarations look top-level.
+        'TEST(Foo, Bar)\n' +
+        '{\n' +
+        '    int local_var = 42;\n' +
+        '    ObString ob_str;\n' +
+        '}\n'
+      );
+      const localVar = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'local_var'
+      );
+      const obStr = result.nodes.find(
+        n => n.kind === 'variable' && n.name === 'ob_str'
+      );
+      expect(localVar).toBeUndefined();
+      expect(obStr).toBeUndefined();
+    });
+  });
+
   describe('Dart imports', () => {
     it('should extract dart: import', () => {
       const code = `import 'dart:async';`;
