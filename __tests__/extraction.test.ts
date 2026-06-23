@@ -2514,6 +2514,222 @@ VOS_UINT32 normalFunc(VOS_VOID)
     });
   });
 
+  describe('C/C++ macro misparse filtering', () => {
+    // Tree-sitter C/C++ parsers lack a preprocessor. When a macro invocation
+    // has the shape MACRO_NAME(params) { body }, it matches the
+    // function_definition grammar rule and produces a spurious function node
+    // for each call site. The extractor collects `#define` names from
+    // preproc_def / preproc_function_def nodes and filters out any "function"
+    // whose name matches a known macro.
+
+    it('filters FOREACH_X macro invocations (for-loop macro)', () => {
+      const code = `
+#define FOREACH_X(it, container, cond) \\
+  for (auto it = (container).begin(); (cond) && (it != (container).end()); ++it)
+
+void process() {
+  FOREACH_X(it, items, true) {
+    doWork(*it);
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'FOREACH_X');
+      expect(func).toBeUndefined();
+      // The real function should still be extracted
+      const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
+      expect(realFunc).toBeDefined();
+    });
+
+    it('filters ARRAY_FOREACH_NORET macro invocations', () => {
+      const code = `
+#define ARRAY_FOREACH_NORET(it, arr) \\
+  for (int64_t it = 0; it < (arr).count(); ++it)
+
+void scan() {
+  ARRAY_FOREACH_NORET(i, table_array) {
+    check(i);
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'ARRAY_FOREACH_NORET');
+      expect(func).toBeUndefined();
+    });
+
+    it('filters PS_DEFENSE_CHECK macro invocations (if-else macro)', () => {
+      const code = `
+#define PS_DEFENSE_CHECK(len)                              \\
+  if (OB_FAIL(ret)) {                                       \\
+  } else if (OB_FAIL(checker.detection(len))) {              \\
+    LOG_WARN("out of bounds", K(ret));                      \\
+  } else
+
+void execute() {
+  PS_DEFENSE_CHECK(length) {
+    sql.assign_ptr(buf, length);
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'PS_DEFENSE_CHECK');
+      expect(func).toBeUndefined();
+    });
+
+    it('filters CREATE_WITH_TEMP_ENTITY macro invocations (for+if macro)', () => {
+      const code = `
+#define CREATE_WITH_TEMP_ENTITY(entity_type, ...) \\
+  CREATE_WITH_TEMP_ENTITY_P(true, entity_type, __VA_ARGS__)
+
+void worker() {
+  CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, tenant_id) {
+    allocator.alloc();
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'CREATE_WITH_TEMP_ENTITY');
+      expect(func).toBeUndefined();
+    });
+
+    it('filters OB_SUCC macro invocation (boolean expression macro)', () => {
+      const code = `
+#define OB_SUCC(statement) \\
+  (OB_LIKELY(::oceanbase::common::OB_SUCCESS == (ret = (statement))))
+
+void check() {
+  if OB_SUCC(ret) {
+    doSomething();
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'OB_SUCC');
+      expect(func).toBeUndefined();
+    });
+
+    it('does not filter real functions that happen to match #define name keywords', () => {
+      // "if", "for", "while" are not macro names — they're keywords.
+      // If someone defines a macro named IF_DEBUG, it should be filtered,
+      // but the keyword check should not accidentally filter it.
+      const code = `
+#define IF_DEBUG(code) if (debug_enabled) { code; }
+
+void run() {
+  IF_DEBUG(log("debug");) {
+    // tree-sitter may misparse this as a function
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'IF_DEBUG');
+      expect(func).toBeUndefined();
+      // "run" should still be found
+      const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'run');
+      expect(realFunc).toBeDefined();
+    });
+
+    it('does not filter real functions with non-macro ALL_CAPS names', () => {
+      // A real function named in ALL_CAPS (unconventional but valid C)
+      // should not be filtered just because some macros also use that style.
+      const code = `
+#define LOG_WARN(fmt, ...) fprintf(stderr, fmt, __VA_ARGS__)
+
+int INNER_LOOP(int n) {
+  return n * 2;
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+      // INNER_LOOP is a real function, not a macro
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'INNER_LOOP');
+      expect(func).toBeDefined();
+      // LOG_WARN is a macro and its invocations should not become functions
+      const macroFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'LOG_WARN');
+      expect(macroFunc).toBeUndefined();
+    });
+  });
+
+  describe('C/C++ macro extraction', () => {
+    it('extracts object-like macro (simple constant)', () => {
+      const code = `#define FOO 42\n`;
+      const result = extractFromSource('test.c', code);
+
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'FOO');
+      expect(macro).toBeDefined();
+      expect(macro?.kind).toBe('macro');
+      expect(macro?.name).toBe('FOO');
+      expect(macro?.signature).toContain('#define FOO 42');
+      expect(macro?.isExported).toBe(true);
+    });
+
+    it('extracts function-like macro', () => {
+      const code = `#define MAX(a,b) ((a)>(b)?(a):(b))\n`;
+      const result = extractFromSource('test.c', code);
+
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'MAX');
+      expect(macro).toBeDefined();
+      expect(macro?.signature).toContain('#define MAX(a,b)');
+    });
+
+    it('extracts multi-line macro with backslash continuation', () => {
+      const code = `#define FOREACH_X(it, container, cond) \\
+  for (auto it = (container).begin(); (cond) && (it != (container).end()); ++it)
+`;
+      const result = extractFromSource('test.cpp', code);
+
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'FOREACH_X');
+      expect(macro).toBeDefined();
+      expect(macro?.signature).toContain('\\');
+    });
+
+    it('extracts macro inside #ifdef conditional', () => {
+      const code = `
+#ifdef DEBUG
+#define LOG_LEVEL 3
+#endif
+`;
+      const result = extractFromSource('test.c', code);
+
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'LOG_LEVEL');
+      expect(macro).toBeDefined();
+    });
+
+    it('extracts multiple macros from a single file', () => {
+      const code = `#define PI 3.14159\n#define SQUARE(x) ((x)*(x))\n`;
+      const result = extractFromSource('math.c', code);
+
+      const macros = result.nodes.filter((n) => n.kind === 'macro');
+      expect(macros.length).toBe(2);
+      expect(macros.map(m => m.name).sort()).toEqual(['PI', 'SQUARE']);
+    });
+
+    it('still filters macro invocations as misparsed functions (no regression)', () => {
+      const code = `
+#define FOREACH_X(it, container, cond) \\
+  for (auto it = (container).begin(); (cond) && (it != (container).end()); ++it)
+
+void process() {
+  FOREACH_X(it, items, true) {
+    doWork(*it);
+  }
+}
+`;
+      const result = extractFromSource('test.cpp', code);
+
+      // Macro node should exist (new behavior)
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'FOREACH_X');
+      expect(macro).toBeDefined();
+
+      // Macro should NOT appear as a function (existing behavior preserved)
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'FOREACH_X');
+      expect(func).toBeUndefined();
+
+      // The real function should still be extracted
+      const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
+      expect(realFunc).toBeDefined();
+    });
+  });
+
   describe('C/C++ imports', () => {
     it('should extract system include', () => {
       const code = `#include <iostream>`;

@@ -179,6 +179,7 @@ export class GraphQueryManager {
       'type_alias',
       'variable',
       'constant',
+      'macro',
     ];
 
     for (const kind of kinds) {
@@ -355,6 +356,7 @@ export class GraphQueryManager {
       'constant',
       'enum',
       'type_alias',
+      'macro',
     ];
 
     for (const kind of kinds) {

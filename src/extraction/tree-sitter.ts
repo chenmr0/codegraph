@@ -239,6 +239,17 @@ const C_CPP_BODY_LEAK_TYPES: ReadonlySet<string> = new Set([
   'type_definition',
 ]);
 
+/** C/C++ keywords that tree-sitter occasionally misparses as variable
+ *  declarator names (e.g. `if` from `else if (MACRO(...))` when preprocessor
+ *  macros confuse the grammar into error recovery). These are reserved words
+ *  that can never be valid variable names, so filtering them is safe. */
+const C_CPP_KEYWORD_NAMES: ReadonlySet<string> = new Set([
+  'if', 'else', 'switch', 'case', 'default',
+  'for', 'while', 'do', 'break', 'continue', 'goto',
+  'return', 'try', 'catch', 'throw',
+  'new', 'delete',
+]);
+
 /**
  * TreeSitterExtractor - Main extraction class
  */
@@ -258,6 +269,12 @@ export class TreeSitterExtractor {
   // hide same-named globals inside the current function body. Populated before
   // visiting each function body, cleared after. Only used for C/C++.
   private currentLocalNames: Set<string> = new Set();
+
+  // Names of `#define` macros collected from the file's preproc_def /
+  // preproc_function_def nodes. Passed to isMisparsedFunction so C/C++ extractors
+  // can suppress spurious function nodes from macro invocations whose shape
+  // (NAME(params) { body }) matches the function_definition grammar rule.
+  private fileMacroNames: Set<string> = new Set();
 
   constructor(filePath: string, source: string, language?: Language) {
     this.filePath = filePath;
@@ -310,6 +327,7 @@ export class TreeSitterExtractor {
     try {
       // Reset per-file state
       this.currentLocalNames.clear();
+      this.fileMacroNames.clear();
 
       // Optional pre-parse source transform (offset-preserving) to work around
       // grammar gaps — e.g. C# blanks conditional-compilation directive lines
@@ -343,6 +361,13 @@ export class TreeSitterExtractor {
 
       // Push file node onto stack so top-level declarations get contains edges
       this.nodeStack.push(fileNode.id);
+
+      // Collect `#define` macro names for misparse filtering. C/C++ parsers
+      // lack a preprocessor: when a macro invocation has the shape
+      // `MACRO_NAME(params) { body }`, tree-sitter misparses it as a
+      // function_definition. Collecting names here lets isMisparsedFunction
+      // suppress those spurious function nodes.
+      this.collectMacroNames();
 
       // File-level package declaration (Kotlin/Java). Creates an implicit
       // `namespace` node wrapping every top-level declaration so their
@@ -546,6 +571,11 @@ export class TreeSitterExtractor {
     // the correct one (it picks kind from isConst, captures the
     // initializer signature, and walks type annotations); the
     // export-statement helper was redundant.
+    // Check for preprocessor macro definitions (#define)
+    else if (this.extractor.macroTypes?.includes(nodeType)) {
+      this.extractMacro(node);
+      skipChildren = true; // macro bodies don't contain sub-symbols
+    }
     // Check for imports
     else if (this.extractor.importTypes.includes(nodeType)) {
       this.extractImport(node);
@@ -729,6 +759,73 @@ export class TreeSitterExtractor {
       if (child && types.includes(child.type)) return child;
     }
     return null;
+  }
+
+  /**
+   * Collect `#define` macro names from `preproc_def` and
+   * `preproc_function_def` nodes in the AST. These are passed to
+   * `isMisparsedFunction` so C/C++ extractors can suppress spurious
+   * function nodes caused by macro invocations whose shape
+   * (`MACRO_NAME(params) { body }`) matches the function_definition
+   * grammar rule.
+   *
+   * `#define` directives are always at the top level of a translation
+   * unit in C/C++ (possibly nested inside `#if`/`#ifdef` blocks, but
+   * never inside functions or classes), so a shallow recursion that
+   * descends into preproc containers but stops at non-preproc nodes is
+   * sufficient — no deep traversal into function bodies needed.
+   */
+  private collectMacroNames(): void {
+    if (!this.tree) return;
+
+    // Container types that can hold preproc directives at file scope
+    const preprocContainers = new Set([
+      'preproc_if',
+      'preproc_ifdef',
+      'preproc_ifndef',
+      'preproc_else',
+    ]);
+
+    const walk = (node: SyntaxNode) => {
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (!child) continue;
+        if (child.type === 'preproc_def' || child.type === 'preproc_function_def') {
+          const nameNode = child.childForFieldName?.('name') ?? null;
+          if (nameNode) {
+            this.fileMacroNames.add(nameNode.text);
+          }
+        } else if (preprocContainers.has(child.type)) {
+          walk(child);
+        }
+      }
+    };
+
+    walk(this.tree.rootNode);
+  }
+
+  /**
+   * Extract a `#define` macro as a graph node.
+   *
+   * Handles both object-like macros (`#define FOO 42`) and function-like
+   * macros (`#define MAX(a,b) ((a)>(b)?(a):(b))`). The macro name is
+   * read from the `name` field, and the full `#define` text is stored
+   * as the signature for searchability and display.
+   */
+  private extractMacro(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    const nameNode = getChildByField(node, 'name');
+    if (!nameNode) return;
+    const name = getNodeText(nameNode, this.source);
+    if (!name) return;
+
+    const signature = this.source.substring(node.startIndex, node.endIndex);
+
+    this.createNode('macro', name, node, {
+      signature,
+      isExported: true,
+    });
   }
 
   /**
@@ -919,7 +1016,7 @@ export class TreeSitterExtractor {
 
     // Check for misparse artifacts (e.g. C++ macros causing "namespace detail" functions)
     // Skip the node but still visit the body for calls and structural nodes
-    if (this.extractor.isMisparsedFunction?.(name, node)) {
+    if (this.extractor.isMisparsedFunction?.(name, node, this.fileMacroNames)) {
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
       if (body) {
@@ -1117,7 +1214,7 @@ export class TreeSitterExtractor {
     const name = extractName(node, this.source, this.extractor);
 
     // Check for misparse artifacts (e.g. C++ "switch" inside macro-confused class body)
-    if (this.extractor.isMisparsedFunction?.(name, node)) {
+    if (this.extractor.isMisparsedFunction?.(name, node, this.fileMacroNames)) {
       const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
         ?? getChildByField(node, this.extractor.bodyField);
       if (body) {
@@ -1891,6 +1988,10 @@ export class TreeSitterExtractor {
 
         const name = getNodeText(resolved, this.source);
         if (!name) continue;
+
+        // Filter C/C++ keywords that tree-sitter misparses as variable
+        // declarator names (e.g. `if` from `else if (MACRO(...))`).
+        if (C_CPP_KEYWORD_NAMES.has(name)) continue;
 
         // Initializer only lives on init_declarator
         const valueNode = child.type === 'init_declarator'

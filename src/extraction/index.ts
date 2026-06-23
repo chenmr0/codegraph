@@ -138,7 +138,7 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', '.nox', '.hypothesis',
   '.ipynb_checkpoints', '.eggs',
   // Rust / JVM (Maven, Gradle, Scala)
-  'target', '.gradle',
+  '.gradle',
   // .NET
   'obj',
   // Vendored deps (Go, PHP/Composer, Ruby/Bundler)

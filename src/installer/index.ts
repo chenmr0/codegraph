@@ -29,6 +29,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
 import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { hasCommand } from '../upgrade';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -103,29 +104,34 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     return;
   }
 
-  // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
+  // Step 2: ensure the codegraph CLI is on PATH so agents can launch the
+  // MCP server. Skip the prompt if codegraph is already on PATH (upgrades
+  // are a separate concern, handled by `codegraph upgrade`).
   if (!useDefaults) {
-    const shouldInstallGlobally = await clack.confirm({
-      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
-      initialValue: true,
-    });
-    if (clack.isCancel(shouldInstallGlobally)) {
-      clack.cancel('Installation cancelled.');
-      process.exit(0);
-    }
-    if (shouldInstallGlobally) {
-      const s = clack.spinner();
-      s.start('Installing codegraph CLI...');
-      try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
-        s.stop('Installed codegraph CLI on PATH');
-      } catch {
-        s.stop('Could not install (permission denied)');
-        clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
-      }
+    if (hasCommand('codegraph')) {
+      clack.log.info('codegraph CLI already on PATH — skipping.');
     } else {
-      clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
+      const shouldInstallGlobally = await clack.confirm({
+        message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
+        initialValue: true,
+      });
+      if (clack.isCancel(shouldInstallGlobally)) {
+        clack.cancel('Installation cancelled.');
+        process.exit(0);
+      }
+      if (shouldInstallGlobally) {
+        const s = clack.spinner();
+        s.start('Installing codegraph CLI...');
+        try {
+          execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
+          s.stop('Installed codegraph CLI on PATH');
+        } catch {
+          s.stop('Could not install (permission denied)');
+          clack.log.warn('Try: sudo npm install -g @colbymchenry/codegraph');
+        }
+      } else {
+        clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
+      }
     }
   }
 

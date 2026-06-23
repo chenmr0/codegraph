@@ -107,6 +107,7 @@ export const cExtractor: LanguageExtractor = {
   importTypes: ['preproc_include'],
   callTypes: ['call_expression'],
   variableTypes: ['declaration'],
+  macroTypes: ['preproc_def', 'preproc_function_def'],
   fieldTypes: ['field_declaration'],
   nameField: 'declarator',
   bodyField: 'body',
@@ -133,6 +134,15 @@ export const cExtractor: LanguageExtractor = {
       if (c?.type === 'storage_class_specifier' && c.text === 'static') return false;
     }
     return true;
+  },
+  isMisparsedFunction: (name, _node, macroNames) => {
+    // C macros cause tree-sitter to misparse macro invocations as function
+    // definitions when the shape matches NAME(params) { body }.
+    if (name.startsWith('namespace')) return true;
+    const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
+    if (cppKeywords.includes(name)) return true;
+    if (macroNames && macroNames.has(name)) return true;
+    return false;
   },
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
@@ -176,6 +186,7 @@ export const cppExtractor: LanguageExtractor = {
   importTypes: ['preproc_include'],
   callTypes: ['call_expression'],
   variableTypes: ['declaration'],
+  macroTypes: ['preproc_def', 'preproc_function_def'],
   fieldTypes: ['field_declaration'],
   nameField: 'declarator',
   bodyField: 'body',
@@ -231,14 +242,21 @@ export const cppExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isMisparsedFunction: (name) => {
+  isMisparsedFunction: (name, _node, macroNames) => {
     // C++ macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause tree-sitter to misparse
     // namespace blocks as function_definitions (e.g. name = "namespace detail").
     // Also filter C++ keywords that tree-sitter occasionally misinterprets as
     // function/method names (e.g. switch statements inside macro-confused scopes).
     if (name.startsWith('namespace')) return true;
     const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
-    return cppKeywords.includes(name);
+    if (cppKeywords.includes(name)) return true;
+    // Filter out macro names that tree-sitter misparses as functions.
+    // Tree-sitter C/C++ parsers lack a preprocessor: when a macro invocation
+    // has the shape MACRO_NAME(params) { body }, it matches the
+    // function_definition grammar rule and produces a spurious function node
+    // for each call site (e.g. FOREACH_X creates 17 "functions" in OceanBase).
+    if (macroNames && macroNames.has(name)) return true;
+    return false;
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();

@@ -159,6 +159,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
   'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
   'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
+  'macro',
 ];
 
 /**
@@ -555,7 +556,7 @@ export class ContextBuilder {
           : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
-             'route', 'component'] as NodeKind[];
+             'route', 'component', 'macro'] as NodeKind[];
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,

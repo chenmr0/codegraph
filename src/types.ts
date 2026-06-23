@@ -25,6 +25,7 @@ export const NODE_KINDS = [
   'protocol',
   'function',
   'method',
+  'macro',
   'property',
   'field',
   'variable',

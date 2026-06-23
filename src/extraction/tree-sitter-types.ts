@@ -112,6 +112,8 @@ export interface LanguageExtractor {
   callTypes: string[];
   /** Node types that represent variable declarations (const, let, var, etc.) */
   variableTypes: string[];
+  /** Node types that represent preprocessor macro definitions (#define) */
+  macroTypes?: string[];
   /** Node types that represent class fields (extracted as 'field' kind inside class bodies) */
   fieldTypes?: string[];
   /** Node types that represent class properties (extracted as 'property' kind inside class bodies) */
@@ -229,8 +231,17 @@ export interface LanguageExtractor {
    * to misparse namespace blocks as function_definitions. When this returns true,
    * the function node is NOT created, but the body is still visited for calls and
    * structural nodes (classes, structs, enums).
+   *
+   * @param name - The extracted function/method name
+   * @param node - The syntax node
+   * @param macroNames - Set of `#define` macro names collected from the file's
+   *   `preproc_def` / `preproc_function_def` nodes. Tree-sitter C/C++ parsers
+   *   lack a preprocessor: when a macro invocation has the shape
+   *   `MACRO_NAME(params) { body }`, it matches the function_definition
+   *   grammar rule and produces a spurious function node for each call site.
+   *   Checking against this set lets extractors suppress those false positives.
    */
-  isMisparsedFunction?: (name: string, node: SyntaxNode) => boolean;
+  isMisparsedFunction?: (name: string, node: SyntaxNode, macroNames?: Set<string>) => boolean;
 
   /**
    * Detect bare method calls that don't use call expression syntax.
