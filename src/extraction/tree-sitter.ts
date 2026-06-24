@@ -248,6 +248,11 @@ const C_CPP_KEYWORD_NAMES: ReadonlySet<string> = new Set([
   'for', 'while', 'do', 'break', 'continue', 'goto',
   'return', 'try', 'catch', 'throw',
   'new', 'delete',
+  // Type keywords that tree-sitter-c may expose as field_identifier
+  // inside misparsed field_declaration / function_declarator nodes.
+  // These are never valid function names.
+  'void', 'char', 'int', 'short', 'long', 'float', 'double',
+  'signed', 'unsigned', 'size_t', 'ssize_t',
 ]);
 
 /**
@@ -506,6 +511,31 @@ export class TreeSitterExtractor {
     // Check for class fields (e.g. Java field_declaration, C# field_declaration)
     else if (this.extractor.fieldTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
       this.extractField(node);
+      skipChildren = true;
+    }
+    // C/C++: top-level field_declaration containing a function_declarator is a
+    // misparsed function prototype. When a multi-line #define leaks struct-body
+    // content into the translation_unit (e.g. uv.h UV_HANDLE_FIELDS), tree-sitter-c
+    // treats subsequent `UV_EXTERN int foo(args);` as field_declaration instead of
+    // declaration. Route these through extractVariable so the existing C/C++ branch
+    // — which already detects function_declarator inside declarations — creates
+    // proper function nodes for them.
+    else if (
+      (this.language === 'c' || this.language === 'cpp') &&
+      nodeType === 'field_declaration' &&
+      !this.isInsideClassLikeNode() &&
+      !this.isInsideFunctionNode() &&
+      node.descendantsOfType('function_declarator').length > 0
+    ) {
+      this.extractVariable(node);
+      // When tree-sitter-c macro body leakage is deep enough, the misparsed
+      // field_declaration wraps a struct_specifier that swallows subsequent
+      // function prototypes as its own field_declaration_list children
+      // (e.g. uv.h lines 738-837: struct uv_udp_send_s swallows 23
+      //  uv_udp_* declarations; lines 972-1441: swallows 50 more).
+      // Walk into struct_specifier → field_declaration_list and extract
+      // every child field_declaration that contains a function_declarator.
+      this.extractNestedStructFunctions(node);
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
@@ -1610,7 +1640,92 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract function-valued properties of an object literal as named function
+   * C/C++: extract function declarations that are nested inside
+   * struct_specifiers within a misparsed top-level field_declaration.
+   *
+   * When tree-sitter-c leaks a multi-line #define body, subsequent struct
+   * definitions can span hundreds of lines and swallow function prototypes
+   * as their field_declaration_list children.  Some of those children are
+   * themselves struct_specifiers (e.g. uv_process_s inside uv_timer_s),
+   * producing deeply nested function declarators.  This walks
+   * struct_specifier → field_declaration_list recursively and creates
+   * function nodes for every leaf field_declaration that contains a
+   * function_declarator.
+   */
+  private extractNestedStructFunctions(node: SyntaxNode): void {
+    if (!this.extractor || (this.language !== 'c' && this.language !== 'cpp')) return;
+
+    const structSpecs = node.namedChildren.filter(c => c.type === 'struct_specifier');
+    if (structSpecs.length === 0) return;
+
+    const extractName = (funcDecl: SyntaxNode): string | null => {
+      // In this misparsed context the declarator uses bare field_identifier.
+      let idNode: SyntaxNode | null =
+        funcDecl.namedChildren.find(c => c.type === 'field_identifier') ?? null;
+      if (!idNode) {
+        const decl = getChildByField(funcDecl, 'declarator');
+        if (decl) {
+          let current: SyntaxNode | null = decl;
+          while (current && (current.type === 'pointer_declarator' ||
+                             current.type === 'array_declarator')) {
+            current = getChildByField(current, 'declarator') || current.namedChild(0) || null;
+          }
+          if (current && current.type === 'identifier') idNode = current;
+        }
+      }
+      if (!idNode) return null;
+      const name = getNodeText(idNode, this.source);
+      return name && !C_CPP_KEYWORD_NAMES.has(name) ? name : null;
+    };
+
+    // Breadth-first walk: for each struct_specifier, process its immediate
+    // field_declaration children (extracting function nodes) and recurse
+    // into nested struct_specifiers.
+    const walkStruct = (spec: SyntaxNode): void => {
+      const fdl = spec.namedChildren.find(c => c.type === 'field_declaration_list');
+      if (!fdl) return;
+
+      for (const innerFd of fdl.namedChildren) {
+        if (innerFd.type !== 'field_declaration') continue;
+
+        // Check for a function_declarator, which may be wrapped in one
+        // or more pointer_declarator layers (e.g. `char** uv_setup_args`).
+        let funcDecl: SyntaxNode | null =
+          innerFd.namedChildren.find(c => c.type === 'function_declarator') ?? null;
+        if (!funcDecl && innerFd.descendantsOfType('function_declarator').length > 0) {
+          // Walk through pointer_declarator wrappers to find it.
+          let current: SyntaxNode | null =
+            innerFd.namedChildren.find(c => c.type === 'pointer_declarator') ?? null;
+          while (current && current.type === 'pointer_declarator') {
+            const inner = current.namedChildren.find(c => c.type === 'function_declarator');
+            if (inner) { funcDecl = inner; break; }
+            current = current.namedChildren.find(c => c.type === 'pointer_declarator') ?? null;
+          }
+        }
+        if (funcDecl) {
+          const fnName = extractName(funcDecl);
+          if (fnName) {
+            this.createNode('function', fnName, innerFd, {
+              signature: this.source.substring(innerFd.startIndex, innerFd.endIndex),
+            });
+          }
+        }
+
+        // Recurse into nested struct_specifiers (e.g. uv_process_s inside the
+        // giant uv_timer_s field_declaration at line 972-1441 in uv.h)
+        const nestedStructs = innerFd.namedChildren.filter(c => c.type === 'struct_specifier');
+        for (const nested of nestedStructs) {
+          walkStruct(nested);
+        }
+      }
+    };
+
+    for (const spec of structSpecs) {
+      walkStruct(spec);
+    }
+  }
+
+  /**
    * nodes (named by their property key). Shared by the two object-of-functions
    * shapes in extractVariable: the object as a direct const value, and the
    * object returned by a store-initializer call. Handles both `key: () => {}` /
@@ -1953,6 +2068,15 @@ export class TreeSitterExtractor {
           };
           return findLastId(n) ?? n;
         }
+        // function_declarator: unwrap through the `declarator` field to reach
+        // the identifier (or further pointer/array wrapping). Needed when
+        // pointer_declarator wraps function_declarator, e.g.
+        // `const char* uv_version_string(void)` where getChildByField returns
+        // the function_declarator itself as the inner declarator.
+        if (n.type === 'function_declarator') {
+          const inner = getChildByField(n, 'declarator');
+          return inner ? unwrapDeclarator(inner) : n;
+        }
         // function_declarator or unrecognized — stop here
         return n;
       };
@@ -1973,18 +2097,50 @@ export class TreeSitterExtractor {
         'parenthesized_declarator', 'qualified_identifier',
       ]);
 
-      // Skip `extern` declarations — they're just declarations, not definitions.
-      // The actual definition lives in another file and will produce the real node.
-      if (this.hasStorageClass(node, 'extern')) return;
+      // Track whether this declaration uses `extern`. Extern variables are
+      // skipped (the actual definition lives in another file), but extern
+      // function declarations are extracted — they're the public API signature.
+      const isExtern = this.hasStorageClass(node, 'extern');
 
       for (const child of node.namedChildren) {
         if (!DECLARATOR_TYPES.has(child.type)) continue;
 
+        // Handle function declarations (forward declarations, prototypes).
+        // Tree-sitter parses `int foo();` as `declaration` containing a
+        // `function_declarator` — not as `function_definition`. Extract the
+        // function name from inside the function_declarator so headers get
+        // function nodes for their public API.
+        if (hasFunctionDeclarator(child)) {
+          // function_declarator inside a `declaration` has a `declarator` field
+          // (e.g. `int foo();` → function_declarator → declarator → identifier).
+          // When tree-sitter-c misparses the prototype as `field_declaration`
+          // (triggered by multi-line #define leaks like UV_HANDLE_FIELDS), the
+          // function_declarator uses a bare `field_identifier` child instead.
+          let innerDecl = getChildByField(child, 'declarator');
+          if (!innerDecl) {
+            innerDecl = child.namedChildren.find(c => c.type === 'field_identifier') ?? null;
+          }
+          if (innerDecl) {
+            const idNode = unwrapDeclarator(innerDecl);
+            if (idNode && (idNode.type === 'identifier' || idNode.type === 'field_identifier')) {
+              const fnName = getNodeText(idNode, this.source);
+              if (fnName && !C_CPP_KEYWORD_NAMES.has(fnName)) {
+                this.createNode('function', fnName, node, {
+                  docstring,
+                  signature: this.source.substring(node.startIndex, node.endIndex),
+                  isExported: isExported || !isExtern,
+                });
+              }
+            }
+          }
+          continue;
+        }
+
+        // Extern variable declarations: skip (the definition is elsewhere)
+        if (isExtern) continue;
+
         const resolved = unwrapDeclarator(child);
         if (!resolved || resolved.type !== 'identifier') continue;
-
-        // A function_declarator was encountered during unwrapping — skip
-        if (hasFunctionDeclarator(child)) continue;
 
         const name = getNodeText(resolved, this.source);
         if (!name) continue;
