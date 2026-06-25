@@ -27,16 +27,24 @@ CodeGraph-WX 是面向 C/C++ 千万行级代码仓的本地代码知识图谱增
 
 CodeGraph-WX 相比上游重点补强 C/C++ 大仓场景：
 
+- 宏提取：`#define MAX 100` 和 `#define LOG(fmt, ...) ...` 生成 `macro` 节点，可搜索和追踪引用
+- 宏误解析过滤：收集文件内所有 `#define` 名称，过滤 tree-sitter 因宏调用误解析出的虚假函数节点
+- 多宏修饰符函数名修复：`RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 func(VOS_VOID)` 正确提取 `func` 而非 `(VOS_VOID)`
+- 函数体泄漏检测与恢复：`#ifdef` 等预处理指令导致 tree-sitter 边界破裂时，将泄漏到函数体内的声明恢复到文件作用域
+- 嵌套结构体函数声明恢复：多行宏（如 `UV_HANDLE_FIELDS`）导致 struct 吞入后续函数声明时，递归恢复被包裹的函数节点
+- 函数声明/原型提取：`.h` 头文件中的 `int foo();` 和 `extern int bar(void);` 提取为函数节点，公共 API 完整可见
 - 文件级变量提取：`int g_counter = 0;`
 - 静态变量识别：`static int s_counter = 0;` 标记为非导出
 - 常量提取：`const int MAX = 100;` 生成 `constant`
 - 多声明器拆分：`int x, y, z;`
 - 指针、数组、引用声明名称解析：`int *p`、`int arr[10]`
-- 跳过 `extern` 声明和函数前向声明，避免误建变量节点
+- 跳过 `extern` 变量声明（定义在另一文件），但提取 `extern` 函数声明
 - 结构体和类字段提取：`struct S { int id; char name[32]; };`
-- 函数体内全局变量引用追踪，并排除同名局部变量、参数和函数调用目标
+- 函数体内全局变量引用追踪（`g_` 前缀），并排除同名局部变量、参数和函数调用目标
 - `#include "foo.h"` / `#include <vector>` 提取与解析
 - 从 `compile_commands.json` 读取 `-I`、`-isystem` 路径，缺失时启用常见目录探测
+- 移除 1MB 文件大小硬限制，大型源文件正常解析，超时时间随文件大小自适应缩放（上限 3 分钟）
+- 回调边合成阶段流式处理，峰值内存降至约 1KB，不随方法数量增长
 
 ## 架构
 
