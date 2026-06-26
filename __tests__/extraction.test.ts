@@ -2514,6 +2514,113 @@ VOS_UINT32 normalFunc(VOS_VOID)
     });
   });
 
+  describe('C/C++ variable with unrecognized macros before name', () => {
+    it('extracts variable name when 2+ macros precede variable with initializer (Pattern A)', () => {
+      // tree-sitter splits 2+ unknown identifiers before a variable with an
+      // initializer: the first N tokens become a spurious declaration, and the
+      // real assignment lands in an orphaned expression_statement.
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 g_DEV_ulFrameType = VOS_NULL_LONG;
+`;
+      const result = extractFromSource('test.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_DEV_ulFrameType');
+      expect(variable).toBeDefined();
+      expect(variable?.signature).toMatch(/^= VOS_NULL_LONG/);
+    });
+
+    it('extracts variable name when 2+ macros precede variable with numeric init (Pattern A)', () => {
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 g_CDEV_ulMaxRruCount = 342;
+`;
+      const result = extractFromSource('test2.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_CDEV_ulMaxRruCount');
+      expect(variable).toBeDefined();
+    });
+
+    it('extracts variable name when 2+ macros precede pointer variable (Pattern A)', () => {
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY HTIMER g_CDEV_hEqmtRegElblBinTimer = VOS_NULL_PTR;
+`;
+      const result = extractFromSource('test3.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_CDEV_hEqmtRegElblBinTimer');
+      expect(variable).toBeDefined();
+    });
+
+    it('extracts variable name from ERROR node when macros before array variable (Pattern B)', () => {
+      // When a macro appears before an array variable, tree-sitter misparses
+      // the macro as the declarator identifier and puts the real variable name
+      // inside an ERROR child of the array_declarator.
+      const code = `
+EXTERN_STDC_BEGIN ADA_DEV_IDCVT_TABLE_STRU g_DEV_astRruDlIdCvtTbl[] = { { 0, 1 } };
+`;
+      const result = extractFromSource('test4.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_DEV_astRruDlIdCvtTbl');
+      expect(variable).toBeDefined();
+    });
+
+    it('extracts variable name from init_declarator ERROR when type is a macro (Pattern C)', () => {
+      // When tree-sitter keeps a single declaration but the init_declarator
+      // has a conflicting ERROR identifier (macro misparsed as the name),
+      // the ERROR child should be preferred.
+      // Simulate with a pattern that produces this AST without 'extern'.
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 g_var = 0;
+`;
+      const result = extractFromSource('test5.c', code);
+
+      // For this 2-macro + init case, Pattern A recovery kicks in from the
+      // expression_statement. The variable should be found.
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_var');
+      expect(variable).toBeDefined();
+    });
+
+    it('regression: single macro before variable still works', () => {
+      const code = `
+VOS_UINT32 g_normalVar = 0;
+`;
+      const result = extractFromSource('normal_var.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_normalVar');
+      expect(variable).toBeDefined();
+    });
+
+    it('regression: no macros before variable still works', () => {
+      const code = `
+int g_counter = 0;
+`;
+      const result = extractFromSource('int_var.c', code);
+
+      const variable = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === 'g_counter');
+      expect(variable).toBeDefined();
+    });
+
+    it('does not extract variables from expression_statement inside function body', () => {
+      const code = `
+void func(void) {
+  int x = 1;
+  x = 42;
+}
+`;
+      const result = extractFromSource('func_body.c', code);
+
+      // The assignment inside the function should NOT be extracted as a global
+      const globalX = result.nodes.find((n) => n.kind === 'variable'
+        && n.name === '42');
+      expect(globalX).toBeUndefined();
+    });
+  });
+
   describe('C/C++ macro misparse filtering', () => {
     // Tree-sitter C/C++ parsers lack a preprocessor. When a macro invocation
     // has the shape MACRO_NAME(params) { body }, it matches the
@@ -7295,5 +7402,224 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
       expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
       cg.destroy();
     } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Edge re-wiring during sync', () => {
+  let tempDir: string;
+  let cg: CodeGraph | null = null;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) { try { cg.close(); } catch { /* already closed */ } }
+    cg = null;
+    try {
+      if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch { /* Windows file-lock timing */ }
+  });
+
+  it('rewires incoming cross-file edges when a changed file is re-indexed', async () => {
+    // Set up a C project: a.h declares foo(), b.c calls foo()
+    fs.writeFileSync(
+      path.join(tempDir, 'a.h'),
+      `#ifndef A_H
+#define A_H
+void foo(void);
+#endif
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+void foo(void) {
+  return;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'b.c'),
+      `#include "a.h"
+void bar(void) {
+  foo();
+}
+`
+    );
+
+    // Initial index
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // Find the nodes — getNodesByName returns Node[]
+    const fooNodes = cg.getNodesByName('foo');
+    const fooDef = fooNodes.find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(fooDef).toBeDefined();
+
+    const barNodes = cg.getNodesByName('bar');
+    const barDef = barNodes.find((n) => n.kind === 'function' && n.filePath === 'b.c');
+    expect(barDef).toBeDefined();
+
+    // b.c calls foo() → verify the cross-file edge exists
+    const callers = cg.getCallers(fooDef!.id);
+    expect(callers.some((c) => c.node.id === barDef!.id)).toBe(true);
+
+    // Record b.c's indexedAt before sync
+    const fileBefore = (cg as any).queries.getFileByPath('b.c');
+    expect(fileBefore).toBeDefined();
+    const indexedBefore = fileBefore!.indexedAt;
+
+    // Modify a.c (change foo's body, keep the name and signature)
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+void foo(void) {
+  int x = 1;  /* changed body */
+  (void)x;
+  return;
+}
+`
+    );
+
+    // Sync
+    const result = await cg.sync();
+
+    // The cross-file edge should still exist (rewired to new node ID)
+    const fooDefAfter = cg.getNodesByName('foo').find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(fooDefAfter).toBeDefined();
+    const callersAfter = cg.getCallers(fooDefAfter!.id);
+    expect(callersAfter.some((c) => c.node.id === barDef!.id)).toBe(true);
+
+    // b.c should NOT have been re-indexed
+    const fileAfter = (cg as any).queries.getFileByPath('b.c');
+    expect(fileAfter).toBeDefined();
+    expect(fileAfter!.indexedAt).toBe(indexedBefore);
+
+    // No failed rewires — co-importer skipped
+    expect(result.failedRewireSourceFiles).toBeUndefined();
+
+    cg.close();
+    cg = null;
+  });
+
+  it('records failed rewire source files when a symbol is renamed', async () => {
+    // Set up: a.h declares foo(), a.c defines foo(), b.c calls foo()
+    fs.writeFileSync(
+      path.join(tempDir, 'a.h'),
+      `#ifndef A_H
+#define A_H
+void foo(void);
+#endif
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+void foo(void) { return; }
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'b.c'),
+      `#include "a.h"
+void bar(void) { foo(); }
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const fooDef = cg.getNodesByName('foo').find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(fooDef).toBeDefined();
+    const barDef = cg.getNodesByName('bar').find((n) => n.kind === 'function' && n.filePath === 'b.c');
+    expect(barDef).toBeDefined();
+    expect(cg.getCallers(fooDef!.id).some((c) => c.node.id === barDef!.id)).toBe(true);
+
+    // Rename foo → renamed_foo in a.c and a.h
+    fs.writeFileSync(
+      path.join(tempDir, 'a.h'),
+      `#ifndef A_H
+#define A_H
+void renamed_foo(void);
+#endif
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+void renamed_foo(void) { return; }
+`
+    );
+
+    const result = await cg.sync();
+
+    // renamed_foo should exist
+    const renamedDef = cg.getNodesByName('renamed_foo').find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(renamedDef).toBeDefined();
+
+    // b.c should be listed as a failed rewire source file
+    expect(result.failedRewireSourceFiles).toBeDefined();
+    expect(result.failedRewireSourceFiles!).toContain('b.c');
+
+    cg.close();
+    cg = null;
+  });
+
+  it('rewires edges correctly when only comments change (no symbol changes)', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'a.h'),
+      `#ifndef A_H
+#define A_H
+int get_value(void);
+#endif
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+int get_value(void) { return 42; }
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'b.c'),
+      `#include "a.h"
+int compute(void) { return get_value() + 1; }
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const getValueDef = cg.getNodesByName('get_value').find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(getValueDef).toBeDefined();
+    const computeDef = cg.getNodesByName('compute').find((n) => n.kind === 'function' && n.filePath === 'b.c');
+    expect(computeDef).toBeDefined();
+    expect(cg.getCallers(getValueDef!.id).some((c) => c.node.id === computeDef!.id)).toBe(true);
+
+    // Modify a.c — only change a comment, no symbol changes
+    fs.writeFileSync(
+      path.join(tempDir, 'a.c'),
+      `#include "a.h"
+/* This is a changed comment */
+int get_value(void) { return 42; }
+`
+    );
+
+    const result = await cg.sync();
+
+    // Edge should still exist
+    const getValueAfter = cg.getNodesByName('get_value').find((n) => n.kind === 'function' && n.filePath === 'a.c');
+    expect(getValueAfter).toBeDefined();
+    const callersAfter = cg.getCallers(getValueAfter!.id);
+    expect(callersAfter.some((c) => c.node.id === computeDef!.id)).toBe(true);
+
+    // No failed rewires
+    expect(result.failedRewireSourceFiles).toBeUndefined();
+
+    cg.close();
+    cg = null;
   });
 });

@@ -552,6 +552,40 @@ export class TreeSitterExtractor {
       this.extractVariable(node);
       skipChildren = true; // extractVariable handles children
     }
+    // C/C++: expression_statement at translation_unit/namespace scope is a
+    // misparse caused by unrecognized macros before a variable declaration
+    // with an initializer.  tree-sitter splits the first N identifiers into a
+    // spurious declaration and leaves the real assignment as an
+    // expression_statement.
+    // e.g.  RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 g_DEV_ulFrameType = VOS_NULL_LONG;
+    else if (
+      (this.language === 'c' || this.language === 'cpp') &&
+      nodeType === 'expression_statement' &&
+      !this.isInsideClassLikeNode() &&
+      !this.isInsideFunctionNode() &&
+      !this.isInsideCompoundStatement(node)
+    ) {
+      const inner = node.namedChild(0);
+      if (inner?.type === 'assignment_expression') {
+        const left = inner.namedChild(0);
+        if (left?.type === 'identifier') {
+          const name = getNodeText(left, this.source);
+          if (name && !C_CPP_KEYWORD_NAMES.has(name)) {
+            const right = inner.namedChild(1);
+            const initValue = right
+              ? getNodeText(right, this.source).slice(0, 100) : undefined;
+            const initSignature = initValue
+              ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+            const isExported = this.extractor.isExported?.(left, this.source) ?? false;
+            this.createNode('variable', name, left, {
+              signature: initSignature,
+              isExported,
+            });
+          }
+        }
+      }
+      skipChildren = true;
+    }
     // Swift stored properties inside a type. Swift instance properties aren't
     // extracted as their own nodes, but a property's PROPERTY WRAPPER
     // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
@@ -2037,7 +2071,27 @@ export class TreeSitterExtractor {
         if (n.type === 'pointer_declarator' || n.type === 'array_declarator' ||
             n.type === 'reference_declarator') {
           const inner = getChildByField(n, 'declarator') || n.namedChild(0);
-          return inner ? unwrapDeclarator(inner) : null;
+          const result = inner ? unwrapDeclarator(inner) : null;
+          // When unrecognized macros appear before the declaration
+          // (e.g. EXTERN_STDC_BEGIN ADA_DEV_IDCVT_TABLE_STRU g_var[] = {}),
+          // tree-sitter puts a macro name as the declarator-field identifier
+          // and the real variable name inside an ERROR child.  Check ERROR
+          // children and prefer an identifier that differs from the one the
+          // declarator field returned.
+          if (result?.type === 'identifier') {
+            for (const child of n.namedChildren) {
+              if (child.type === 'ERROR') {
+                for (const errChild of child.namedChildren) {
+                  if (errChild.type === 'identifier') {
+                    if (getNodeText(errChild, this.source) !== getNodeText(result, this.source)) {
+                      return errChild;
+                    }
+                  }
+                }
+              }
+            }
+          }
+          return result ?? null;
         }
         if (n.type === 'parenthesized_declarator') {
           for (let i = 0; i < n.namedChildCount; i++) {
@@ -2102,7 +2156,7 @@ export class TreeSitterExtractor {
       // function declarations are extracted — they're the public API signature.
       const isExtern = this.hasStorageClass(node, 'extern');
 
-      for (const child of node.namedChildren) {
+      outer: for (const child of node.namedChildren) {
         if (!DECLARATOR_TYPES.has(child.type)) continue;
 
         // Handle function declarations (forward declarations, prototypes).
@@ -2140,6 +2194,48 @@ export class TreeSitterExtractor {
         if (isExtern) continue;
 
         const resolved = unwrapDeclarator(child);
+
+        // When init_declarator has ERROR children containing identifiers
+        // that DIFFER from the one unwrapDeclarator returned, tree-sitter
+        // has misparsed macros as the identifier and the real variable name
+        // is in the ERROR recovery node.
+        // e.g.  extern RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 g_var = 0;
+        //       init_declarator → identifier "VOS_UINT32" ← macro
+        //                      → ERROR → identifier "g_var" ← real name
+        if (resolved?.type === 'identifier' && child.type === 'init_declarator') {
+          for (const c of child.namedChildren) {
+            if (c.type === 'ERROR') {
+              for (const ec of c.namedChildren) {
+                if (ec.type === 'identifier' &&
+                    getNodeText(ec, this.source) !== getNodeText(resolved, this.source)) {
+                  const errName = getNodeText(ec, this.source);
+                  if (errName && !C_CPP_KEYWORD_NAMES.has(errName)) {
+                    const valueNode = getChildByField(child, 'value');
+                    const initValue = valueNode
+                      ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+                    const initSignature = initValue
+                      ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+                    this.createNode(kind, errName, ec, {
+                      docstring,
+                      signature: initSignature,
+                      isExported,
+                    });
+                  }
+                  break; // exit ERROR children loop — already created the node
+                }
+              }
+              // If we found a conflicting ERROR identifier, skip to next
+              // named child (continue the outer for loop)
+              if (c.namedChildren.some(
+                (ec: SyntaxNode) => ec.type === 'identifier' &&
+                  getNodeText(ec, this.source) !== getNodeText(resolved, this.source)
+              )) {
+                continue outer; // continue outer for loop (next child)
+              }
+            }
+          }
+        }
+
         if (!resolved || resolved.type !== 'identifier') continue;
 
         const name = getNodeText(resolved, this.source);

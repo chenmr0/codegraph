@@ -14,6 +14,7 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  SavedCrossFileEdge,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -84,6 +85,11 @@ export interface SyncResult {
   nodesUpdated: number;
   durationMs: number;
   changedFilePaths?: string[];
+  /** Files whose incoming cross-file edges couldn't be fully rewired —
+   *  they need co-importer re-indexing as a fallback.  undefined means
+   *  edge re-wiring ran and all edges were restored; an empty array
+   *  means no rewiring was needed (0 incoming edges). */
+  failedRewireSourceFiles?: string[];
 }
 
 /**
@@ -589,6 +595,12 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  /**
+   * Accumulates source file paths of nodes whose incoming edges couldn't be
+   * re-wired during a sync pass. Populated by storeExtractionResult, consumed
+   * and cleared by sync().
+   */
+  private syncRewireFailures: string[] = [];
 
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
@@ -1297,7 +1309,12 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Store extraction result in database
+   * Store extraction result in database.
+   *
+   * Before deleting old nodes, incoming cross-file edges are snapshotted and
+   * then re-wired to new node IDs after insertion (by matching target name +
+   * kind). This avoids expensive co-importer re-indexing for the common case
+   * where symbols moved position but kept their name and kind.
    */
   private storeExtractionResult(
     filePath: string,
@@ -1315,8 +1332,12 @@ export class ExtractionOrchestrator {
       return; // No changes
     }
 
-    // Delete existing data for this file
+    // Snapshot incoming cross-file edges before deleting old nodes.
+    // These are edges from nodes in OTHER files → nodes in THIS file.
+    // After re-insertion we'll re-wire them to the new node IDs.
+    let savedEdges: SavedCrossFileEdge[] = [];
     if (existingFile) {
+      savedEdges = this.queries.getIncomingCrossFileEdges(filePath);
       this.queries.deleteFile(filePath);
     }
 
@@ -1356,6 +1377,17 @@ export class ExtractionOrchestrator {
       }
     }
 
+    // Re-wire saved incoming cross-file edges to new node IDs
+    if (savedEdges.length > 0 && validNodes.length > 0) {
+      this.rewireEdges(savedEdges, validNodes);
+    } else if (savedEdges.length > 0) {
+      // File was emptied (all symbols removed) — all incoming edges are
+      // legitimately orphaned. Record source files so they get re-indexed
+      // (which will surface the now-unresolved references).
+      const sourceFiles = [...new Set(savedEdges.map((e) => e.sourceFilePath))];
+      this.syncRewireFailures.push(...sourceFiles);
+    }
+
     // Insert file record
     const fileRecord: FileRecord = {
       path: filePath,
@@ -1368,6 +1400,70 @@ export class ExtractionOrchestrator {
       errors: result.errors.length > 0 ? result.errors : undefined,
     };
     this.queries.upsertFile(fileRecord);
+  }
+
+  /**
+   * Re-wire saved incoming cross-file edges to new node IDs by matching
+   * target (name, kind). Edges that can't be matched (symbol removed or
+   * renamed) record their source file so co-importer fallback can run.
+   */
+  private rewireEdges(
+    savedEdges: SavedCrossFileEdge[],
+    newNodes: ExtractionResult['nodes']
+  ): void {
+    // Index new nodes by "name|kind" → [nodeId, ...]
+    const nameIndex = new Map<string, string[]>();
+    for (const node of newNodes) {
+      const key = `${node.name}|${node.kind}`;
+      const ids = nameIndex.get(key);
+      if (ids) {
+        ids.push(node.id);
+      } else {
+        nameIndex.set(key, [node.id]);
+      }
+    }
+
+    const rewired: Array<{
+      source: string;
+      target: string;
+      kind: import('../types').EdgeKind;
+      metadata?: Record<string, unknown>;
+      line?: number;
+      column?: number;
+      provenance?: 'tree-sitter' | 'scip' | 'heuristic';
+    }> = [];
+    const failedSourceFiles = new Set<string>();
+
+    for (const saved of savedEdges) {
+      const key = `${saved.targetName}|${saved.targetKind}`;
+      const matches = nameIndex.get(key);
+
+      if (matches && matches.length === 1) {
+        rewired.push({
+          source: saved.sourceId,
+          target: matches[0]!,
+          kind: saved.edgeKind as import('../types').EdgeKind,
+          metadata: saved.metadata
+            ? (JSON.parse(saved.metadata) as Record<string, unknown>)
+            : undefined,
+          line: saved.line ?? undefined,
+          column: saved.col ?? undefined,
+          provenance: (saved.provenance as 'tree-sitter' | 'scip' | 'heuristic') ?? undefined,
+        });
+      } else {
+        // 0 matches → symbol removed; >1 matches → ambiguous overload, defer
+        // to co-importer fallback (conservative — no wrong edges).
+        failedSourceFiles.add(saved.sourceFilePath);
+      }
+    }
+
+    if (rewired.length > 0) {
+      this.queries.insertEdges(rewired as import('../types').Edge[]);
+    }
+
+    if (failedSourceFiles.size > 0) {
+      this.syncRewireFailures.push(...failedSourceFiles);
+    }
   }
 
   /**
@@ -1387,6 +1483,7 @@ export class ExtractionOrchestrator {
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    this.syncRewireFailures = [];
 
     onProgress?.({
       phase: 'scanning',
@@ -1492,6 +1589,9 @@ export class ExtractionOrchestrator {
       nodesUpdated += result.nodes.length;
     }
 
+    const failedFiles = [...new Set(this.syncRewireFailures)];
+    this.syncRewireFailures = [];
+
     return {
       filesChecked,
       filesAdded,
@@ -1500,6 +1600,7 @@ export class ExtractionOrchestrator {
       nodesUpdated,
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
+      failedRewireSourceFiles: failedFiles.length > 0 ? failedFiles : undefined,
     };
   }
 

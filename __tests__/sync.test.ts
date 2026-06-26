@@ -347,9 +347,10 @@ describe('Sync Module', () => {
       fs.writeFileSync(acPath, content);
       fs.utimesSync(acPath, now, now);
 
-      // Sync should re-index a.c and b.c (co-importer of a.h)
+      // Sync re-indexes a.c. b.c's cross-file edges to a.c's nodes are
+      // preserved via edge re-wiring (no co-importer re-indexing needed).
       const result = await cg.sync();
-      expect(result.filesModified).toBeGreaterThanOrEqual(2);
+      expect(result.filesModified).toBeGreaterThanOrEqual(1);
 
       // Verify cross-file caller is still present after sync
       const varNode2 = (await cg.searchNodes('g_counter', { limit: 10 }))

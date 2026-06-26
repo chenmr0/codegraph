@@ -484,57 +484,52 @@ export class CodeGraph {
           this.resolver.resolveChainedCallsViaConformance();
         }
 
-        // Re-index co-importers. When a changed file (e.g. a.c) is re-indexed,
-        // its old nodes are cascade-deleted, which drops incoming cross-file
-        // edges from other files (e.g. b.c → a.c:g_counter). To restore them,
-        // we find files that import the same headers as the changed files
-        // (co-importers), re-extract them (repopulating unresolved_refs), and
-        // run a second scoped resolution pass.
-        if (
-          result.changedFilePaths &&
-          result.changedFilePaths.length > 0 &&
-          (result.filesAdded > 0 || result.filesModified > 0)
-        ) {
-          const coImporterFiles = this.queries.getCoImporters(result.changedFilePaths);
-          if (coImporterFiles.length > 0) {
+        // Edge re-wiring (done inside storeExtractionResult during
+        // orchestrator.sync()) already restored incoming cross-file edges
+        // from unchanged files to the changed files' new nodes.  Only the
+        // files whose edges couldn't be re-wired (symbol renamed/removed,
+        // or ambiguous overload) need the old co-importer re-index fallback.
+        const failedFiles = result.failedRewireSourceFiles?.length
+          ? result.failedRewireSourceFiles.filter(
+              fp => !result.changedFilePaths!.includes(fp)
+            )
+          : [];
+
+        if (failedFiles.length > 0) {
+          options.onProgress?.({
+            phase: 'parsing',
+            current: 0,
+            total: failedFiles.length,
+            currentFile: failedFiles[0],
+          });
+
+          for (let i = 0; i < failedFiles.length; i++) {
+            const fp = failedFiles[i]!;
+            try {
+              await this.orchestrator.indexFile(fp, { force: true });
+              result.filesModified++;
+            } catch {
+              continue;
+            }
             options.onProgress?.({
               phase: 'parsing',
-              current: 0,
-              total: coImporterFiles.length,
-              currentFile: coImporterFiles[0],
+              current: i + 1,
+              total: failedFiles.length,
             });
-
-            for (let i = 0; i < coImporterFiles.length; i++) {
-              const fp = coImporterFiles[i]!;
-              try {
-                await this.orchestrator.indexFile(fp, { force: true });
-                result.filesModified++;
-              } catch {
-                // File may have been deleted since the import edge was created
-                continue;
-              }
-              options.onProgress?.({
-                phase: 'parsing',
-                current: i + 1,
-                total: coImporterFiles.length,
-              });
-            }
-
-            // Resolve co-importers' refs (restores their cross-file edges)
-            const coImportRefs = this.queries.getUnresolvedReferencesByFiles(
-              coImporterFiles.filter(fp => !result.changedFilePaths!.includes(fp))
-            );
-            if (coImportRefs.length > 0) {
-              this.resolver.resolveAndPersist(coImportRefs, (current, total) => {
-                options.onProgress?.({ phase: 'resolving', current, total });
-              });
-            }
-
-            // Merge into changedFilePaths for the result report
-            result.changedFilePaths = result.changedFilePaths.concat(
-              coImporterFiles.filter(fp => !result.changedFilePaths!.includes(fp))
-            );
           }
+
+          const coImportRefs =
+            this.queries.getUnresolvedReferencesByFiles(failedFiles);
+          if (coImportRefs.length > 0) {
+            this.resolver.resolveAndPersist(coImportRefs, (current, total) => {
+              options.onProgress?.({ phase: 'resolving', current, total });
+            });
+          }
+
+          // Merge into changedFilePaths for the result report
+          result.changedFilePaths = result.changedFilePaths!.concat(
+            failedFiles.filter(fp => !result.changedFilePaths!.includes(fp))
+          );
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.

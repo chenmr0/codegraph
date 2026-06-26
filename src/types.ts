@@ -280,6 +280,31 @@ export interface ExtractionError {
 }
 
 /**
+ * Snapshot of a cross-file incoming edge saved before a file's old nodes
+ * are deleted, so the edge can be re-wired to the new nodes after re-insertion.
+ */
+export interface SavedCrossFileEdge {
+  /** Source node ID (in another file — NOT being re-indexed) */
+  sourceId: string;
+  /** File path of the source node */
+  sourceFilePath: string;
+  /** Name of the target node (in the file being re-indexed) */
+  targetName: string;
+  /** Kind of the target node */
+  targetKind: string;
+  /** Edge relationship kind */
+  edgeKind: string;
+  /** Edge metadata (JSON string from DB) */
+  metadata: string | null;
+  /** Line number at the edge site */
+  line: number | null;
+  /** Column number at the edge site */
+  col: number | null;
+  /** How the edge was created */
+  provenance: string | null;
+}
+
+/**
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {

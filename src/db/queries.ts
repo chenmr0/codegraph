@@ -10,6 +10,7 @@ import {
   Edge,
   FileRecord,
   UnresolvedReference,
+  SavedCrossFileEdge,
   NodeKind,
   EdgeKind,
   Language,
@@ -1690,6 +1691,52 @@ export class QueryBuilder {
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
       filePath: row.file_path,
       language: row.language as Language,
+    }));
+  }
+
+  /**
+   * Snapshot incoming cross-file edges pointing TO nodes in `filePath`,
+   * before those nodes are deleted.  These edges are from nodes in OTHER
+   * files to nodes in THIS file — edge re-wiring will try to re-create them
+   * after re-insertion by matching target (name, kind) to new node IDs.
+   *
+   * Returns an empty array when there are no incoming cross-file edges.
+   */
+  getIncomingCrossFileEdges(filePath: string): SavedCrossFileEdge[] {
+    const sql = `SELECT e.source, e.kind, e.metadata, e.line, e.col, e.provenance,
+       nt.name  AS target_name,
+       nt.kind  AS target_kind,
+       ns.file_path AS source_file_path
+FROM nodes nt
+JOIN edges e ON e.target = nt.id
+JOIN nodes ns ON ns.id = e.source
+WHERE nt.file_path = ?
+  AND ns.file_path != ?`;
+
+    const rows = this.db
+      .prepare(sql)
+      .all(filePath, filePath) as Array<{
+      source: string;
+      kind: string;
+      metadata: string | null;
+      line: number | null;
+      col: number | null;
+      provenance: string | null;
+      target_name: string;
+      target_kind: string;
+      source_file_path: string;
+    }>;
+
+    return rows.map((r) => ({
+      sourceId: r.source,
+      sourceFilePath: r.source_file_path,
+      targetName: r.target_name,
+      targetKind: r.target_kind,
+      edgeKind: r.kind,
+      metadata: r.metadata,
+      line: r.line,
+      col: r.col,
+      provenance: r.provenance,
     }));
   }
 
