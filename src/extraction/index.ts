@@ -247,15 +247,18 @@ function readGitignorePatterns(giPath: string): string {
 
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
- * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
- * by both enumeration paths so behavior is identical with or without git — and so
- * the defaults apply to tracked files too (committing a dependency dir doesn't make
- * it project code; the explicit `.gitignore` negation is the only opt-in).
+ * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, then
+ * merged with `.codegraphignore` (if present) as the top layer — the user's explicit
+ * extra excludes or overrides scoped to CodeGraph. Shared by both enumeration paths
+ * so behavior is identical with or without git — and so the defaults apply to
+ * tracked files too (committing a dependency dir doesn't make it project code).
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   const rootGitignore = path.join(rootDir, '.gitignore');
   if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  const cgIgnore = path.join(rootDir, '.codegraphignore');
+  if (fs.existsSync(cgIgnore)) ig.add(readGitignorePatterns(cgIgnore));
   return ig;
 }
 
@@ -1616,6 +1619,13 @@ export class ExtractionOrchestrator {
       const added: string[] = [];
       const modified: string[] = [];
       const removed: string[] = [];
+
+      // Apply built-in + .gitignore + .codegraphignore filters uniformly so
+      // sync and init agree on which files are in scope. (Git status only
+      // respects .gitignore, so the supplement layers must be applied here.)
+      const ig = buildDefaultIgnore(this.rootDir);
+      gitChanges.modified = gitChanges.modified.filter(f => !ig.ignores(f));
+      gitChanges.added = gitChanges.added.filter(f => !ig.ignores(f));
 
       // Deleted files — only report if tracked in DB
       for (const filePath of gitChanges.deleted) {

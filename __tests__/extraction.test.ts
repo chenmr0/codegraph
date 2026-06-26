@@ -6040,6 +6040,31 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  it('.codegraphignore adds extra excludes on top of .gitignore', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'node_modules/\n');
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), 'generated/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('node_modules/')).toBe(true);  // from .gitignore
+    expect(ig.ignores('generated/')).toBe(true);      // from .codegraphignore
+    expect(ig.ignores('src/app.ts')).toBe(false);     // not ignored
+  });
+
+  it('.codegraphignore negation overrides a rule from a lower layer', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!dist/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('node_modules/')).toBe(true); // default still applies
+    expect(ig.ignores('dist/')).toBe(false);        // negation in .codegraphignore
+    expect(ig.ignores('src/app.ts')).toBe(false);
+  });
+
+  it('.codegraphignore survives bad patterns like .gitignore does', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), 'generated/\n\\\\[\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(() => ig.ignores('src/app.ts')).not.toThrow();
+    expect(ig.ignores('generated/')).toBe(true); // valid rule survives
+    expect(ig.ignores('src/app.ts')).toBe(false);
+  });
 });
 
 // =============================================================================
