@@ -263,6 +263,30 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
 }
 
 /**
+ * Check whether the project's `.codegraphignore` (if present) contains any
+ * negation rule (`!` prefix).  Negations re-include files that `.gitignore`
+ * already excludes — but `git ls-files` won't report those files at all, so
+ * the git fast-path can't surface them.  Callers that detect a negation must
+ * fall back to a filesystem walk, which correctly applies the full ignore
+ * chain (built-in → .gitignore → .codegraphignore).
+ */
+function hasCodegraphIgnoreNegation(rootDir: string): boolean {
+  const cgIgnore = path.join(rootDir, '.codegraphignore');
+  if (!fs.existsSync(cgIgnore)) return false;
+
+  const patterns = readGitignorePatterns(cgIgnore);
+  if (!patterns) return false;
+
+  for (const line of patterns.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('!') && trimmed.length > 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
  * git repository rooted at `repoDir`, adding each to `files` with `prefix`
  * prepended so paths stay relative to the original scan root.
@@ -319,6 +343,10 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>): v
  * (non-git project) so callers can fall back to a filesystem walk.
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
+  // .codegraphignore negation rules re-include files git has already excluded,
+  // so `git ls-files` never reports them.  Fall back to a filesystem walk.
+  if (hasCodegraphIgnoreNegation(rootDir)) return null;
+
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -1612,7 +1640,9 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    // .codegraphignore negation rules re-include files git has already excluded,
+    // so `git status` never reports them.  Fall back to a full filesystem scan.
+    const gitChanges = hasCodegraphIgnoreNegation(this.rootDir) ? null : getGitChangedFiles(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===

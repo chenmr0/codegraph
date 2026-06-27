@@ -6065,6 +6065,67 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('generated/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  // .codegraphignore with negation (!) in a git repo: git ls-files won't
+  // report the re-included files (they're gitignored), so the fast path
+  // must fall back to a filesystem walk.
+  it('.codegraphignore negation re-includes a gitignored directory in git mode', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    // Set up a git repo
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .gitignore excludes build/ — those files will NOT be in git ls-files
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    // .codegraphignore re-includes build/ with a negation
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!build/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    expect(files).toContain('build/output.ts');
+  });
+
+  // Performance regression guard: when .codegraphignore has only exclusion
+  // rules (no !), the git fast path is retained.
+  it('.codegraphignore with only exclusion rules retains git fast path', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .gitignore excludes build/
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    // .codegraphignore only adds exclusion rules, no negations
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), 'generated/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    // build/ is gitignored → excluded by git ls-files (git fast path active)
+    // generated/ is excluded by .codegraphignore (in-memory filter)
+    expect(files).toContain('src/main.ts');
+    expect(files).not.toContain('build/output.ts');
+    expect(files).not.toContain('generated/gen.ts');
+  });
 });
 
 // =============================================================================
