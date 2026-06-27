@@ -248,15 +248,19 @@ function readGitignorePatterns(giPath: string): string {
 /**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, then
- * merged with `.codegraphignore` (if present) as the top layer — the user's explicit
- * extra excludes or overrides scoped to CodeGraph. Shared by both enumeration paths
- * so behavior is identical with or without git — and so the defaults apply to
- * tracked files too (committing a dependency dir doesn't make it project code).
+ * merged with `.git/info/exclude` (the repo-local uncommitted exclude file), and
+ * finally merged with `.codegraphignore` (if present) as the top layer — the user's
+ * explicit extra excludes or overrides scoped to CodeGraph. Shared by both
+ * enumeration paths so behavior is identical with or without git — and so the
+ * defaults apply to tracked files too (committing a dependency dir doesn't make it
+ * project code).
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   const rootGitignore = path.join(rootDir, '.gitignore');
   if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  const gitExclude = path.join(rootDir, '.git', 'info', 'exclude');
+  if (fs.existsSync(gitExclude)) ig.add(readGitignorePatterns(gitExclude));
   const cgIgnore = path.join(rootDir, '.codegraphignore');
   if (fs.existsSync(cgIgnore)) ig.add(readGitignorePatterns(cgIgnore));
   return ig;

@@ -6126,6 +6126,305 @@ describe('Nested non-submodule git repos', () => {
     expect(files).not.toContain('build/output.ts');
     expect(files).not.toContain('generated/gen.ts');
   });
+
+  // hasCodegraphIgnoreNegation edge cases
+  it('hasCodegraphIgnoreNegation: comment (#!) is not a negation', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '#! this is a comment\n');
+    // hasCodegraphIgnoreNegation is private; test via scanDirectory behavior:
+    // no negation → git fast path retained → build/ excluded by .gitignore
+    const { execFileSync } = require('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+
+    const files = scanDirectory(tempDir);
+    expect(files).toContain('src/main.ts');
+    // git fast path active: build/ is gitignored → excluded
+    expect(files).not.toContain('build/output.ts');
+  });
+
+  it('hasCodegraphIgnoreNegation: escaped backslash-! is not a negation', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '\\!not-a-negation\n');
+    const { execFileSync } = require('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+
+    const files = scanDirectory(tempDir);
+    expect(files).toContain('src/main.ts');
+    // git fast path retained: build/ is gitignored → excluded
+    expect(files).not.toContain('build/output.ts');
+  });
+
+  it('hasCodegraphIgnoreNegation: bare ! with no following text is not a negation', () => {
+    // A line with only "!" (trimmed length === 1) should not count as negation
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!\n');
+    const { execFileSync } = require('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+
+    const files = scanDirectory(tempDir);
+    expect(files).toContain('src/main.ts');
+    expect(files).not.toContain('build/output.ts');
+  });
+
+  it('.codegraphignore with multiple negation patterns triggers fallback', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\ndist/\n');
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!build/\n!dist/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'dist', 'bundle.js'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    // Both build/ and dist/ are re-included by negation
+    expect(files).toContain('build/output.ts');
+    expect(files).toContain('dist/bundle.js');
+  });
+
+  it('.codegraphignore negation re-includes a file inside a default-ignored directory (non-git)', () => {
+    // Non-git project: dist/ is excluded by DEFAULT_IGNORE_PATTERNS,
+    // .codegraphignore !dist/ should override and re-include it.
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!dist/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'dist', 'bundle.js'), '// generated');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    // Re-included by .codegraphignore negation
+    expect(files).toContain('dist/bundle.js');
+  });
+
+  it('.codegraphignore negation re-includes nested files under a re-included dir', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!generated/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated', 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'sub', 'nested.ts'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    expect(files).toContain('generated/gen.ts');
+    expect(files).toContain('generated/sub/nested.ts');
+  });
+
+  it('.codegraphignore negation overrides a .gitignore exclusion for a specific file', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.generated.ts\n');
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!important.generated.ts\n');
+
+    fs.writeFileSync(path.join(tempDir, 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'important.generated.ts'), 'export const y = 2;');
+    fs.writeFileSync(path.join(tempDir, 'other.generated.ts'), 'export const z = 3;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('main.ts');
+    expect(files).toContain('important.generated.ts'); // re-included
+    expect(files).not.toContain('other.generated.ts');  // still excluded
+  });
+});
+
+// =============================================================================
+// .git/info/exclude
+// =============================================================================
+
+describe('.git/info/exclude', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('is respected via git fast path (git ls-files --exclude-standard)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // Exclude generated/ via .git/info/exclude
+    const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+    fs.appendFileSync(excludePath, '\ngenerated/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const y = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    // generated/ excluded by .git/info/exclude via --exclude-standard
+    expect(files).not.toContain('generated/gen.ts');
+  });
+
+  it('is respected alongside .gitignore in git fast path', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .gitignore excludes build/, .git/info/exclude excludes generated/
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n');
+    const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+    fs.appendFileSync(excludePath, '\ngenerated/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    expect(files).not.toContain('build/output.ts');       // .gitignore
+    expect(files).not.toContain('generated/gen.ts');       // .git/info/exclude
+  });
+
+  it('.git/info/exclude combined with .codegraphignore exclusion rules retains fast path', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .git/info/exclude excludes generated/
+    const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+    fs.appendFileSync(excludePath, '\ngenerated/\n');
+    // .codegraphignore adds extra excludes (no negation — fast path retained)
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), 'tmp/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'tmp'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'tmp', 'scratch.ts'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('src/main.ts');
+    expect(files).not.toContain('generated/gen.ts');  // .git/info/exclude
+    expect(files).not.toContain('tmp/scratch.ts');    // .codegraphignore
+  });
+
+  // .codegraphignore negation (!) triggers a filesystem walk fallback.
+  // .git/info/exclude is now read by buildDefaultIgnore, so it applies
+  // to both the git fast path AND the filesystem walk fallback.
+  it('.git/info/exclude is respected when .codegraphignore negation forces filesystem walk', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .git/info/exclude excludes generated/
+    const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+    fs.appendFileSync(excludePath, '\ngenerated/\n');
+    // .codegraphignore with negation triggers filesystem walk fallback
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!build/\n');
+
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'main.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'output.ts'), 'export const y = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'gen.ts'), 'export const z = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    // build/ is re-included by .codegraphignore negation (working as intended)
+    expect(files).toContain('build/output.ts');
+    // generated/ is excluded by .git/info/exclude — now respected in both paths
+    expect(files).not.toContain('generated/gen.ts');
+  });
+
+  // .codegraphignore is the highest-priority layer: a ! negation there
+  // can override an exclusion from .git/info/exclude for specific files.
+  it('.codegraphignore negation overrides a .git/info/exclude exclusion for a specific file', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    git(tempDir, 'init', '-q');
+    git(tempDir, 'config', 'user.email', 'test@test.com');
+    git(tempDir, 'config', 'user.name', 'Test');
+
+    // .git/info/exclude excludes files inside generated/ (but not the dir itself,
+    // so the walk can descend and apply per-file negations)
+    const excludePath = path.join(tempDir, '.git', 'info', 'exclude');
+    fs.appendFileSync(excludePath, '\ngenerated/*\n');
+    // .codegraphignore re-includes only important.ts (negation triggers fallback)
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!generated/important.ts\n');
+
+    fs.mkdirSync(path.join(tempDir, 'generated'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'generated', 'important.ts'), 'export const keep = 1;');
+    fs.writeFileSync(path.join(tempDir, 'generated', 'junk.ts'), 'export const junk = 1;');
+
+    const files = scanDirectory(tempDir);
+
+    // important.ts re-included by .codegraphignore negation (overrides .git/info/exclude)
+    expect(files).toContain('generated/important.ts');
+    // junk.ts still excluded by .git/info/exclude
+    expect(files).not.toContain('generated/junk.ts');
+  });
 });
 
 // =============================================================================
