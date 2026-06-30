@@ -22,8 +22,11 @@ describe('config secret redaction (#383)', () => {
   let tmpDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  const exploreOriginal = process.env[EXPLORE_ENV];
 
   beforeEach(async () => {
+    process.env[EXPLORE_ENV] = '1';
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-config-secret-'));
     const javaDir = path.join(tmpDir, 'src/main/java/com/example');
     const resDir = path.join(tmpDir, 'src/main/resources');
@@ -58,6 +61,8 @@ describe('config secret redaction (#383)', () => {
   });
 
   afterEach(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.destroy();
     if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
   });

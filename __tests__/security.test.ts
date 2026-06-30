@@ -286,8 +286,12 @@ describe('MCP Input Validation', () => {
   let testDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  let exploreOriginal: string | undefined;
 
   beforeEach(async () => {
+    exploreOriginal = process.env[EXPLORE_ENV];
+    process.env[EXPLORE_ENV] = '1';
     testDir = createTempDir();
 
     const srcDir = path.join(testDir, 'src');
@@ -306,6 +310,8 @@ describe('MCP Input Validation', () => {
   });
 
   afterEach(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.close();
     cleanupTempDir(testDir);
   });

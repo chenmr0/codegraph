@@ -19,8 +19,12 @@ describe('MCP input size limits', () => {
   let tempDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  let exploreOriginal: string | undefined;
 
   beforeEach(async () => {
+    exploreOriginal = process.env[EXPLORE_ENV];
+    process.env[EXPLORE_ENV] = '1';
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-limits-'));
     fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
     fs.writeFileSync(
@@ -35,6 +39,8 @@ describe('MCP input size limits', () => {
   });
 
   afterEach(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.destroy();
     if (fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true, force: true });

@@ -141,8 +141,12 @@ describe('codegraph_explore output respects the adaptive budget', () => {
   let testDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  const exploreOriginal = process.env[EXPLORE_ENV];
 
   beforeAll(async () => {
+    // codegraph_explore is disabled by default — re-enable for these tests.
+    process.env[EXPLORE_ENV] = '1';
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-explore-budget-'));
     const srcDir = path.join(testDir, 'src');
     fs.mkdirSync(srcDir);
@@ -178,6 +182,8 @@ describe('codegraph_explore output respects the adaptive budget', () => {
   });
 
   afterAll(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.destroy();
     if (testDir && fs.existsSync(testDir)) {
       fs.rmSync(testDir, { recursive: true, force: true });

@@ -55,6 +55,8 @@ describe('adaptive codegraph_explore sizing — sibling skeletonization', () => 
   let testDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  const exploreOriginal = process.env[EXPLORE_ENV];
 
   // Names the spine (dispatch/proceed/handleLogging), the on-spine exemplar,
   // the three off-spine siblings, and the distinct step — so every file we
@@ -64,6 +66,7 @@ describe('adaptive codegraph_explore sizing — sibling skeletonization', () => 
     'dispatch proceed handleLogging LoggingInterceptor BridgeInterceptor CacheInterceptor RetryInterceptor ResponseFormatter';
 
   beforeAll(async () => {
+    process.env[EXPLORE_ENV] = '1';
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-adaptive-explore-'));
     const srcDir = path.join(testDir, 'src');
     fs.mkdirSync(srcDir);
@@ -249,6 +252,8 @@ export class YamlCodec extends Codec {
   });
 
   afterAll(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.destroy();
     if (testDir && fs.existsSync(testDir)) {
       fs.rmSync(testDir, { recursive: true, force: true });

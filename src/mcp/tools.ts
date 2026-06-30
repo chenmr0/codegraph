@@ -269,6 +269,15 @@ function adaptiveExploreEnabled(): boolean {
 }
 
 /**
+ * Whether `codegraph_explore` is enabled. Default OFF.
+ * Set `CODEGRAPH_ENABLE_EXPLORE=1` (or `true`) to re-enable the explore tool.
+ */
+function isExploreEnabled(): boolean {
+  const v = process.env.CODEGRAPH_ENABLE_EXPLORE;
+  return v === '1' || v === 'true';
+}
+
+/**
  * Prefix each line of a source slice with its 1-based line number, matching
  * the Read tool's `cat -n` convention (number + tab) so the agent treats it
  * the same way it treats Read output.
@@ -575,9 +584,17 @@ export const tools: ToolDefinition[] = [
  */
 export function getStaticTools(): ToolDefinition[] {
   const raw = process.env.CODEGRAPH_MCP_TOOLS;
-  if (!raw || !raw.trim()) return tools;
-  const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  let filtered: ToolDefinition[];
+  if (!raw || !raw.trim()) {
+    filtered = tools;
+  } else {
+    const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
+    filtered = allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  }
+  if (!isExploreEnabled()) {
+    filtered = filtered.filter(t => t.name !== 'codegraph_explore');
+  }
+  return filtered;
 }
 
 /**
@@ -658,8 +675,9 @@ export class ToolHandler {
     return set.size ? set : null;
   }
 
-  /** Whether a tool name passes the CODEGRAPH_MCP_TOOLS allowlist (if any). */
+  /** Whether a tool name passes the CODEGRAPH_MCP_TOOLS allowlist (if any) and is not disabled. */
   private isToolAllowed(name: string): boolean {
+    if (name === 'codegraph_explore' && !isExploreEnabled()) return false;
     const allow = this.toolAllowlist();
     return !allow || allow.has(name.replace(/^codegraph_/, ''));
   }
@@ -675,6 +693,9 @@ export class ToolHandler {
     let visible = allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
       : tools;
+    if (!isExploreEnabled()) {
+      visible = visible.filter(t => t.name !== 'codegraph_explore');
+    }
     if (!this.cg) return visible;
 
     try {

@@ -18,8 +18,11 @@ describe('codegraph_explore — blast radius', () => {
   let testDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  const EXPLORE_ENV = 'CODEGRAPH_ENABLE_EXPLORE';
+  const exploreOriginal = process.env[EXPLORE_ENV];
 
   beforeEach(async () => {
+    process.env[EXPLORE_ENV] = '1';
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-'));
     const src = path.join(testDir, 'src');
     fs.mkdirSync(src, { recursive: true });
@@ -47,6 +50,8 @@ describe('codegraph_explore — blast radius', () => {
   });
 
   afterEach(() => {
+    if (exploreOriginal === undefined) delete process.env[EXPLORE_ENV];
+    else process.env[EXPLORE_ENV] = exploreOriginal;
     if (cg) cg.destroy();
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
