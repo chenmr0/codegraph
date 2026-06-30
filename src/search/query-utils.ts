@@ -440,3 +440,19 @@ export function isDistinctiveIdentifier(token: string): boolean {
   if (/[A-Z]/.test(token.slice(1))) return true;
   return false;
 }
+
+/**
+ * Detect whether a query is natural language rather than a bag of
+ * symbol/file names by checking for Chinese characters (U+4E00–U+9FFF).
+ *
+ * Chinese characters NEVER appear in code identifiers, so any query
+ * containing them is definitely natural language and will produce poor
+ * results through the FTS→LIKE→fuzzy chain. Fast-failing lets the agent
+ * correct course before wasting time.
+ */
+export function isNaturalLanguageQuery(query: string): { isNatural: boolean; reason?: string } {
+  if (/[\u4e00-\u9fff]/.test(query)) {
+    return { isNatural: true, reason: '查询中包含中文字符' };
+  }
+  return { isNatural: false };
+}

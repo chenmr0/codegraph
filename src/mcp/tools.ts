@@ -21,7 +21,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isNaturalLanguageQuery, isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
@@ -378,13 +378,13 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
+    description: '按符号名精确/模糊搜索。仅返回位置信息（无代码——获取源码请用 codegraph_explore）。禁止传入自然语言问题。',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol name or partial name (e.g., "auth", "signIn", "UserService")',
+          description: '精确或部分符号名（例如 "auth"、"signIn"、"UserService"）。不要传自然语言问题',
         },
         kind: {
           type: 'string',
@@ -504,13 +504,13 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. 传入一组符号名/文件名（例如 "AuthService"、"GraphTraverser BFS impact traversal.ts"）。为获得最佳结果请使用符号名，不要传自然语言问题。Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Symbol names, file names, or short code terms to explore (e.g., "AuthService loginUser session-manager", "GraphTraverser BFS impact traversal.ts"). Use codegraph_search first to find relevant names.',
+          description: '符号名、文件名或简短代码术语（例如 "AuthService"、"GraphTraverser BFS traversal.ts"）。不要传自然语言问题——先提取关键符号名再传入。',
         },
         maxFiles: {
           type: 'number',
@@ -1068,6 +1068,19 @@ export class ToolHandler {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
+    // Fast-fail: reject natural-language queries so the agent corrects
+    // course before the FTS→LIKE→fuzzy chain wastes time on bad input.
+    const nlCheck = isNaturalLanguageQuery(query);
+    if (nlCheck.isNatural) {
+      return this.textResult(
+        `codegraph_search 需要传入符号名，不支持自然语言描述。\n\n` +
+        `收到的查询: "${query}"\n` +
+        `检测到: ${nlCheck.reason}\n\n` +
+        `→ 请从你的问题中提取关键符号名，直接搜索符号名\n` +
+        `  （例如: 从 "MML命令注册 TRM MML_DBG" 中提取 "MML_DBG_TRM" 来搜索）`
+      );
+    }
+
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const kind = args.kind as string | undefined;
     const rawLimit = Number(args.limit) || 10;
@@ -1575,6 +1588,27 @@ export class ToolHandler {
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
+
+    // Fast-fail: reject natural-language queries. Explore works best with
+    // symbol/file names extracted from the question, not the raw question.
+    const nlCheck = isNaturalLanguageQuery(query);
+    if (nlCheck.isNatural) {
+      // Extract any identifier-looking tokens as a hint for the agent.
+      const idTokens = query
+        .split(/[\s,;]+/)
+        .map((t) => t.replace(/^[^\w]+|[^\w]+$/g, ''))
+        .filter((t) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t) && t.length >= 2);
+      const hint = idTokens.length >= 2
+        ? `\n→ 请尝试: codegraph_explore query="${idTokens.join(' ')}"\n  （从问题中提取的关键符号名）`
+        : '';
+      return this.textResult(
+        `codegraph_explore 使用符号名/文件名效果最好，不支持自然语言描述。\n\n` +
+        `收到的查询: "${query}"\n` +
+        `检测到: ${nlCheck.reason}\n\n` +
+        `→ 请从问题中提取关键符号名后直接传入` +
+        hint
+      );
+    }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
