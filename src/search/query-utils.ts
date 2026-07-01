@@ -442,17 +442,55 @@ export function isDistinctiveIdentifier(token: string): boolean {
 }
 
 /**
- * Detect whether a query is natural language rather than a bag of
- * symbol/file names by checking for Chinese characters (U+4E00–U+9FFF).
+ * Detect whether a query is natural language / non-symbol content rather
+ * than a single symbol name.
  *
- * Chinese characters NEVER appear in code identifiers, so any query
- * containing them is definitely natural language and will produce poor
- * results through the FTS→LIKE→fuzzy chain. Fast-failing lets the agent
- * correct course before wasting time.
+ * Fast-fail checks (before the FTS→LIKE→fuzzy chain):
+ *   - Chinese characters (NEVER in code identifiers)
+ *   - Hex values (0xABCD) — addresses, error codes, magic numbers
+ *   - Pure numeric strings
+ *   - Question marks (English or Chinese)
+ *   - Whitespace — symbol names never contain spaces
+ *
+ * Fast-failing lets the agent correct course before wasting time on
+ * a query that will produce zero or irrelevant results.
  */
 export function isNaturalLanguageQuery(query: string): { isNatural: boolean; reason?: string } {
-  if (/[\u4e00-\u9fff]/.test(query)) {
+  const trimmed = query.trim();
+
+  // Chinese characters — never in code identifiers
+  if (/[\u4e00-\u9fff]/.test(trimmed)) {
     return { isNatural: true, reason: '查询中包含中文字符' };
   }
+
+  // Hex values like 0x4237F001 — addresses, error codes, magic numbers.
+  // No codebase uses a bare hex literal as a symbol name.
+  if (/^0x[0-9A-Fa-f]+$/.test(trimmed)) {
+    return {
+      isNatural: true,
+      reason: '查询是十六进制数值（如 0x4237F001），不是符号名。请搜索该值的常量/宏定义名',
+    };
+  }
+
+  // Pure numeric — error codes, line numbers, etc. Not a symbol name.
+  if (/^\d+$/.test(trimmed)) {
+    return { isNatural: true, reason: '查询是纯数字，不是符号名' };
+  }
+
+  // Question marks — clearly a natural-language question
+  if (/[?？]/.test(trimmed)) {
+    return { isNatural: true, reason: '查询包含问号，疑似自然语言问题。请提取关键符号名搜索' };
+  }
+
+  // Whitespace — symbol names never contain spaces.  "ADD TRMDBG",
+  // "how does auth work", "RepAlloc.Rsp" (dot gets FTS-stripped into two
+  // terms) — all rejected.  The agent should pass a single symbol name.
+  if (/\s/.test(trimmed)) {
+    return {
+      isNatural: true,
+      reason: '查询包含空格，不是单个符号名。请提取关键符号名搜索（如 "TRMDBG"、"RepAlloc"）',
+    };
+  }
+
   return { isNatural: false };
 }

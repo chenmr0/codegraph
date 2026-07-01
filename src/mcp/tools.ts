@@ -387,13 +387,20 @@ const projectPathProperty: PropertySchema = {
 export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
-    description: '按符号名精确/模糊搜索。仅返回位置信息（无代码——获取源码请用 codegraph_explore）。禁止传入自然语言问题。',
+    description:
+      '按符号名精确/模糊搜索。返回符号位置信息。' +
+      '只接受符号名或符号名片段。' +
+      '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
+      '"RepAlloc.Rsp"（点号分隔的 proto 引用）、"how does auth work?"（自然语言问题）。' +
+      '正面示例："signIn"、"UserService"、"handleAuth"、"TRMDBG"',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: '精确或部分符号名（例如 "auth"、"signIn"、"UserService"）。不要传自然语言问题',
+          description:
+            '符号名（例如 "auth"、"signIn"、"UserService"）。' +
+            '禁止传入：十六进制值(0x...)、自然语言问题、空格分隔的命令/描述、点号分隔的引用',
         },
         kind: {
           type: 'string',
@@ -1094,11 +1101,10 @@ export class ToolHandler {
     const nlCheck = isNaturalLanguageQuery(query);
     if (nlCheck.isNatural) {
       return this.textResult(
-        `codegraph_search 需要传入符号名，不支持自然语言描述。\n\n` +
+        `codegraph_search 需要传入符号名，不支持自然语言描述或非符号内容。\n\n` +
         `收到的查询: "${query}"\n` +
         `检测到: ${nlCheck.reason}\n\n` +
-        `→ 请从你的问题中提取关键符号名，直接搜索符号名\n` +
-        `  （例如: 从 "MML命令注册 TRM MML_DBG" 中提取 "MML_DBG_TRM" 来搜索）`
+        `→ 请从你的问题中提取关键符号名，直接搜索符号名。\n`
       );
     }
 
