@@ -1322,6 +1322,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'c-decl-def') {
+      return {
+        label: `C declaration-definition pair (structural link, not a call)`,
+        compact: `decl-def pair${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 

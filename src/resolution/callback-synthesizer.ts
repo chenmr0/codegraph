@@ -540,6 +540,69 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * C declaration-definition pairing. A C function's prototype (in a .h header)
+ * and its definition (in a .c source file) are extracted as two separate
+ * nodes with NO edge between them. The declaration has callers (resolved by
+ * name-matching) but no callees (no body); the definition has callees but no
+ * callers. An agent that picks the declaration sees an empty Trail for
+ * outgoing calls; one that picks the definition sees nothing calling it.
+ *
+ * Bridge them with a `defines` edge: definition (with body, endLine > startLine)
+ * → declaration (prototype, single line). Same edge kind and rendering as the
+ * C++ synthesizer — `formatDeclDef` is edge-driven and language-agnostic.
+ *
+ * STRICT MODE: only pair when the declaration is in a .h header file. This is
+ * the verifiable signal that replaces C++'s class-node existence check: a
+ * declaration in a header is a public API prototype meant to be paired with
+ * a .c definition. Forward declarations in .c files are not paired (avoids
+ * mis-pairing a local forward declaration with an unrelated same-named
+ * definition in another .c file).
+ */
+function cDeclDefEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // Group c function nodes by name (bare name, no '::').
+  const funcsByName = new Map<string, Node[]>();
+  for (const f of queries.iterateNodesByKind('function')) {
+    if (f.language !== 'c' || !f.name) continue;
+    const arr = funcsByName.get(f.name);
+    if (arr) arr.push(f);
+    else funcsByName.set(f.name, [f]);
+  }
+
+  for (const [, nodes] of funcsByName) {
+    // Definition: spans multiple lines (has body). Declaration: single line.
+    const defs = nodes.filter((n) => n.endLine > n.startLine);
+    const decls = nodes.filter((n) => n.endLine === n.startLine);
+    if (defs.length === 0 || decls.length === 0) continue;
+
+    for (const def of defs) {
+      for (const decl of decls) {
+        if (def.filePath === decl.filePath) continue;       // cross-file only
+        if (!decl.filePath.endsWith('.h')) continue;        // strict: decl in header
+        const key = `${def.id}>${decl.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: def.id,
+          target: decl.id,
+          kind: 'defines',
+          line: def.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'c-decl-def',
+            registeredAt: `${decl.filePath}:${decl.startLine}`,
+          },
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Phase 5.5: interface / abstract dispatch (Java, Kotlin). A call through an
  * injected interface (`@Autowired FooService svc; svc.list()`) or an abstract
  * base dispatches at runtime to the implementing class's override — a vtable
@@ -1765,6 +1828,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const cppDeclDef = cppDeclDefEdges(queries);
+  const cDeclDef = cDeclDefEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
   const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
@@ -1789,6 +1853,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...flutterEdges,
     ...cppEdges,
     ...cppDeclDef,
+    ...cDeclDef,
     ...ifaceEdges,
     ...kotlinExpectActual,
     ...goGrpcEdges,
