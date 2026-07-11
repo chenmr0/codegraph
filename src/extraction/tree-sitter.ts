@@ -1590,6 +1590,38 @@ export class TreeSitterExtractor {
     // Declarators may be wrapped in pointer_declarator / array_declarator.
     // Multiple field_identifiers can appear as siblings (comma-separated).
     if (declarators.length === 0 && (this.language === 'c' || this.language === 'cpp')) {
+      // A member function declaration inside a class (`void bar();`) is parsed
+      // by tree-sitter-cpp as a field_declaration with a function_declarator as
+      // its declarator. Extract it as a method node so it can be paired with
+      // its out-of-line .cpp definition by the decl-def synthesizer. Without
+      // this the declaration is dropped and only the .cpp definition exists.
+      const fnDeclField = getChildByField(node, 'declarator');
+      if (fnDeclField && fnDeclField.type === 'function_declarator') {
+        let innerDecl = getChildByField(fnDeclField, 'declarator');
+        if (!innerDecl) {
+          innerDecl = fnDeclField.namedChildren.find(c => c.type === 'field_identifier') ?? null;
+        }
+        if (innerDecl) {
+          let idNode: SyntaxNode | null = innerDecl;
+          while (idNode && (idNode.type === 'pointer_declarator' || idNode.type === 'reference_declarator')) {
+            idNode = getChildByField(idNode, 'declarator') || idNode.namedChild(0) || null;
+          }
+          if (idNode) {
+            const fnName = getNodeText(idNode, this.source);
+            if (fnName) {
+              const returnType = this.extractor.getReturnType?.(node, this.source);
+              this.createNode('method', fnName, node, {
+                docstring,
+                visibility,
+                isStatic,
+                returnType,
+              });
+              return;
+            }
+          }
+        }
+      }
+
       const fieldEntries: Array<{ name: string; posNode: SyntaxNode }> = [];
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);

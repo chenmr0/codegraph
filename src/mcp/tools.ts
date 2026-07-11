@@ -1315,6 +1315,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'cpp-decl-def') {
+      return {
+        label: `C++ declaration-definition pair (structural link, not a call)`,
+        compact: `decl-def pair${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 
@@ -2907,7 +2914,8 @@ export class ToolHandler {
     };
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
-    if (callees.length === 0 && callers.length === 0) return '';
+    const declDefSection = this.formatDeclDef(cg, node);
+    if (callees.length === 0 && callers.length === 0) return declDefSection;
     const lines: string[] = ['', '### Trail — codegraph_node any of these to follow it (no Read needed)'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
@@ -2915,6 +2923,67 @@ export class ToolHandler {
     if (callers.length > 0) {
       lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
     }
+    return (declDefSection ? declDefSection + '\n' : '') + lines.join('\n');
+  }
+
+  /**
+   * Format the declaration/definition link for a C++ node. When a method's
+   * .h declaration and .cpp definition are paired (cppDeclDefEdges
+   * synthesizer), this surfaces the other end as a pointer. On a dead-end
+   * declaration node (no callers/callees of its own), it also surfaces the
+   * definition's real call trail so the agent isn't misled into thinking
+   * the method is unused.
+   */
+  private formatDeclDef(cg: CodeGraph, node: Node): string {
+    const CAP = 6;
+    const out = cg.getOutgoingEdges(node.id).filter((e) => e.kind === 'defines');
+    const inc = cg.getIncomingEdges(node.id).filter((e) => e.kind === 'defines');
+    if (out.length === 0 && inc.length === 0) return '';
+
+    const ref = (id: string): string => {
+      const n = cg.getNode(id);
+      return n ? `\`${n.name}\` (${n.filePath}:${n.startLine})` : id;
+    };
+    const trailFmt = (e: { node: Node; edge: Edge }): string => {
+      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const synth = this.synthEdgeNote(e.edge);
+      return synth ? `${base} [${synth.compact}]` : base;
+    };
+
+    const lines: string[] = ['', '### Declaration / Definition'];
+
+    // Definition node → outgoing defines point at its declarations.
+    if (out.length > 0) {
+      const refs = out.slice(0, CAP).map((e) => ref(e.target)).join(', ');
+      const more = out.length > CAP ? `, +${out.length - CAP} more` : '';
+      const label = out.length === 1 ? '**Declaration:**' : '**Declarations:**';
+      lines.push(`${label} ${refs}${more}`);
+    }
+
+    // Declaration node → incoming defines come from its definition(s). Surface
+    // the first definition's real call trail to fix the dead-end trap.
+    if (inc.length > 0) {
+      const refs = inc.slice(0, CAP).map((e) => ref(e.source)).join(', ');
+      const more = inc.length > CAP ? `, +${inc.length - CAP} more` : '';
+      const label = inc.length === 1 ? '**Definition:**' : '**Definitions:**';
+      lines.push(`${label} ${refs}${more}`);
+
+      const firstInc = inc[0];
+      if (firstInc) {
+        const defId = firstInc.source;
+        const defCallees = cg.getCallees(defId);
+        const defCallers = cg.getCallers(defId);
+        if (defCallees.length > 0) {
+          const shown = defCallees.slice(0, CAP);
+          lines.push(`**Definition calls →** ${shown.map(trailFmt).join(', ')}${defCallees.length > CAP ? `, +${defCallees.length - CAP} more` : ''}`);
+        }
+        if (defCallers.length > 0) {
+          const shown = defCallers.slice(0, CAP);
+          lines.push(`**Definition called by ←** ${shown.map(trailFmt).join(', ')}${defCallers.length > CAP ? `, +${defCallers.length - CAP} more` : ''}`);
+        }
+      }
+    }
+
     return lines.join('\n');
   }
 

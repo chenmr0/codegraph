@@ -454,6 +454,92 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * C++ declaration-definition pairing. A class member function's prototype
+ * (in a .h header) and its out-of-line definition (in a .cpp file) are
+ * extracted as two separate nodes with NO edge between them — the header
+ * declaration is a graph dead-end (0 callers, 0 callees), so an agent that
+ * picks it in search results sees an empty Trail and mis-reads the method
+ * as unused.
+ *
+ * Bridge them with a `defines` edge: definition (with body, endLine > startLine)
+ * → declaration (prototype, single line). The edge is isolated from the call
+ * graph (getCallers/getCallees only follow calls/references/imports) so it
+ * cannot pollute caller/callee trails; codegraph_node renders it as a
+ * "Declaration:"/"Definition:" pointer and, on a dead-end declaration node,
+ * also surfaces the definition's real callers/callees.
+ *
+ * STRICT MODE: only pair when the receiver class is verifiable in the graph
+ * (a cpp class/struct node with the matching name exists). Cases where the
+ * class node wasn't extracted (macro-heavy class bodies, large classes that
+ * trip the parser) are skipped — zero false positives preferred over
+ * coverage. Free functions (no `::` in qualifiedName) are NOT paired here:
+ * a declaration-only function node can't be distinguished from a
+ * downgraded class-member declaration when the class wasn't indexed, so
+ * pairing free functions by bare name would risk mis-pairing. Adding free
+ * function support needs a separate verifiable signal.
+ *
+ * Overloads share a qualifiedName (signature is not encoded); each
+ * definition links to every same-qualifiedName declaration. Over-pairs but
+ * never mis-pairs — every edge points at a real declaration of that name.
+ */
+function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // Prefetch cpp class/struct names for receiver verification.
+  const classNames = new Set<string>();
+  for (const cls of queries.iterateNodesByKind('class')) {
+    if (cls.language === 'cpp') classNames.add(cls.name);
+  }
+  for (const cls of queries.iterateNodesByKind('struct')) {
+    if (cls.language === 'cpp') classNames.add(cls.name);
+  }
+
+  // Group cpp method nodes by qualifiedName (must contain '::').
+  const methodsByQn = new Map<string, Node[]>();
+  for (const m of queries.iterateNodesByKind('method')) {
+    if (m.language !== 'cpp' || !m.qualifiedName || !m.qualifiedName.includes('::')) continue;
+    const arr = methodsByQn.get(m.qualifiedName);
+    if (arr) arr.push(m);
+    else methodsByQn.set(m.qualifiedName, [m]);
+  }
+
+  for (const [qn, nodes] of methodsByQn) {
+    // Verify receiver class is indexed (strict mode).
+    const sep = qn.lastIndexOf('::');
+    const receiver = qn.slice(0, sep);
+    if (!classNames.has(receiver)) continue;
+
+    // Definition: spans multiple lines (has body). Declaration: single line.
+    const defs = nodes.filter((n) => n.endLine > n.startLine);
+    const decls = nodes.filter((n) => n.endLine === n.startLine);
+    if (defs.length === 0 || decls.length === 0) continue;
+
+    for (const def of defs) {
+      for (const decl of decls) {
+        if (def.filePath === decl.filePath) continue; // cross-file only
+        const key = `${def.id}>${decl.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: def.id,
+          target: decl.id,
+          kind: 'defines',
+          line: def.startLine,
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'cpp-decl-def',
+            registeredAt: `${decl.filePath}:${decl.startLine}`,
+          },
+        });
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Phase 5.5: interface / abstract dispatch (Java, Kotlin). A call through an
  * injected interface (`@Autowired FooService svc; svc.list()`) or an abstract
  * base dispatches at runtime to the implementing class's override — a vtable
@@ -1678,6 +1764,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const pascalEdges = pascalFormEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
+  const cppDeclDef = cppDeclDefEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
   const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
@@ -1701,6 +1788,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...pascalEdges,
     ...flutterEdges,
     ...cppEdges,
+    ...cppDeclDef,
     ...ifaceEdges,
     ...kotlinExpectActual,
     ...goGrpcEdges,

@@ -58,7 +58,8 @@ export type EdgeKind =
   | 'returns'         // Function returns type
   | 'instantiates'    // Creates instance of class
   | 'overrides'       // Method overrides parent method
-  | 'decorates';      // Decorator applied to symbol
+  | 'decorates'       // Decorator applied to symbol
+  | 'defines';        // C++ definition (with body) defines its declaration (prototype)
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a
