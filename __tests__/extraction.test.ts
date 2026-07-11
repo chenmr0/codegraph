@@ -3054,6 +3054,54 @@ void process() {
     });
   });
 
+  describe('C/C++ X-macro struct/enum rescue (field_declaration leak)', () => {
+    // Fixture: a 502-line slice of libuv's uv.h (lines 940-1441) that triggers
+    // the X-macro leak — `struct uv_timer_s { UV_HANDLE_FIELDS UV_TIMER_PRIVATE_FIELDS };`
+    // leaves tree-sitter-c unable to close the field_declaration_list, so ERROR
+    // recovery folds the following ~470 lines of top-level declarations into one
+    // giant field_declaration wrapping a struct_specifier. The swallowed content
+    // includes 14 plain struct definitions, 1 plain enum (uv_process_flags), and
+    // many function prototypes. Without the rescue, only the functions surface
+    // (via extractNestedStructFunctions); the structs/enums vanish entirely.
+    const fixturePath = path.join(__dirname, 'fixtures', 'uv-xmacro.c');
+
+    it('rescues swallowed struct definitions from the X-macro leak', () => {
+      const code = fs.readFileSync(fixturePath, 'utf8');
+      const result = extractFromSource('uv-xmacro.c', code);
+      const structs = result.nodes.filter(n => n.kind === 'struct').map(n => n.name);
+      // Sample of the 14 swallowed structs — each was completely absent before.
+      for (const name of [
+        'uv_getaddrinfo_s', 'uv_getnameinfo_s', 'uv_process_s', 'uv_work_s',
+        'uv_cpu_info_s', 'uv_passwd_s', 'uv_group_s', 'uv_metrics_s',
+      ]) {
+        expect(structs).toContain(name);
+      }
+    });
+
+    it('rescues the swallowed uv_process_flags enum and its members', () => {
+      const code = fs.readFileSync(fixturePath, 'utf8');
+      const result = extractFromSource('uv-xmacro.c', code);
+      expect(result.nodes.find(n => n.kind === 'enum' && n.name === 'uv_process_flags'))
+        .toBeDefined();
+      // The rescued enum's members are extracted via extractEnum's body walk.
+      expect(result.nodes.find(n => n.kind === 'enum_member' && n.name === 'UV_PROCESS_SETUID'))
+        .toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'enum_member' && n.name === 'UV_PROCESS_DETACHED'))
+        .toBeDefined();
+    });
+
+    it('still rescues swallowed function prototypes (no regression)', () => {
+      const code = fs.readFileSync(fixturePath, 'utf8');
+      const result = extractFromSource('uv-xmacro.c', code);
+      // Functions are rescued by the pre-existing extractNestedStructFunctions;
+      // verify they still surface alongside the newly rescued structs/enums.
+      expect(result.nodes.find(n => n.kind === 'function' && n.name === 'uv_timer_init'))
+        .toBeDefined();
+      expect(result.nodes.find(n => n.kind === 'function' && n.name === 'uv_async_send'))
+        .toBeDefined();
+    });
+  });
+
   describe('C/C++ global variable reference tracking', () => {
     it('emits references edge for global variable read in same file', () => {
       const result = extractFromSource('foo.c', 'int g_counter = 0;\nint get(void) { return g_counter; }');

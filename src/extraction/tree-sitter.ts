@@ -520,22 +520,34 @@ export class TreeSitterExtractor {
     // declaration. Route these through extractVariable so the existing C/C++ branch
     // — which already detects function_declarator inside declarations — creates
     // proper function nodes for them.
+    //
+    // The leak can also swallow subsequent struct/enum definitions inside the
+    // wrapper struct_specifier's field_declaration_list (X-macro pattern
+    // `struct X { MACRO_FIELDS };` — tree-sitter-c has no preprocessor, so the
+    // macro identifier is misread as the field type and field_declaration_list
+    // never closes; ERROR recovery then folds the following top-level declarations
+    // into one giant field_declaration). extractNestedStructEnums rescues those
+    // still-intact struct_specifier/enum_specifier bodies.
     else if (
       (this.language === 'c' || this.language === 'cpp') &&
       nodeType === 'field_declaration' &&
       !this.isInsideClassLikeNode() &&
       !this.isInsideFunctionNode() &&
-      node.descendantsOfType('function_declarator').length > 0
+      (node.descendantsOfType('function_declarator').length > 0 ||
+       this.hasSwallowedTypeDefinitions(node))
     ) {
-      this.extractVariable(node);
-      // When tree-sitter-c macro body leakage is deep enough, the misparsed
-      // field_declaration wraps a struct_specifier that swallows subsequent
-      // function prototypes as its own field_declaration_list children
-      // (e.g. uv.h lines 738-837: struct uv_udp_send_s swallows 23
-      //  uv_udp_* declarations; lines 972-1441: swallows 50 more).
-      // Walk into struct_specifier → field_declaration_list and extract
-      // every child field_declaration that contains a function_declarator.
-      this.extractNestedStructFunctions(node);
+      if (node.descendantsOfType('function_declarator').length > 0) {
+        this.extractVariable(node);
+        // When tree-sitter-c macro body leakage is deep enough, the misparsed
+        // field_declaration wraps a struct_specifier that swallows subsequent
+        // function prototypes as its own field_declaration_list children
+        // (e.g. uv.h lines 738-837: struct uv_udp_send_s swallows 23
+        //  uv_udp_* declarations; lines 972-1441: swallows 50 more).
+        // Walk into struct_specifier → field_declaration_list and extract
+        // every child field_declaration that contains a function_declarator.
+        this.extractNestedStructFunctions(node);
+      }
+      this.extractNestedStructEnums(node);
       skipChildren = true;
     }
     // Check for variable declarations (const, let, var, etc.)
@@ -1789,6 +1801,167 @@ export class TreeSitterExtractor {
     for (const spec of structSpecs) {
       walkStruct(spec);
     }
+  }
+
+  /**
+   * C/C++: detect whether a misparsed top-level field_declaration wraps a
+   * struct_specifier whose field_declaration_list body contains any
+   * struct_specifier/enum_specifier descendants that still have their own body
+   * (i.e. real definitions swallowed by the X-macro leak). Used to widen the
+   * field_declaration rescue guard beyond the function_declarator-only case.
+   */
+  private hasSwallowedTypeDefinitions(node: SyntaxNode): boolean {
+    if (!this.extractor) return false;
+    const bodyField = this.extractor.bodyField;
+    for (const wrapper of node.namedChildren.filter(c => c.type === 'struct_specifier')) {
+      const body = getChildByField(wrapper, bodyField);
+      if (!body) continue;
+      if (body.descendantsOfType('struct_specifier').some(s => getChildByField(s, bodyField)) ||
+          body.descendantsOfType('enum_specifier').some(e => getChildByField(e, bodyField))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * C/C++: extract nested struct/enum definitions that were swallowed by a
+   * misparsed top-level field_declaration (X-macro leak:
+   * `struct X { MACRO_FIELDS };` — tree-sitter-c has no preprocessor, so the
+   * macro identifier is misread as the field type and field_declaration_list
+   * never closes; ERROR recovery folds following top-level declarations into
+   * the wrapper struct_specifier's body). Pairs with extractNestedStructFunctions,
+   * which rescues function_declarator children; this rescues the struct_specifier
+   * / enum_specifier children that still have a valid body. typedef enum/struct
+   * is fully ERROR-ized by tree-sitter-c (no valid type_definition node), so it
+   * is out of scope here — recovering it needs a preprocessor.
+   *
+   * Structs are rescued via rescueSwallowedStruct (not extractStruct) to avoid
+   * two side effects of extractStruct's unconditional body visit: swallowed
+   * function prototypes (field_declaration + function_declarator) would become
+   * duplicate `method` nodes via extractField's function_declarator branch —
+   * they're already rescued as `function` nodes by extractNestedStructFunctions;
+   * and swallowed type definitions (field_declaration whose type is a
+   * struct/enum specifier with body) would become garbage `field` nodes.
+   * Enums are safe to route through extractEnum — their body (enumerator_list)
+   * holds only enumerator children, no function_declarator or type-specifier
+   * noise.
+   */
+  private extractNestedStructEnums(node: SyntaxNode): void {
+    if (!this.extractor || (this.language !== 'c' && this.language !== 'cpp')) return;
+    const bodyField = this.extractor.bodyField;
+    // The wrapper struct_specifier is the misparsed field_declaration's directly
+    // named child (e.g. uv_timer_s). Its field_declaration_list body holds the
+    // swallowed content. descendantsOfType reaches any nesting depth and naturally
+    // excludes the wrapper itself (a descendant is not its own descendant).
+    const wrapperSpecs = node.namedChildren.filter(c => c.type === 'struct_specifier');
+    for (const wrapper of wrapperSpecs) {
+      const body = getChildByField(wrapper, bodyField);
+      if (!body) continue;
+      const structs = body.descendantsOfType('struct_specifier')
+        .filter(s => getChildByField(s, bodyField));
+      const enums = body.descendantsOfType('enum_specifier')
+        .filter(e => getChildByField(e, bodyField));
+      for (const s of structs) this.rescueSwallowedStruct(s);
+      for (const e of enums) this.extractEnum(e);
+    }
+  }
+
+  /**
+   * C/C++: rescue a struct definition swallowed by the X-macro leak. Like
+   * extractStruct, this creates the struct node and visits body children to
+   * extract real fields — but it skips categories of swallowed content that
+   * extractStruct would misextract:
+   *
+   *  1. field_declarations containing a function_declarator — these are
+   *     swallowed function prototypes, already rescued as `function` nodes by
+   *     extractNestedStructFunctions. extractField would create duplicate
+   *     `method` nodes for them.
+   *  2. field_declarations whose `type` is a struct/enum specifier with a body
+   *     — these are swallowed type definitions (typedef remnants or nested
+   *     structs/enums). extractField would create garbage `field` nodes from
+   *     their declarator. The struct/enum specifiers themselves are handled by
+   *     the outer descendantsOfType loop in extractNestedStructEnums.
+   *  3. field_declarations whose `type` is a `type_identifier` with text
+   *     `typedef` — tree-sitter-c's ERROR recovery parses the `typedef` keyword
+   *     itself as a type_identifier, producing a field_declaration whose
+   *     declarators are the enumerators/fields of the flattened typedef
+   *     enum/struct. extractField would create garbage field nodes named after
+   *     those enumerators (e.g. UV_IGNORE, UV_DIRENT_UNKNOWN).
+   *  4. field_declarations whose `type` is a `macro_type_specifier` — a macro
+   *     function invocation misparsed as a field type (e.g.
+   *     `uv_process_get_pid(const uv_process_t*)`), producing a garbage field
+   *     named after the macro's return typedef (e.g. uv_pid_t).
+   *
+   * Real fields (field_declarations with field_identifier declarators, pointer/
+   * array wrappers, primitive types, etc.) are visited normally via visitNode,
+   * so they get extracted exactly as extractStruct would. Individual fields of
+   * flattened `typedef struct { ... }` content (ru_stime, ru_maxrss, etc.)
+   * still leak through — they have normal primitive/type_identifier types and
+   * no AST marker distinguishes them from real fields. Rescuing them requires
+   * a preprocessor, not an AST filter. A field_declaration whose type is an
+   * ALL_UPPERCASE macro placeholder (UV_REQ_FIELDS, UV_HANDLE_FIELDS) can also
+   * be a real field whose type was mangled into the preceding macro name —
+   * filtering those would lose real fields, so they are kept.
+   */
+  private rescueSwallowedStruct(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    const body = getChildByField(node, this.extractor.bodyField);
+    if (!body) return;
+
+    const name = extractName(node, this.source, this.extractor);
+    const docstring = getPrecedingDocstring(node, this.source);
+    const visibility = this.extractor.getVisibility?.(node);
+    const isExported = this.extractor.isExported?.(node, this.source);
+
+    const structNode = this.createNode('struct', name, node, {
+      docstring,
+      visibility,
+      isExported,
+    });
+    if (!structNode) return; // already created by a prior rescue (dedup)
+
+    this.extractInheritance(node, structNode.id);
+
+    this.nodeStack.push(structNode.id);
+    const bodyField = this.extractor.bodyField;
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (!child) continue;
+      // Skip swallowed function prototypes — already rescued as function nodes
+      // by extractNestedStructFunctions; visiting them here would create
+      // duplicate method nodes via extractField's function_declarator branch.
+      if (
+        child.type === 'field_declaration' &&
+        child.descendantsOfType('function_declarator').length > 0
+      ) continue;
+      // Skip swallowed type definitions (field_declaration whose type is a
+      // struct/enum specifier with a body) — the specifiers are handled by the
+      // outer descendantsOfType loop; visiting the wrapper field_declaration
+      // would create garbage field nodes from the typedef declarator name.
+      if (child.type === 'field_declaration') {
+        const typeChild = getChildByField(child, 'type');
+        if (
+          typeChild &&
+          (typeChild.type === 'struct_specifier' ||
+            typeChild.type === 'enum_specifier') &&
+          getChildByField(typeChild, bodyField)
+        ) continue;
+        // Skip typedef-keyword artifacts: tree-sitter-c's ERROR recovery parses
+        // the `typedef` keyword as a type_identifier, flattening a typedef
+        // enum/struct's enumerators/fields into field_identifier declarators.
+        // Without this, UV_IGNORE / UV_DIRENT_UNKNOWN / uv_stdio_flags etc.
+        // become garbage field nodes named after the enumerators.
+        if (typeChild && typeChild.type === 'type_identifier' && typeChild.text === 'typedef') continue;
+        // Skip macro_type_specifier artifacts: a macro function invocation
+        // misparsed as a field type (e.g. uv_process_get_pid(...)), producing a
+        // garbage field named after the macro's return typedef (e.g. uv_pid_t).
+        if (typeChild && typeChild.type === 'macro_type_specifier') continue;
+      }
+      this.visitNode(child);
+    }
+    this.nodeStack.pop();
   }
 
   /**
