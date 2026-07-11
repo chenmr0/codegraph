@@ -282,7 +282,7 @@ export function detectLanguage(filePath: string, source?: string): Language {
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=|\w+::)|\bconstexpr\b|\benum\s+(?:class|struct)\s+\w+|\b(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<|\bstd::/.test(sample);
 }
 
 /**

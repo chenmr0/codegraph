@@ -101,6 +101,73 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  describe('.h file C/C++ disambiguation', () => {
+    it('detects C++ using-declaration (using std::isinf;)', () => {
+      const src = '#ifndef OB_DEFINE_H\n#define OB_DEFINE_H\n#include <cstdint>\nusing std::isinf;\nnamespace oceanbase { namespace share { class ObLSID {}; }\n#endif\n';
+      expect(detectLanguage('ob_define.h', src)).toBe('cpp');
+    });
+
+    it('detects C++ namespace', () => {
+      const src = 'namespace oceanbase {\nnamespace share {\nvoid foo();\n}\n}\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects C++ class definition', () => {
+      const src = 'class Foo {\npublic:\n  int bar();\n};\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects constexpr', () => {
+      const src = '#ifndef FOO_H\nconstexpr int kSize = 64;\n#endif\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects enum class', () => {
+      const src = 'enum class Color { Red, Green, Blue };\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects static_cast', () => {
+      const src = 'template <typename T>\nT convert(int x) { return static_cast<T>(x); }\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects std:: usage', () => {
+      const src = '#include <vector>\nstd::vector<int> v;\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects template declaration', () => {
+      const src = 'template <typename T>\nclass Vec { T data[8]; };\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('detects using type alias (existing pattern)', () => {
+      const src = 'using IntVec = std::vector<int>;\n';
+      expect(detectLanguage('foo.h', src)).toBe('cpp');
+    });
+
+    it('preserves C for typedef struct + prototypes', () => {
+      const src = '#ifndef FOO_H\ntypedef struct foo_s {\n  int x;\n} foo_t;\nfoo_t *foo_new(void);\nvoid foo_free(foo_t *p);\n#endif\n';
+      expect(detectLanguage('foo.h', src)).toBe('c');
+    });
+
+    it('preserves C for #define + static __inline__', () => {
+      const src = '#ifndef EASY_ATOMIC_H\n#define EASY_ATOMIC_H\n#define easy_atomic_t int\ntypedef easy_atomic_t easy_atomic64_t;\nstatic __inline__ void easy_atomic_set(easy_atomic_t *v, int x) { *v = x; }\n#endif\n';
+      expect(detectLanguage('easy_atomic.h', src)).toBe('c');
+    });
+
+    it('preserves C for extern "C" guard + prototypes', () => {
+      const src = '#ifdef __cplusplus\nextern "C" {\n#endif\nvoid foo_init(void);\nint bar_count(void);\n#ifdef __cplusplus\n}\n#endif\n';
+      expect(detectLanguage('foo.h', src)).toBe('c');
+    });
+
+    it('preserves C for pure C with // comments', () => {
+      const src = '// pure C header\n#ifndef FOO_H\n#define FOO_H\nint foo(void);\n// returns bar\nint bar(void);\n#endif\n';
+      expect(detectLanguage('foo.h', src)).toBe('c');
+    });
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
