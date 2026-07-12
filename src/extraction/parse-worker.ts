@@ -55,15 +55,23 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[] }) => {
+// Project-wide macro names sent once by the orchestrator (avoids serializing
+// 10k+ names with every parse message). Persists for the worker's lifetime;
+// on recycle/crash, ensureWorker() re-sends it.
+let globalMacroNames: Set<string> | undefined = undefined;
+
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[] }) => {
   if (msg.type === 'load-grammars') {
     await loadGrammarsForLanguages(msg.languages!);
     parentPort!.postMessage({ type: 'grammars-loaded' });
+  } else if (msg.type === 'set-global-macros') {
+    globalMacroNames = new Set(msg.macroNames);
+    parentPort!.postMessage({ type: 'global-macros-set' });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
     try {
       const language = detectLanguage(filePath!, content);
-      const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames);
+      const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames, globalMacroNames);
 
       // Periodic parser reset to reclaim WASM heap memory
       const count = (parseCounts.get(language) ?? 0) + 1;

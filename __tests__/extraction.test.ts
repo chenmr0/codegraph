@@ -2821,6 +2821,50 @@ int INNER_LOOP(int n) {
       const macroFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'LOG_WARN');
       expect(macroFunc).toBeUndefined();
     });
+
+    it('filters cross-file macro invocations via globalMacroNames', () => {
+      // Macro FOREACH_X is defined in another file (a header) and #included
+      // here. Tree-sitter has no preprocessor, so the file's AST has no
+      // #define for FOREACH_X — the globalMacroNames parameter carries it.
+      const code = `
+void foo() {
+  FOREACH_X(it, items, true) {
+    doWork(*it);
+  }
+}
+`;
+      const globalMacroNames = new Set(['FOREACH_X']);
+      const result = extractFromSource('test.cpp', code, undefined, undefined, globalMacroNames);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'FOREACH_X');
+      expect(func).toBeUndefined();
+      // The real function should still be extracted
+      const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'foo');
+      expect(realFunc).toBeDefined();
+    });
+
+    it('filters cross-file macro misparsed as function declaration', () => {
+      // When tree-sitter parses SWITCH(args) CASE(args) {body} as a
+      // declaration with a function_declarator (not a function_definition),
+      // the isMisparsedFunction check at the declaration path must still
+      // filter it using globalMacroNames.
+      const code = `
+void process() {
+  SWITCH(message->field)
+  CASE(RESOURCE_NAME)
+    if (cond) {
+      doWork();
+    }
+}
+`;
+      const globalMacroNames = new Set(['SWITCH', 'CASE']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      const switchFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'SWITCH');
+      expect(switchFunc).toBeUndefined();
+      const caseFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'CASE');
+      expect(caseFunc).toBeUndefined();
+      const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
+      expect(realFunc).toBeDefined();
+    });
   });
 
   describe('C/C++ macro extraction', () => {

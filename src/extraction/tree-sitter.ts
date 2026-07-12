@@ -281,11 +281,18 @@ export class TreeSitterExtractor {
   // (NAME(params) { body }) matches the function_definition grammar rule.
   private fileMacroNames: Set<string> = new Set();
 
-  constructor(filePath: string, source: string, language?: Language) {
+  // Project-wide `#define` names collected by the orchestrator's pre-scan
+  // (regex over all C/C++/ObjC files). Merged into `fileMacroNames` during
+  // collectMacroNames() so `isMisparsedFunction` can suppress spurious
+  // function nodes caused by macros defined in OTHER files (via #include).
+  private globalMacroNames: Set<string> | null = null;
+
+  constructor(filePath: string, source: string, language?: Language, globalMacroNames?: Set<string>) {
     this.filePath = filePath;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
+    this.globalMacroNames = globalMacroNames ?? null;
   }
 
   /**
@@ -878,6 +885,17 @@ export class TreeSitterExtractor {
     };
 
     walk(this.tree.rootNode);
+
+    // Merge project-wide macro names collected by the orchestrator's
+    // pre-scan. This catches macros defined in other files (via #include)
+    // that tree-sitter can't see in this file's AST — without it, a macro
+    // invocation MACRO(args){body} in file B, where the macro is defined
+    // in header A, would produce a spurious function node in file B.
+    if (this.globalMacroNames) {
+      for (const name of this.globalMacroNames) {
+        this.fileMacroNames.add(name);
+      }
+    }
   }
 
   /**
@@ -1782,7 +1800,7 @@ export class TreeSitterExtractor {
         }
         if (funcDecl) {
           const fnName = extractName(funcDecl);
-          if (fnName) {
+          if (fnName && !this.extractor!.isMisparsedFunction?.(fnName, innerFd, this.fileMacroNames)) {
             this.createNode('function', fnName, innerFd, {
               signature: this.source.substring(innerFd.startIndex, innerFd.endIndex),
             });
@@ -2383,7 +2401,8 @@ export class TreeSitterExtractor {
             const idNode = unwrapDeclarator(innerDecl);
             if (idNode && (idNode.type === 'identifier' || idNode.type === 'field_identifier')) {
               const fnName = getNodeText(idNode, this.source);
-              if (fnName && !C_CPP_KEYWORD_NAMES.has(fnName)) {
+              if (fnName && !C_CPP_KEYWORD_NAMES.has(fnName)
+                && !this.extractor.isMisparsedFunction?.(fnName, node, this.fileMacroNames)) {
                 this.createNode('function', fnName, node, {
                   docstring,
                   signature: this.source.substring(node.startIndex, node.endIndex),
@@ -5377,7 +5396,8 @@ export function extractFromSource(
   filePath: string,
   source: string,
   language?: Language,
-  frameworkNames?: string[]
+  frameworkNames?: string[],
+  globalMacroNames?: Set<string>
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -5419,7 +5439,7 @@ export function extractFromSource(
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
   } else {
-    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage);
+    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage, globalMacroNames);
     result = extractor.extract();
   }
 

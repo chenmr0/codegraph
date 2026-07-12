@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, EXTENSION_MAP } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -631,6 +631,13 @@ export class ExtractionOrchestrator {
    */
   private detectedFrameworkNames: string[] | null = null;
   /**
+   * Project-wide `#define` macro names collected by a regex pre-scan over
+   * all C/C++/ObjC files. Passed to extractFromSource so isMisparsedFunction
+   * can suppress spurious function nodes from macros defined in OTHER files
+   * (via #include). Cached on the orchestrator; reset each indexAll run.
+   */
+  private globalMacroNames: Set<string> | null = null;
+  /**
    * Accumulates source file paths of nodes whose incoming edges couldn't be
    * re-wired during a sync pass. Populated by storeExtractionResult, consumed
    * and cleared by sync().
@@ -712,6 +719,68 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Pre-scan all C/C++/ObjC files with a regex to collect project-wide
+   * `#define` macro names. This is ~100x faster than a full tree-sitter
+   * parse and catches macros inside `#if` blocks (the regex is
+   * context-blind, which is the conservative direction for filtering).
+   *
+   * The resulting set is passed to extractFromSource and merged into each
+   * file's fileMacroNames so isMisparsedFunction can suppress spurious
+   * function nodes from macros defined in OTHER files (via #include) —
+   * tree-sitter has no preprocessor, so a macro invocation
+   * `MACRO(args){body}` in file B, where MACRO is defined in header A,
+   * would otherwise produce a fake function node in B.
+   *
+   * Cached on the orchestrator for the lifetime of the run. Call with
+   * the scanned file list to avoid re-scanning the directory.
+   */
+  private async ensureGlobalMacroNames(files?: string[]): Promise<Set<string>> {
+    if (this.globalMacroNames !== null) return this.globalMacroNames;
+
+    const fileList = files ?? scanDirectory(this.rootDir);
+    const macroRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)/gm;
+    const names = new Set<string>();
+
+    // Filter to C/C++/ObjC files — only these have the preprocessor and
+    // the macro-misparse-as-function problem.
+    const cLikeFiles = fileList.filter((f) => {
+      const ext = f.slice(f.lastIndexOf('.')).toLowerCase();
+      const lang = EXTENSION_MAP[ext];
+      return lang === 'c' || lang === 'cpp' || lang === 'objc';
+    });
+
+    // Batch reads to overlap I/O. 50 files per batch balances throughput
+    // against memory for very large projects.
+    const BATCH = 50;
+    for (let i = 0; i < cLikeFiles.length; i += BATCH) {
+      const batch = cLikeFiles.slice(i, i + BATCH);
+      const contents = await Promise.all(
+        batch.map(async (relPath) => {
+          const full = validatePathWithinRoot(this.rootDir, relPath);
+          if (!full) return null;
+          try {
+            return await fsp.readFile(full, 'utf-8');
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const content of contents) {
+        if (!content) continue;
+        let m: RegExpExecArray | null;
+        macroRegex.lastIndex = 0;
+        while ((m = macroRegex.exec(content)) !== null) {
+          const name = m[1];
+          if (name) names.add(name);
+        }
+      }
+    }
+
+    this.globalMacroNames = names;
+    return names;
+  }
+
+  /**
    * Index all files in the project
    */
   async indexAll(
@@ -755,6 +824,13 @@ export class ExtractionOrchestrator {
     // between runs is picked up without restarting the process.
     this.detectedFrameworkNames = null;
     const frameworkNames = this.ensureDetectedFrameworks(files);
+
+    // Pre-scan C/C++/ObjC files for project-wide #define macro names so
+    // isMisparsedFunction can filter cross-file macro misparses (macro
+    // defined in header A, used in file B → tree-sitter has no
+    // preprocessor and would otherwise emit a fake function node in B).
+    this.globalMacroNames = null;
+    const globalMacroNames = await this.ensureGlobalMacroNames(files);
 
     if (signal?.aborted) {
       return {
@@ -872,6 +948,20 @@ export class ExtractionOrchestrator {
         parseWorker!.postMessage({ type: 'load-grammars', languages: neededLanguages });
       });
 
+      // Send project-wide macro names once to the new worker. On
+      // recycle/crash the worker is destroyed and ensureWorker() respawns,
+      // so this re-sends automatically. Sending once (rather than with
+      // every parse message) avoids serializing 10k+ names per file.
+      if (globalMacroNames.size > 0) {
+        await new Promise<void>((resolve, reject) => {
+          parseWorker!.once('message', (msg: { type: string }) => {
+            if (msg.type === 'global-macros-set') resolve();
+            else reject(new Error(`Unexpected message: ${msg.type}`));
+          });
+          parseWorker!.postMessage({ type: 'set-global-macros', macroNames: [...globalMacroNames] });
+        });
+      }
+
       return parseWorker;
     }
 
@@ -901,7 +991,8 @@ export class ExtractionOrchestrator {
           filePath,
           content,
           detectLanguage(filePath, content),
-          frameworkNames
+          frameworkNames,
+          globalMacroNames
         );
       }
 
@@ -1333,7 +1424,8 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.ensureDetectedFrameworks();
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const globalMacroNames = await this.ensureGlobalMacroNames();
+    const result = extractFromSource(relativePath, content, language, frameworkNames, globalMacroNames);
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {
