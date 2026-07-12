@@ -159,6 +159,16 @@ export interface Node {
   /** Whether symbol is abstract */
   isAbstract?: boolean;
 
+  /**
+   * Whether this is a declaration (prototype) rather than a definition.
+   * C/C++ function prototypes extracted from headers (e.g. `int foo();` with
+   * no body) are marked true; the corresponding `function_definition` nodes
+   * with a body are false/undefined. Lets cDeclDefEdges pair prototypes with
+   * definitions without relying on the buggy endLine>startLine heuristic
+   * (which misclassifies multi-line prototypes as definitions).
+   */
+  isDeclaration?: boolean;
+
   /** Decorators/annotations applied */
   decorators?: string[];
 

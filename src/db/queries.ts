@@ -71,6 +71,7 @@ interface NodeRow {
   is_async: number;
   is_static: number;
   is_abstract: number;
+  is_declaration: number;
   decorators: string | null;
   type_parameters: string | null;
   return_type: string | null;
@@ -133,6 +134,7 @@ function rowToNode(row: NodeRow): Node {
     isAsync: row.is_async === 1,
     isStatic: row.is_static === 1,
     isAbstract: row.is_abstract === 1,
+    isDeclaration: row.is_declaration === 1,
     decorators: row.decorators ? safeJsonParse(row.decorators, undefined) : undefined,
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
     returnType: row.return_type ?? undefined,
@@ -251,13 +253,13 @@ export class QueryBuilder {
           id, kind, name, qualified_name, file_path, language,
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
-          is_exported, is_async, is_static, is_abstract,
+          is_exported, is_async, is_static, is_abstract, is_declaration,
           decorators, type_parameters, return_type, updated_at
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
-          @isExported, @isAsync, @isStatic, @isAbstract,
+          @isExported, @isAsync, @isStatic, @isAbstract, @isDeclaration,
           @decorators, @typeParameters, @returnType, @updatedAt
         )
       `);
@@ -299,6 +301,7 @@ export class QueryBuilder {
       isAsync: node.isAsync ? 1 : 0,
       isStatic: node.isStatic ? 1 : 0,
       isAbstract: node.isAbstract ? 1 : 0,
+      isDeclaration: node.isDeclaration ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       returnType: node.returnType ?? null,
@@ -340,6 +343,7 @@ export class QueryBuilder {
           is_async = @isAsync,
           is_static = @isStatic,
           is_abstract = @isAbstract,
+          is_declaration = @isDeclaration,
           decorators = @decorators,
           type_parameters = @typeParameters,
           return_type = @returnType,
@@ -375,6 +379,7 @@ export class QueryBuilder {
       isAsync: node.isAsync ? 1 : 0,
       isStatic: node.isStatic ? 1 : 0,
       isAbstract: node.isAbstract ? 1 : 0,
+      isDeclaration: node.isDeclaration ? 1 : 0,
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       returnType: node.returnType ?? null,

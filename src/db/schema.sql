@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_async INTEGER DEFAULT 0,
     is_static INTEGER DEFAULT 0,
     is_abstract INTEGER DEFAULT 0,
+    is_declaration INTEGER DEFAULT 0, -- C/C++ function prototype (no body) vs definition
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
     return_type TEXT, -- normalized return/result type name (e.g. C++ method return, for receiver-type inference)

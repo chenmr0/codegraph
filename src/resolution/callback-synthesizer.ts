@@ -572,9 +572,16 @@ function cDeclDefEdges(queries: QueryBuilder): Edge[] {
   }
 
   for (const [, nodes] of funcsByName) {
-    // Definition: spans multiple lines (has body). Declaration: single line.
-    const defs = nodes.filter((n) => n.endLine > n.startLine);
-    const decls = nodes.filter((n) => n.endLine === n.startLine);
+    // Use the explicit isDeclaration flag set at extraction time: a
+    // function_declarator inside a `declaration` node is a prototype (no
+    // body) and is marked isDeclaration=true; a function_definition has a
+    // body and leaves isDeclaration unset. This replaces the buggy
+    // endLine>startLine heuristic, which misclassified multi-line prototypes
+    // — `void f(\n  int a,\n  int b);` — as definitions. Requires a re-index
+    // to populate the flag on existing databases (migration v6 only adds
+    // the column; it does not backfill).
+    const decls = nodes.filter((n) => n.isDeclaration === true);
+    const defs = nodes.filter((n) => n.isDeclaration !== true);
     if (defs.length === 0 || decls.length === 0) continue;
 
     for (const def of defs) {

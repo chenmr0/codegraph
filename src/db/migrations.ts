@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Migration definition
@@ -72,6 +72,16 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Add nodes.is_declaration — mark C/C++ function prototypes (no body) so cDeclDefEdges can pair them with definitions without the buggy endLine>startLine heuristic (which misclassified multi-line prototypes as definitions)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN is_declaration INTEGER DEFAULT 0;
       `);
     },
   },

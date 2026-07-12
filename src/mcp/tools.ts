@@ -1125,10 +1125,16 @@ export class ToolHandler {
     // Down-rank generated files within the FTS-returned set so a search
     // for "Send" surfaces the hand-written keeper before .pb.go stubs
     // that share the name. Stable: only reorders generated vs. not.
+    // Also rank definitions ahead of declarations (prototypes) so the
+    // agent sees the implementation before the header signature — a
+    // prototype gives no body to read and a dead-end callees trail.
     const ranked = [...results].sort((a, b) => {
       const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
       const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
-      return aGen - bGen;
+      if (aGen !== bGen) return aGen - bGen;
+      const aDecl = a.node.isDeclaration === true ? 1 : 0;
+      const bDecl = b.node.isDeclaration === true ? 1 : 0;
+      return aDecl - bDecl;
     });
 
     const formatted = this.formatSearchResults(ranked);
@@ -3468,8 +3474,11 @@ export class ToolHandler {
     for (const result of results) {
       const { node } = result;
       const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact format: one line per result with key info
-      lines.push(`### ${node.name} (${node.kind})`);
+      // Compact format: one line per result with key info.
+      // Tag prototypes so the agent knows to follow the `defines` edge to
+      // the definition for the real body/callees rather than dead-ending.
+      const declTag = node.isDeclaration === true ? ' [declaration]' : '';
+      lines.push(`### ${node.name} (${node.kind})${declTag}`);
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');

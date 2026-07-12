@@ -230,13 +230,20 @@ const INSTANTIATION_KINDS: ReadonlySet<string> = new Set([
  * boundary due to preprocessor directives inside the function. These
  * are top-level constructs that should not appear as statements inside
  * a valid C/C++ compound_statement.
+ *
+ * Note: `type_definition` is intentionally EXCLUDED. Unlike struct/enum/class
+ * specifiers (which tree-sitter wraps in a `declaration` node at statement
+ * scope), a `typedef` statement always produces a bare `type_definition`
+ * node as a direct child of the compound_statement. Local typedefs are
+ * legitimate C/C++ code, so including `type_definition` here causes body
+ * leak detection to over-fire on every local typedef, incorrectly treating
+ * it and all subsequent content as file-level globals.
  */
 const C_CPP_BODY_LEAK_TYPES: ReadonlySet<string> = new Set([
   'function_definition',
   'class_specifier',
   'struct_specifier',
   'enum_specifier',
-  'type_definition',
 ]);
 
 /** C/C++ keywords that tree-sitter occasionally misparses as variable
@@ -1803,6 +1810,7 @@ export class TreeSitterExtractor {
           if (fnName && !this.extractor!.isMisparsedFunction?.(fnName, innerFd, this.fileMacroNames)) {
             this.createNode('function', fnName, innerFd, {
               signature: this.source.substring(innerFd.startIndex, innerFd.endIndex),
+              isDeclaration: true,
             });
           }
         }
@@ -2407,6 +2415,7 @@ export class TreeSitterExtractor {
                   docstring,
                   signature: this.source.substring(node.startIndex, node.endIndex),
                   isExported: isExported || !isExtern,
+                  isDeclaration: true,
                 });
               }
             }

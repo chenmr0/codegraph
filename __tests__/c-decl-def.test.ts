@@ -30,8 +30,10 @@ describe('c-decl-def synthesizer', () => {
       .prepare(
         `SELECT s.name src_name, s.qualified_name src_qn, s.kind src_kind,
                 s.file_path src_path, s.start_line src_line, s.end_line src_endline,
+                s.is_declaration src_isdecl,
                 t.name tgt_name, t.qualified_name tgt_qn, t.kind tgt_kind,
                 t.file_path tgt_path, t.start_line tgt_line,
+                t.is_declaration tgt_isdecl,
                 e.provenance, json_extract(e.metadata,'$.synthesizedBy') synthBy,
                 json_extract(e.metadata,'$.registeredAt') registeredAt
          FROM edges e
@@ -315,5 +317,48 @@ int compute(int x) {
     expect(computeEdges.length).toBe(2);
     // Every edge goes from .c definition to a .h declaration.
     expect(computeEdges.every((e) => e.src_path.endsWith('.c') && e.tgt_path.endsWith('.h'))).toBe(true);
+  });
+
+  it('pairs a multi-line .h declaration with its .c definition (isDeclaration flag, not endLine heuristic)', async () => {
+    // Prototype spans 3 lines — the old endLine>startLine heuristic
+    // misclassified this as a definition and skipped pairing. With the
+    // isDeclaration flag set at extraction time, the prototype is correctly
+    // recognized as a declaration regardless of how many lines it spans.
+    fs.writeFileSync(
+      path.join(dir, 'multi.h'),
+      `#pragma once
+void draw(
+    int x,
+    int y);
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'multi.c'),
+      `#include "multi.h"
+void draw(int x, int y) {
+  plot(x, y);
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db);
+    cg.close?.();
+
+    const drawEdges = edges.filter((e) => e.src_name === 'draw' || e.tgt_name === 'draw');
+    expect(drawEdges.length).toBe(1);
+
+    const edge = drawEdges[0]!;
+    // Definition (.c, has body) → declaration (.h, multi-line prototype).
+    expect(edge.src_path.endsWith('multi.c')).toBe(true);
+    expect(edge.tgt_path.endsWith('multi.h')).toBe(true);
+    // The isDeclaration flag must be populated: 0 on the definition source,
+    // 1 on the prototype target. This is what distinguishes them without
+    // relying on the buggy line-count heuristic.
+    expect(edge.src_isdecl).toBe(0);
+    expect(edge.tgt_isdecl).toBe(1);
+    expect(edge.synthBy).toBe('c-decl-def');
   });
 });
