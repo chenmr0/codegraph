@@ -150,6 +150,31 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
     expect(all.note).toMatch(/Aggregated|symbols named "run"/);
   });
 
+  it('does not silently fall back to a prefix-named symbol for a bare name with no exact match', () => {
+    // `run_due` is a prefix of `run_due_tasks` but is not itself an exact name.
+    // Old behavior: FTS prefix search returned `run_due_tasks`, exactMatches was
+    // empty, and the code silently returned `run_due_tasks` as if it were the
+    // query. The fix surfaces this as a warned closest-match fallback.
+    const all = findAllSymbols(cg, 'run_due');
+    expect(all.nodes.length).toBe(1);
+    // The returned node is the closest fuzzy match, NOT a phantom `run_due`.
+    expect(all.nodes[0]!.name).toBe('run_due_tasks');
+    // The warning must make the non-exact nature visible to the caller.
+    expect(all.note).toMatch(/No exact match.*run_due/);
+    expect(all.note).toContain('run_due_tasks');
+  });
+
+  it('returns empty for a qualified lookup whose last part exists in the wrong module (no silent fuzzy fallback)', () => {
+    // `run_due_tasks` exists only in scheduler.rs, not in stage_apply. A
+    // qualified lookup `stage_apply::run_due_tasks` finds the name via FTS
+    // (re-search by tail `run_due_tasks`), but `matchesSymbol` rejects it
+    // because the file path has no `stage_apply` segment. Old behavior silently
+    // returned the scheduler.rs node; the fix returns empty (#173 alignment).
+    const all = findAllSymbols(cg, 'stage_apply::run_due_tasks');
+    expect(all.nodes.length).toBe(0);
+    expect(all.note).toBe('');
+  });
+
   it('still returns nothing for genuinely unknown qualified lookups', () => {
     const matches = findSymbolMatches(cg, 'stage_apply::nonexistent_fn');
     expect(matches.length).toBe(0);

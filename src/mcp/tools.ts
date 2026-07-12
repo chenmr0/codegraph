@@ -3414,27 +3414,71 @@ export class ToolHandler {
   /**
    * Find ALL symbols matching a name. Used by callers/callees/impact to aggregate
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
+   *
+   * Bare names go through the direct exact-name index (`getNodesByName`) — not FTS,
+   * which caps + ranks — so a heavily-overloaded name or a name that is a prefix of
+   * another symbol's name resolves correctly. When no exact match exists, the single
+   * top fuzzy result is returned with a `⚠️ No exact match` warning note so the caller
+   * knows the returned neighborhood belongs to a closest match, not the queried name.
+   * Qualified names use FTS + `matchesSymbol`; a qualified lookup with no exact match
+   * returns empty (no silent fuzzy fallback, per #173).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+    const isQualified = /[.\/]|::/.test(symbol);
+
+    // Bare name: enumerate EVERY exact-name definition via the direct index
+    // (not FTS, which caps + ranks). Mirrors `findSymbolMatches` — a heavily
+    // overloaded name (>50 FTS hits) or a name that is a prefix of another
+    // symbol's name must not silently fall back to the first FTS prefix hit.
+    if (!isQualified) {
+      const exact = cg.getNodesByName(symbol);
+      if (exact.length > 0) {
+        const ranked = [...exact].sort((a, b) =>
+          (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0)
+        );
+        if (ranked.length === 1) {
+          return { nodes: [ranked[0]!], note: '' };
+        }
+        const locations = ranked.map(r =>
+          `${r.kind} at ${r.filePath}:${r.startLine}`
+        );
+        const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
+        return { nodes: ranked, note };
+      }
+      // No exact match — fall back to the single top fuzzy result, with a
+      // warning so callers/callees/impact do not silently return the wrong
+      // symbol's neighborhood when the queried name is a prefix of a real one.
+      const fuzzy = cg.searchNodes(symbol, { limit: 10 });
+      if (fuzzy.length === 0) return { nodes: [], note: '' };
+      const node = fuzzy[0]!.node;
+      const note = `\n\n> ⚠️ No exact match for "${symbol}". Showing closest match: ${node.name}`;
+      return { nodes: [node], note };
+    }
+
+    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
     let results = cg.searchNodes(symbol, { limit: 50 });
 
-    // Mirror the fallback in `findSymbol` for qualified queries — FTS
-    // strips colons, so a module-qualified lookup needs a second pass
-    // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
+    // FTS strips colons, so `stage_apply::run` searches the literal
+    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
+    // let `matchesSymbol` filter by qualifier.
+    if (results.length === 0) {
       const tail = lastQualifierPart(symbol);
       if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
     }
 
-    if (results.length === 0) {
-      return { nodes: [], note: '' };
-    }
+    if (results.length === 0) return { nodes: [], note: '' };
 
     const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
 
-    if (exactMatches.length <= 1) {
-      const node = exactMatches[0]?.node ?? results[0]!.node;
-      return { nodes: [node], note: '' };
+    if (exactMatches.length === 0) {
+      // No exact match — a qualified lookup must not fall back to a fuzzy file
+      // hit (#173); return empty so the caller sees "not found" rather than
+      // the wrong symbol's callers/callees/impact.
+      return { nodes: [], note: '' };
+    }
+
+    if (exactMatches.length === 1) {
+      return { nodes: [exactMatches[0]!.node], note: '' };
     }
 
     // Same generated-file down-rank as findSymbol — keeps callers/callees
