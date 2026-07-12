@@ -21,6 +21,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import { NODE_KINDS } from '../types';
 import { isNaturalLanguageQuery, isTestFile, normalizeNameToken } from '../search/query-utils';
 import {
   existsSync,
@@ -376,6 +377,16 @@ const projectPathProperty: PropertySchema = {
 };
 
 /**
+ * NodeKinds exposed as the `kind` filter enum in codegraph_search.
+ * Derived from NODE_KINDS so new kinds appear automatically — a hardcoded
+ * list is exactly how macro/enum/enum_member were silently omitted before.
+ * Excluded: file/parameter/import/export (no user-facing search value).
+ */
+const SEARCHABLE_KINDS = NODE_KINDS.filter(
+  k => k !== 'file' && k !== 'parameter' && k !== 'import' && k !== 'export'
+);
+
+/**
  * All CodeGraph MCP tools
  *
  * Designed for minimal context usage - use codegraph_explore as the primary tool
@@ -405,7 +416,7 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
+          enum: SEARCHABLE_KINDS,
         },
         limit: {
           type: 'number',
