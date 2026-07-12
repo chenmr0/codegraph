@@ -2867,6 +2867,192 @@ void process() {
     });
   });
 
+  describe('C/C++ statement-level macro preParse (SWITCH/CASE/DEFAULT/END)', () => {
+    // open5gs defines statement-level macros SWITCH/CASE/DEFAULT/END in
+    // lib/core/ogs-macros.h that expand to brace-balanced code WITHOUT a
+    // trailing semicolon. Tree-sitter's C/C++ grammars lack a preprocessor,
+    // so a bare `SWITCH(x)` triggers error recovery and eventually closes the
+    // enclosing compound_statement early, dropping every subsequent call
+    // into the translation_unit. preParse rewrites these invocations to
+    // `0;` (length-preserving) before parsing so the body stays open.
+    it('keeps all calls inside a SWITCH/CASE/DEFAULT/END body attributed to the enclosing function', () => {
+      const code = `
+int handle(oid_t id) {
+  int rv = 0;
+  SWITCH(id)
+  CASE(RESOURCE_A)
+    parse_a();
+    rv = 1;
+    break;
+  CASE(RESOURCE_B)
+    parse_b();
+    add_client();
+    rv = 2;
+    break;
+  DEFAULT
+    ogs_error("unknown");
+    rv = -1;
+    break;
+  END
+  return rv;
+}
+`;
+      const globalMacroNames = new Set(['SWITCH', 'CASE', 'DEFAULT', 'END', 'RESOURCE_A', 'RESOURCE_B']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      expect(fn).toBeDefined();
+      // All four case-body calls must appear as callees of handle().
+      const callees = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fn!.id && r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callees).toContain('parse_a');
+      expect(callees).toContain('parse_b');
+      expect(callees).toContain('add_client');
+      expect(callees).toContain('ogs_error');
+    });
+
+    it('does not replace macro calls that have a trailing semicolon', () => {
+      // SWITCH(x); has a `;` → tree-sitter already parses it as a normal
+      // call_expression; preParse must leave it untouched.
+      const code = `
+int f() {
+  SWITCH(x);
+  return 0;
+}
+`;
+      const globalMacroNames = new Set(['SWITCH']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'f');
+      expect(fn).toBeDefined();
+      // SWITCH must appear as a callee (it was not blanked to `0;`).
+      const callees = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fn!.id && r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callees).toContain('SWITCH');
+    });
+
+    it('does not replace MACRO(params) { body } (isMisparsedFunction pattern)', () => {
+      // When a macro invocation is followed by `{`, the existing
+      // isMisparsedFunction mechanism handles it; preParse must NOT blank
+      // it (doing so would break the `{ body }` association).
+      const code = `
+void g() {
+  FOREACH_X(items)
+  {
+    process_item();
+  }
+}
+`;
+      const globalMacroNames = new Set(['FOREACH_X']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      // FOREACH_X must still be filtered as a misparsed function, and the
+      // real function g must survive with its body call attributed.
+      const forEachFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'FOREACH_X');
+      expect(forEachFunc).toBeUndefined();
+      const g = result.nodes.find((n) => n.kind === 'function' && n.name === 'g');
+      expect(g).toBeDefined();
+      const callees = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === g!.id && r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callees).toContain('process_item');
+    });
+
+    it('does not touch macro constants used as call arguments (paren depth > 0)', () => {
+      // RESOURCE_A appears inside CASE(...) at paren depth 1 — preParse
+      // must not blank it. (It's not in the macro set's "statement-like"
+      // position so even if it were in macroNames it should be left alone.)
+      const code = `
+int h() {
+  CASE(RESOURCE_A)
+    do_work();
+    break;
+  END
+  return 0;
+}
+`;
+      const globalMacroNames = new Set(['CASE', 'END', 'RESOURCE_A']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'h');
+      expect(fn).toBeDefined();
+      const callees = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fn!.id && r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callees).toContain('do_work');
+    });
+
+    it('leaves string literals, comments, and preprocessor directives untouched', () => {
+      // The text "SWITCH(x)" inside a string, comment, and #define must
+      // NOT be blanked. preParse only rewrites statement-level macro
+      // invocations at paren depth 0 outside strings/comments/directives.
+      const code = `
+#define MSG "SWITCH(x) is a macro"
+/* CASE(foo) in a comment */
+void k() {
+  const char *s = "END is here";
+  SWITCH(x)
+  CASE(y)
+    real_call();
+    break;
+  END
+}
+`;
+      const globalMacroNames = new Set(['SWITCH', 'CASE', 'END']);
+      const result = extractFromSource('test.c', code, undefined, undefined, globalMacroNames);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'k');
+      expect(fn).toBeDefined();
+      const callees = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fn!.id && r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(callees).toContain('real_call');
+      // The macro definition must still be extracted from the #define line
+      // (proves the preprocessor directive was copied verbatim, not blanked).
+      const macro = result.nodes.find((n) => n.kind === 'macro' && n.name === 'MSG');
+      expect(macro).toBeDefined();
+    });
+  });
+
+  describe('C function declaration isDeclaration flag', () => {
+    it('marks a header prototype as isDeclaration=true', () => {
+      // `int add(int a, int b);` is a function_declarator inside a
+      // declaration (no body) — must be flagged isDeclaration=true so
+      // cDeclDefEdges pairs it with the .c definition without relying
+      // on the buggy endLine>startLine heuristic.
+      const result = extractFromSource('foo.h', 'int add(int a, int b);\n');
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'add');
+      expect(fn).toBeDefined();
+      expect(fn!.isDeclaration).toBe(true);
+    });
+
+    it('leaves a function definition (with body) unflagged', () => {
+      // `int add(int a, int b) { ... }` is a function_definition with a
+      // body — isDeclaration must be unset (falsy) so cDeclDefEdges treats
+      // it as the definition side of the pair.
+      const result = extractFromSource(
+        'foo.c',
+        'int add(int a, int b) {\n  return a + b;\n}\n'
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'add');
+      expect(fn).toBeDefined();
+      expect(fn!.isDeclaration).toBeFalsy();
+    });
+
+    it('marks a multi-line prototype as isDeclaration regardless of line span', () => {
+      // A prototype that wraps its parameter list across multiple lines
+      // — the exact case the old endLine>startLine heuristic misclassified
+      // as a definition. The flag is set from the AST shape (declaration
+      // node containing a function_declarator), not from line counting.
+      const result = extractFromSource(
+        'multi.h',
+        'void draw(\n    int x,\n    int y);\n'
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'draw');
+      expect(fn).toBeDefined();
+      expect(fn!.isDeclaration).toBe(true);
+      // The prototype spans 3 lines — this is what tripped the old heuristic.
+      expect(fn!.endLine).toBeGreaterThan(fn!.startLine);
+    });
+  });
+
   describe('C/C++ macro extraction', () => {
     it('extracts object-like macro (simple constant)', () => {
       const code = `#define FOO 42\n`;

@@ -347,7 +347,7 @@ export class TreeSitterExtractor {
       // this.source so downstream getNodeText reads the same bytes the parser
       // saw (identical outside the blanked directive lines).
       if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source);
+        this.source = this.extractor.preParse(this.source, this.globalMacroNames ?? undefined);
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {

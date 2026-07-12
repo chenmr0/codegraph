@@ -95,6 +95,242 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
   return normalizeCppReturnType(getNodeText(typeNode, source));
 }
 
+/**
+ * Replace a statement-like macro invocation with `0;` (padded to the same
+ * byte length, newlines preserved) so tree-sitter's C/C++ parser doesn't
+ * close the enclosing compound_statement early. The original text is the
+ * full invocation (e.g. `SWITCH(x)` or `DEFAULT`); we overwrite the first
+ * two chars with `0;` and blank the rest to spaces, keeping any `\n`s so
+ * line numbers and byte offsets stay identical.
+ */
+function replaceWithSemicolon(text: string): string {
+  const chars = [...text];
+  if (chars.length >= 2) {
+    chars[0] = '0';
+    chars[1] = ';';
+    for (let i = 2; i < chars.length; i++) {
+      if (chars[i] !== '\n') chars[i] = ' ';
+    }
+  } else if (chars.length === 1) {
+    // Single-char macro → null statement.
+    chars[0] = ';';
+  }
+  return chars.join('');
+}
+
+/**
+ * Pre-parse transform for C/C++: replace statement-level macro invocations
+ * with `0;` so tree-sitter's parser doesn't close the compound_statement
+ * early on macros that expand to brace-balanced code WITHOUT a trailing
+ * semicolon (e.g. open5gs SWITCH/CASE/DEFAULT/END in lib/core/ogs-macros.h).
+ *
+ * Tree-sitter's C/C++ grammars lack a preprocessor, so a bare `SWITCH(x)`
+ * (no trailing `;`) parses as a call_expression that triggers error
+ * recovery; as errors accumulate the parser eventually closes the function
+ * body prematurely, dropping every subsequent call/statement into the
+ * translation_unit. Replacing the invocation with a legal `0;` expression
+ * statement keeps the compound_statement open so visitFunctionBody can
+ * still walk every case body.
+ *
+ * A macro invocation is "statement-like" (and thus replaced) when ALL of:
+ *   1. the identifier is in the known macro set (`macroNames`)
+ *   2. paren depth is 0 (not inside a call/arg list — excludes macro
+ *      constants used as arguments like `CASE(MACRO_CONST)` or
+ *      `foo(x, MACRO_CONST)`)
+ *   3. NOT followed by `;` (no trailing semicolon → not a regular call;
+ *      tree-sitter already handles those)
+ *   4. NOT followed by `{` (preserves the existing isMisparsedFunction
+ *      pattern `MACRO(params) { body }` — replacing it would break that
+ *      mechanism)
+ *
+ * String/char literals, line/block comments, and preprocessor directives
+ * are skipped verbatim. The output preserves the exact byte length of the
+ * input (replaced text is space-padded, newlines kept) so node positions
+ * and getNodeText remain correct.
+ */
+function preprocessStatementMacros(source: string, macroNames?: Set<string>): string {
+  if (!macroNames || macroNames.size === 0) return source;
+
+  const isIdentStart = (c: string) => /[A-Za-z_]/.test(c);
+  const isIdentPart = (c: string) => /[A-Za-z0-9_]/.test(c);
+
+  // Safe char access — returns '' for out-of-bounds (correct for all
+  // equality comparisons below; the loop guards ensure we never push the
+  // empty string from an out-of-range read).
+  const at = (idx: number): string => (idx >= 0 && idx < source.length) ? source[idx]! : '';
+
+  const out: string[] = [];
+  let i = 0;
+  let parenDepth = 0;
+  const n = source.length;
+
+  while (i < n) {
+    const c = at(i);
+
+    // Line comment — copy verbatim to end of line.
+    if (c === '/' && at(i + 1) === '/') {
+      const end = source.indexOf('\n', i);
+      const stop = end === -1 ? n : end;
+      out.push(source.slice(i, stop));
+      i = stop;
+      continue;
+    }
+
+    // Block comment — copy verbatim through `*/`.
+    if (c === '/' && at(i + 1) === '*') {
+      const end = source.indexOf('*/', i + 2);
+      const stop = end === -1 ? n : end + 2;
+      out.push(source.slice(i, stop));
+      i = stop;
+      continue;
+    }
+
+    // String literal — copy verbatim through the closing quote (handle escapes).
+    if (c === '"') {
+      out.push(c);
+      i++;
+      while (i < n) {
+        const ch = at(i);
+        out.push(ch);
+        i++;
+        if (ch === '\\') {
+          if (i < n) {
+            out.push(at(i));
+            i++;
+          }
+          continue;
+        }
+        if (ch === '"') break;
+      }
+      continue;
+    }
+
+    // Char literal — copy verbatim through the closing quote (handle escapes).
+    if (c === "'") {
+      out.push(c);
+      i++;
+      while (i < n) {
+        const ch = at(i);
+        out.push(ch);
+        i++;
+        if (ch === '\\') {
+          if (i < n) {
+            out.push(at(i));
+            i++;
+          }
+          continue;
+        }
+        if (ch === "'") break;
+      }
+      continue;
+    }
+
+    // Preprocessor directive — copy the entire line verbatim (and any
+    // line-continuation backslash continuations).
+    if (c === '#') {
+      // Only treat as preprocessor if at the start of a logical line
+      // (only whitespace before it on this line).
+      let lineStart = i;
+      while (lineStart > 0 && at(lineStart - 1) !== '\n') lineStart--;
+      let onlyWs = true;
+      for (let k = lineStart; k < i; k++) {
+        if (!/\s/.test(at(k))) { onlyWs = false; break; }
+      }
+      if (onlyWs) {
+        while (i < n) {
+          out.push(at(i));
+          if (at(i) === '\n') {
+            // Honor line continuation: a backslash immediately before the
+            // newline keeps the directive alive on the next line.
+            if (at(i - 1) === '\\') { i++; continue; }
+            i++;
+            break;
+          }
+          i++;
+        }
+        continue;
+      }
+      // Otherwise fall through (an inline `#` outside directives — rare).
+    }
+
+    // Track paren depth.
+    if (c === '(') { parenDepth++; out.push(c); i++; continue; }
+    if (c === ')') { parenDepth--; out.push(c); i++; continue; }
+
+    // Identifier at depth 0 — candidate statement-level macro.
+    if (isIdentStart(c) && parenDepth === 0) {
+      let j = i + 1;
+      while (j < n && isIdentPart(at(j))) j++;
+      const ident = source.slice(i, j);
+
+      if (macroNames.has(ident)) {
+        // Find the end of the invocation: function-like MACRO(...) includes
+        // through the matching `)`; object-like MACRO is just the identifier.
+        let invEnd = j;
+        let k = j;
+        while (k < n && (at(k) === ' ' || at(k) === '\t')) k++;
+        if (k < n && at(k) === '(') {
+          let depth = 1;
+          invEnd = k + 1;
+          while (invEnd < n && depth > 0) {
+            const ch = at(invEnd);
+            if (ch === '(') depth++;
+            else if (ch === ')') depth--;
+            // Don't follow parens inside string/char literals.
+            else if (ch === '"') {
+              invEnd++;
+              while (invEnd < n) {
+                if (at(invEnd) === '\\') { invEnd += 2; continue; }
+                if (at(invEnd) === '"') { invEnd++; break; }
+                invEnd++;
+              }
+              continue;
+            } else if (ch === "'") {
+              invEnd++;
+              while (invEnd < n) {
+                if (at(invEnd) === '\\') { invEnd += 2; continue; }
+                if (at(invEnd) === "'") { invEnd++; break; }
+                invEnd++;
+              }
+              continue;
+            }
+            invEnd++;
+          }
+        }
+
+        // Find the next non-whitespace token after the invocation.
+        let nextIdx = invEnd;
+        while (nextIdx < n && (at(nextIdx) === ' ' || at(nextIdx) === '\t' || at(nextIdx) === '\n' || at(nextIdx) === '\r')) nextIdx++;
+        const nextTok = nextIdx < n ? at(nextIdx) : '';
+
+        if (nextTok === ';' || nextTok === '{') {
+          // Regular call (tree-sitter handles it) or the
+          // MACRO(params) { body } pattern (handled by isMisparsedFunction).
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+
+        // Statement-level macro → replace with `0;` + spaces.
+        out.push(replaceWithSemicolon(source.slice(i, invEnd)));
+        i = invEnd;
+        continue;
+      }
+
+      // Not a known macro — copy the identifier through.
+      out.push(ident);
+      i = j;
+      continue;
+    }
+
+    // Default — copy char verbatim.
+    out.push(c);
+    i++;
+  }
+
+  return out.join('');
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -112,6 +348,7 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  preParse: preprocessStatementMacros,
   getReturnType: extractCppReturnType,
   isConst: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
@@ -191,6 +428,7 @@ export const cppExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
+  preParse: preprocessStatementMacros,
   isConst: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);

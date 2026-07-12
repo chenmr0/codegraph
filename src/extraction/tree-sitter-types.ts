@@ -86,7 +86,7 @@ export interface LanguageExtractor {
    * removed text with spaces, keep newlines) so node positions and getNodeText
    * stay correct; the returned string is used for both parsing and extraction.
    */
-  preParse?: (source: string) => string;
+  preParse?: (source: string, macroNames?: Set<string>) => string;
 
   // --- Node type mappings ---
 
