@@ -1652,6 +1652,7 @@ export class TreeSitterExtractor {
                 visibility,
                 isStatic,
                 returnType,
+                isDeclaration: true,
               });
               return;
             }

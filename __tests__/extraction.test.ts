@@ -3119,6 +3119,51 @@ void k() {
     });
   });
 
+  describe('C++ class member function declaration isDeclaration flag', () => {
+    it('marks a class-internal member function declaration as isDeclaration=true', () => {
+      // `void foo();` inside a class body is parsed by tree-sitter-cpp as a
+      // field_declaration with a function_declarator. Must be flagged
+      // isDeclaration=true so cppDeclDefEdges pairs it with the out-of-line
+      // .cpp definition (and so codegraph_search shows it as a declaration).
+      const result = extractFromSource(
+        'foo.h',
+        'class Foo {\npublic:\n  void bar();\n};\n'
+      );
+      const m = result.nodes.find((n) => n.kind === 'method' && n.name === 'bar');
+      expect(m).toBeDefined();
+      expect(m!.isDeclaration).toBe(true);
+    });
+
+    it('leaves an out-of-line .cpp method definition unflagged', () => {
+      // The matching .cpp definition `void Foo::bar() { ... }` is a
+      // function_definition and must leave isDeclaration falsy so it is the
+      // definition side of the cppDeclDefEdges pair.
+      const result = extractFromSource(
+        'foo.cpp',
+        'void Foo::bar() {\n  // body\n}\n'
+      );
+      const m = result.nodes.find((n) => n.kind === 'method' && n.name === 'bar');
+      expect(m).toBeDefined();
+      expect(m!.isDeclaration).toBeFalsy();
+    });
+
+    it('marks a multi-line class member declaration regardless of line span', () => {
+      // The exact case the old endLine>startLine heuristic misclassified:
+      // a class member declaration whose parameter list wraps across lines
+      // would look like a definition. The flag is set from the AST shape
+      // (field_declaration + function_declarator), not line counting.
+      const result = extractFromSource(
+        'foo.h',
+        'class Foo {\npublic:\n  void bar(\n      int a,\n      int b);\n};\n'
+      );
+      const m = result.nodes.find((n) => n.kind === 'method' && n.name === 'bar');
+      expect(m).toBeDefined();
+      expect(m!.isDeclaration).toBe(true);
+      // Declaration spans 4 lines — this is what tripped the old heuristic.
+      expect(m!.endLine).toBeGreaterThan(m!.startLine);
+    });
+  });
+
   describe('C/C++ macro extraction', () => {
     it('extracts object-like macro (simple constant)', () => {
       const code = `#define FOO 42\n`;

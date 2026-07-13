@@ -362,3 +362,86 @@ void draw(int x, int y) {
     expect(edge.synthBy).toBe('c-decl-def');
   });
 });
+
+describe('cpp-decl-def synthesizer', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-decldef-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Helper: query all `defines` edges with joined node attrs. */
+  const definesEdges = (db: any) =>
+    db
+      .prepare(
+        `SELECT s.name src_name, s.qualified_name src_qn, s.kind src_kind,
+                s.file_path src_path, s.start_line src_line, s.end_line src_endline,
+                s.is_declaration src_isdecl,
+                t.name tgt_name, t.qualified_name tgt_qn, t.kind tgt_kind,
+                t.file_path tgt_path, t.start_line tgt_line, s.end_line tgt_endline,
+                t.is_declaration tgt_isdecl,
+                e.provenance, json_extract(e.metadata,'$.synthesizedBy') synthBy,
+                json_extract(e.metadata,'$.registeredAt') registeredAt
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE e.kind = 'defines'`
+      )
+      .all() as any[];
+
+  it('pairs a C++ multi-line class member declaration with its .cpp definition (isDeclaration flag, not endLine heuristic)', async () => {
+    // The class member declaration wraps its parameter list across 4 lines.
+    // The old endLine>startLine heuristic misclassified this multi-line
+    // declaration as a definition (it spans more than one line), so it was
+    // never paired with the .cpp definition. With the isDeclaration flag set
+    // at extraction time (field_declaration + function_declarator), the
+    // declaration is recognized regardless of line span.
+    fs.writeFileSync(
+      path.join(dir, 'shape.h'),
+      `#pragma once
+class Shape {
+public:
+  void resize(
+      int w,
+      int h);
+};
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'shape.cpp'),
+      `#include "shape.h"
+void Shape::resize(int w, int h) {
+  // body
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db);
+    cg.close?.();
+
+    const resizeEdges = edges.filter(
+      (e) => (e.src_name === 'resize' || e.tgt_name === 'resize')
+    );
+    expect(resizeEdges.length).toBe(1);
+
+    const edge = resizeEdges[0]!;
+    // Definition (.cpp, has body) → declaration (.h, multi-line, in class).
+    expect(edge.src_path.endsWith('shape.cpp')).toBe(true);
+    expect(edge.tgt_path.endsWith('shape.h')).toBe(true);
+    // The isDeclaration flag must be populated: 0 on the definition source,
+    // 1 on the in-class declaration target. This is what distinguishes them
+    // without relying on the buggy line-count heuristic.
+    expect(edge.src_isdecl).toBe(0);
+    expect(edge.tgt_isdecl).toBe(1);
+    expect(edge.synthBy).toBe('cpp-decl-def');
+    expect(edge.provenance).toBe('heuristic');
+    expect(edge.registeredAt).toMatch(/shape\.h:\d+/);
+  });
+});

@@ -510,9 +510,16 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
     const receiver = qn.slice(0, sep);
     if (!classNames.has(receiver)) continue;
 
-    // Definition: spans multiple lines (has body). Declaration: single line.
-    const defs = nodes.filter((n) => n.endLine > n.startLine);
-    const decls = nodes.filter((n) => n.endLine === n.startLine);
+    // Use the explicit isDeclaration flag set at extraction time: a class
+    // member function declaration (`void foo();` inside the class body, parsed
+    // as field_declaration + function_declarator) is marked isDeclaration=true;
+    // an out-of-line .cpp definition leaves isDeclaration unset. This replaces
+    // the buggy endLine>startLine heuristic, which misclassified multi-line
+    // declarations — `void foo(\n  int a,\n  int b);` — as definitions.
+    // Requires a re-index to populate the flag on existing databases
+    // (migration v6 only adds the column; it does not backfill).
+    const decls = nodes.filter((n) => n.isDeclaration === true);
+    const defs = nodes.filter((n) => n.isDeclaration !== true);
     if (defs.length === 0 || decls.length === 0) continue;
 
     for (const def of defs) {
