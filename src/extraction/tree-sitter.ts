@@ -612,6 +612,35 @@ export class TreeSitterExtractor {
       }
       skipChildren = true;
     }
+    // C/C++: top-level ERROR node containing a function_declarator is a
+    // misparsed function prototype. Stacked attribute macros before the
+    // return type (e.g. `SAFE VOS_VOID* OWNED NULLABLE`) plus a trailing
+    // macro call after the parameter list (e.g. `CALLEE_RET_ALIGN()`)
+    // break tree-sitter-c's declaration parse: the `*` is misread as a
+    // dereference expression, the type split into a spurious declaration +
+    // expression_statement, and the function_declarator lands in an ERROR
+    // recovery node. Route through extractVariable so the existing C/C++
+    // branch detects the function_declarator and creates a function
+    // declaration node with isDeclaration=true.
+    //
+    // Do NOT set skipChildren: a large ERROR node (e.g. X-macro leak where
+    // `struct foo { MACRO_FIELDS };` never closes the field_declaration_list)
+    // may also contain struct_specifier / enum_specifier / declaration
+    // children that the body walker still needs to dispatch to their own
+    // extractors. extractVariable only processes direct children whose type
+    // is in DECLARATOR_TYPES (bare function_declarator, pointer_declarator,
+    // etc.), so it won't re-process declaration children the walker reaches
+    // next.
+    else if (
+      (this.language === 'c' || this.language === 'cpp') &&
+      nodeType === 'ERROR' &&
+      !this.isInsideClassLikeNode() &&
+      !this.isInsideFunctionNode() &&
+      !this.isInsideCompoundStatement(node) &&
+      node.descendantsOfType('function_declarator').length > 0
+    ) {
+      this.extractVariable(node);
+    }
     // Swift stored properties inside a type. Swift instance properties aren't
     // extracted as their own nodes, but a property's PROPERTY WRAPPER
     // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE

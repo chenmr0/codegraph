@@ -361,6 +361,50 @@ void draw(int x, int y) {
     expect(edge.tgt_isdecl).toBe(1);
     expect(edge.synthBy).toBe('c-decl-def');
   });
+
+  it('pairs a .h declaration with stacked attribute macros and a trailing macro call', async () => {
+    // Stacked attribute macros before the return type (`SAFE VOS_VOID* OWNED
+    // NULLABLE`) plus a trailing macro call after the parameter list
+    // (`CALLEE_RET_ALIGN()`) break tree-sitter-c's declaration parse: the `*`
+    // is misread as a dereference expression, the type split into a spurious
+    // declaration + expression_statement, and the function_declarator lands in
+    // an ERROR recovery node. The ERROR-node rescue in the body walker routes
+    // it through extractVariable, which detects the function_declarator and
+    // creates a declaration node — enabling cDeclDefEdges to pair it with the
+    // .c definition.
+    fs.writeFileSync(
+      path.join(dir, 'attr.h'),
+      `#pragma once
+SAFE VOS_VOID* OWNED NULLABLE TlmDynamicMemAlloc(VOS_UINT32 dwPid, VOS_UINT32 dwSize) CALLEE_RET_ALIGN();
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'attr.c'),
+      `#include "attr.h"
+RRE_ATTRIBUTE_VISIBILITY VOS_VOID *TlmDynamicMemAlloc(VOS_UINT32 dwPid, VOS_UINT32 dwSize) {
+  return 0;
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db);
+    cg.close?.();
+
+    const tlmEdges = edges.filter(
+      (e) => e.src_name === 'TlmDynamicMemAlloc' || e.tgt_name === 'TlmDynamicMemAlloc'
+    );
+    expect(tlmEdges.length).toBe(1);
+
+    const edge = tlmEdges[0]!;
+    expect(edge.src_path.endsWith('attr.c')).toBe(true);
+    expect(edge.tgt_path.endsWith('attr.h')).toBe(true);
+    expect(edge.src_isdecl).toBe(0);
+    expect(edge.tgt_isdecl).toBe(1);
+    expect(edge.synthBy).toBe('c-decl-def');
+  });
 });
 
 describe('cpp-decl-def synthesizer', () => {
