@@ -405,6 +405,48 @@ RRE_ATTRIBUTE_VISIBILITY VOS_VOID *TlmDynamicMemAlloc(VOS_UINT32 dwPid, VOS_UINT
     expect(edge.tgt_isdecl).toBe(1);
     expect(edge.synthBy).toBe('c-decl-def');
   });
+
+  it('pairs a .h declaration where the ERROR is nested inside a declaration node', async () => {
+    // With fewer leading attribute macros (so tree-sitter-c does not split
+    // the type into a spurious declaration + expression_statement), the
+    // function_declarator lands in an ERROR that is itself nested inside a
+    // declaration node. The declaration dispatch normally sets skipChildren,
+    // which would prevent the body walker from reaching the ERROR. The fix
+    // detects ERROR children with function_declarator descendants and keeps
+    // walking so the ERROR-node rescue can extract the prototype.
+    fs.writeFileSync(
+      path.join(dir, 'nest.h'),
+      `#pragma once
+EXTERN VOS_VOID TlmFree(VOS_VOID *p) CALLEE_RET_ALIGN();
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'nest.c'),
+      `#include "nest.h"
+VOS_VOID TlmFree(VOS_VOID *p) {
+  return;
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db);
+    cg.close?.();
+
+    const freeEdges = edges.filter(
+      (e) => e.src_name === 'TlmFree' || e.tgt_name === 'TlmFree'
+    );
+    expect(freeEdges.length).toBe(1);
+
+    const edge = freeEdges[0]!;
+    expect(edge.src_path.endsWith('nest.c')).toBe(true);
+    expect(edge.tgt_path.endsWith('nest.h')).toBe(true);
+    expect(edge.src_isdecl).toBe(0);
+    expect(edge.tgt_isdecl).toBe(1);
+    expect(edge.synthBy).toBe('c-decl-def');
+  });
 });
 
 describe('cpp-decl-def synthesizer', () => {

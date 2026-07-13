@@ -576,7 +576,19 @@ export class TreeSitterExtractor {
       !this.isInsideCompoundStatement(node)
     ) {
       this.extractVariable(node);
-      skipChildren = true; // extractVariable handles children
+      // C/C++: a declaration may wrap an ERROR child — stacked attribute
+      // macros (e.g. `EXTERN VOS_VOID TlmFree(...) CALLEE_RET_ALIGN();`) can
+      // cause tree-sitter-c to nest the function_declarator inside an ERROR
+      // that is itself inside a declaration. extractVariable skips ERROR
+      // children (not in DECLARATOR_TYPES), so don't skipChildren in that
+      // case — let the body walker reach the ERROR so the ERROR-node rescue
+      // below can extract the function declaration.
+      const hasErrorWithFd =
+        (this.language === 'c' || this.language === 'cpp') &&
+        node.namedChildren.some(
+          (c) => c.type === 'ERROR' && c.descendantsOfType('function_declarator').length > 0
+        );
+      skipChildren = !hasErrorWithFd;
     }
     // C/C++: expression_statement at translation_unit/namespace scope is a
     // misparse caused by unrecognized macros before a variable declaration
