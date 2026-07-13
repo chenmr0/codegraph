@@ -2865,6 +2865,72 @@ void process() {
       const realFunc = result.nodes.find((n) => n.kind === 'function' && n.name === 'process');
       expect(realFunc).toBeDefined();
     });
+
+    it('keeps real function sharing a name with a cross-file #define wrapper macro', () => {
+      // C debug wrapper pattern: a real function `TlmDynamicMemAlloc` and a
+      // same-named `#define` that adds __FILE__/__LINE__ args. The #define
+      // lives in a header (simulated via globalMacroNames); the .c file has
+      // the real definition. The form check must keep both the function
+      // definition and declaration — only the macro node should be filtered
+      // as a function. Regression for commit d96678f which suppressed every
+      // name matching a global macro.
+      const code = `
+void* TlmDynamicMemAlloc(int pid, int size);
+
+void* TlmDynamicMemAlloc(int pid, int size) {
+  return (void*)0;
+}
+`;
+      const globalMacroNames = new Set(['TlmDynamicMemAlloc']);
+      const result = extractFromSource('impl.c', code, undefined, undefined, globalMacroNames);
+      const funcDef = result.nodes.find(
+        (n) => n.kind === 'function' && n.name === 'TlmDynamicMemAlloc' && !n.isDeclaration
+      );
+      expect(funcDef).toBeDefined();
+      const funcDecl = result.nodes.find(
+        (n) => n.kind === 'function' && n.name === 'TlmDynamicMemAlloc' && n.isDeclaration
+      );
+      expect(funcDecl).toBeDefined();
+    });
+
+    it('keeps real function sharing a name with a same-file #define wrapper macro', () => {
+      // Same wrapper-macro pattern but the #define is in the same file as
+      // the real function (fileMacroNames path, not globalMacroNames).
+      const code = `
+#define TlmDynamicMemAlloc(pid, size) \\
+  TlmDynamicMemAlloc((pid), (size), __FILE__, __LINE__)
+
+void* TlmDynamicMemAlloc(int pid, int size, const char* file, int line) {
+  return (void*)0;
+}
+`;
+      const result = extractFromSource('impl.c', code);
+      const funcDef = result.nodes.find(
+        (n) => n.kind === 'function' && n.name === 'TlmDynamicMemAlloc'
+      );
+      expect(funcDef).toBeDefined();
+      const macroNode = result.nodes.find(
+        (n) => n.kind === 'macro' && n.name === 'TlmDynamicMemAlloc'
+      );
+      expect(macroNode).toBeDefined();
+    });
+
+    it('does not regress the e7ef006 multi-prefix form when name is in macroNames', () => {
+      // `RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 normalFunc(VOS_VOID){}` — with
+      // 2+ unrecognized macro prefixes tree-sitter produces a real function
+      // node (declarator wrapped in parenthesized_declarator) carrying a real
+      // return type. Even when normalFunc is in macroNames, the form check
+      // must keep it: the type field holds a real type, not the function name.
+      const code = `
+RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 normalFunc(VOS_VOID) {
+  return 0;
+}
+`;
+      const globalMacroNames = new Set(['normalFunc', 'RRE_ATTRIBUTE_VISIBILITY', 'VOS_UINT32']);
+      const result = extractFromSource('test.cpp', code, undefined, undefined, globalMacroNames);
+      const func = result.nodes.find((n) => n.kind === 'function' && n.name === 'normalFunc');
+      expect(func).toBeDefined();
+    });
   });
 
   describe('C/C++ statement-level macro preParse (SWITCH/CASE/DEFAULT/END)', () => {

@@ -331,6 +331,55 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
   return out.join('');
 }
 
+/**
+ * Decide whether a function-shaped AST node whose name matches a known
+ * `#define` macro is a real function/declaration or a tree-sitter misparse of
+ * a macro invocation `MACRO(args) { body }`.
+ *
+ * C permits a function and a `#define` macro to share a name (a common debug
+ * wrapper pattern, e.g. `TlmDynamicMemAlloc`). The old name-only check
+ * suppressed every such name, which dropped real function definitions and
+ * declarations along with the misparse (regression in commit d96678f).
+ *
+ * The reliable witness is NESTING, not the `type` field: a macro invocation
+ * misparse always appears INSIDE a function body (its direct parent is a
+ * `compound_statement`), because macros are called in code, not at file scope.
+ * A real function definition / prototype lives at `translation_unit` level (or
+ * inside a class/struct `field_declaration_list`).
+ *
+ * Nesting is required because the e7ef006 form — a REAL function
+ * `RRE_ATTR VOS_UINT32 foo(...) {}` that tree-sitter splits so the function
+ * name lands in the `type` field and the declarator becomes a
+ * `parenthesized_declarator` — is structurally identical to the
+ * `FOREACH_X(items)\n{ body }` misparse. Both have type.text === name and a
+ * parenthesized_declarator; only the parent (translation_unit vs
+ * compound_statement) tells them apart, so a type-field check alone cannot.
+ */
+function cCppIsMacroInvocationMisparse(
+  name: string,
+  node: SyntaxNode,
+  macroNames?: Set<string>
+): boolean {
+  if (!macroNames || !macroNames.has(name)) return false;
+  // A macro invocation `MACRO(args) { body }` that tree-sitter misparses as a
+  // function_definition / declaration always appears INSIDE a function body —
+  // its direct parent is a `compound_statement`, because macros are invoked in
+  // code, not at file scope. A real function definition / prototype lives at
+  // the `translation_unit` level (or inside a class/struct
+  // `field_declaration_list`).
+  //
+  // The parent check is what distinguishes the e7ef006 form — a REAL function
+  // `RRE_ATTR VOS_UINT32 foo(...) {}` that tree-sitter splits so the function
+  // name lands in the `type` field and the declarator becomes a
+  // `parenthesized_declarator` — from the structurally identical
+  // `FOREACH_X(items)\n{ body }` misparse. Both have type.text === name and a
+  // parenthesized_declarator; only the nesting differs (translation_unit vs
+  // compound_statement), so a type-field check alone cannot tell them apart.
+  const parent = node.parent;
+  if (parent && parent.type === 'compound_statement') return true;
+  return false;
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -372,14 +421,13 @@ export const cExtractor: LanguageExtractor = {
     }
     return true;
   },
-  isMisparsedFunction: (name, _node, macroNames) => {
+  isMisparsedFunction: (name, node, macroNames) => {
     // C macros cause tree-sitter to misparse macro invocations as function
     // definitions when the shape matches NAME(params) { body }.
     if (name.startsWith('namespace')) return true;
     const cppKeywords = ['switch', 'if', 'for', 'while', 'do', 'case', 'return'];
     if (cppKeywords.includes(name)) return true;
-    if (macroNames && macroNames.has(name)) return true;
-    return false;
+    return cCppIsMacroInvocationMisparse(name, node, macroNames);
   },
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
@@ -480,7 +528,7 @@ export const cppExtractor: LanguageExtractor = {
     }
     return undefined;
   },
-  isMisparsedFunction: (name, _node, macroNames) => {
+  isMisparsedFunction: (name, node, macroNames) => {
     // C++ macros like NLOHMANN_JSON_NAMESPACE_BEGIN cause tree-sitter to misparse
     // namespace blocks as function_definitions (e.g. name = "namespace detail").
     // Also filter C++ keywords that tree-sitter occasionally misinterprets as
@@ -493,8 +541,9 @@ export const cppExtractor: LanguageExtractor = {
     // has the shape MACRO_NAME(params) { body }, it matches the
     // function_definition grammar rule and produces a spurious function node
     // for each call site (e.g. FOREACH_X creates 17 "functions" in OceanBase).
-    if (macroNames && macroNames.has(name)) return true;
-    return false;
+    // The form check below keeps real functions that merely share a name with
+    // a macro (C permits `void* foo(int);` alongside `#define foo(...)`).
+    return cCppIsMacroInvocationMisparse(name, node, macroNames);
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();
