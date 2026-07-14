@@ -1475,24 +1475,28 @@ export class TreeSitterExtractor {
       visibility,
       isExported,
     });
-    if (!structNode) return;
+    // Anonymous struct (no name -> createNode returned null). Still walk the
+    // body so the fields are extracted; their contains edge points to the
+    // enclosing scope (C++ anonymous-struct fields inject into the outer
+    // scope), so we deliberately do NOT push onto nodeStack here.
+    if (structNode) {
+      // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
+      this.extractInheritance(node, structNode.id);
 
-    // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
-    this.extractInheritance(node, structNode.id);
+      // C# primary-constructor parameter dependencies (`struct P(int x)`, and
+      // `record struct M(decimal Amount)` which the grammar nests here).
+      this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
 
-    // C# primary-constructor parameter dependencies (`struct P(int x)`, and
-    // `record struct M(decimal Amount)` which the grammar nests here).
-    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
-
-    // Push to stack for field extraction
-    this.nodeStack.push(structNode.id);
+      // Push to stack for field extraction
+      this.nodeStack.push(structNode.id);
+    }
     for (let i = 0; i < body.namedChildCount; i++) {
       const child = body.namedChild(i);
       if (child) {
         this.visitNode(child);
       }
     }
-    this.nodeStack.pop();
+    if (structNode) this.nodeStack.pop();
   }
 
   /**
@@ -1516,13 +1520,18 @@ export class TreeSitterExtractor {
       visibility,
       isExported,
     });
-    if (!enumNode) return;
 
-    // Extract inheritance (e.g. Swift: enum AFError: Error)
-    this.extractInheritance(node, enumNode.id);
+    // Anonymous enum (no name → createNode returned null). Still walk the body
+    // so the enumerators are extracted; their contains edge points to the
+    // enclosing scope (C++ anonymous-enum members inject into the outer
+    // scope), so we deliberately do NOT push onto nodeStack here.
+    if (enumNode) {
+      // Extract inheritance (e.g. Swift: enum AFError: Error)
+      this.extractInheritance(node, enumNode.id);
 
-    // Push to stack and visit body children (enum members, nested types, methods)
-    this.nodeStack.push(enumNode.id);
+      // Push to stack and visit body children (enum members, nested types, methods)
+      this.nodeStack.push(enumNode.id);
+    }
 
     const memberTypes = this.extractor.enumMemberTypes;
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -1535,7 +1544,7 @@ export class TreeSitterExtractor {
         this.visitNode(child);
       }
     }
-    this.nodeStack.pop();
+    if (enumNode) this.nodeStack.pop();
   }
 
   /**
@@ -1621,6 +1630,33 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
+
+    // C/C++: a field_declaration inside a class/struct body may wrap a type
+    // definition (enum/struct/class) WITHOUT a trailing declarator — e.g.
+    //   class C { public: enum E { A, B }; };
+    // tree-sitter-cpp parses this as a field_declaration whose named child is
+    // an enum_specifier/struct_specifier/class_specifier (the "type"), with NO
+    // declarator. extractField normally only extracts declarators (methods/
+    // fields) and silently drops the wrapped type definition along with all
+    // its members (the root cause of enum_member 74% under-indexing on
+    // OceanBase: class-internal enums were never visited). Descend into the
+    // type-specifier child so extractEnum/extractStruct/extractClass can pick
+    // it up. This runs BEFORE declarator handling so both the type definition
+    // AND any trailing declarator (e.g. `enum E { A, B } e;` → enum E + field e)
+    // get extracted. The `body` guard skips forward declarations like
+    // `class Foo;` (no body) — extractClass would otherwise treat the
+    // specifier itself as its body and emit garbage children.
+    if (this.language === 'c' || this.language === 'cpp') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (!child) continue;
+        const t = child.type;
+        if ((t === 'enum_specifier' || t === 'struct_specifier' || t === 'class_specifier')
+          && getChildByField(child, this.extractor.bodyField)) {
+          this.visitNode(child);
+        }
+      }
+    }
 
     // Java field_declaration: "private final String name = value;" → variable_declarator(s) are direct children
     // C# field_declaration: wraps in variable_declaration → variable_declarator(s)
