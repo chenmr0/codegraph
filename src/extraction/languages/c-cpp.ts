@@ -137,11 +137,20 @@ function replaceWithSemicolon(text: string): string {
  *   2. paren depth is 0 (not inside a call/arg list — excludes macro
  *      constants used as arguments like `CASE(MACRO_CONST)` or
  *      `foo(x, MACRO_CONST)`)
- *   3. NOT followed by `;` (no trailing semicolon → not a regular call;
+ *   3. NOT inside an initializer list / aggregate body (braceStack top is
+ *      not `true`) — excludes `NULL` in `{ NULL, 0 }`, `OB_X | 0x10` in
+ *      `{ ... }`, macros in `enum E { A = MACRO }`, C++ `int x{ MACRO }`,
+ *      `return { MACRO }`, etc.  Class/struct/namespace bodies are classified
+ *      as `false` (allow replace) because they contain method bodies with
+ *      statement-level macros and class-level macros like `TO_STRING_KV(...)`.
+ *   4. NOT followed by `;` (no trailing semicolon → not a regular call;
  *      tree-sitter already handles those)
- *   4. NOT followed by `{` (preserves the existing isMisparsedFunction
+ *   5. NOT followed by `{` (preserves the existing isMisparsedFunction
  *      pattern `MACRO(params) { body }` — replacing it would break that
  *      mechanism)
+ *   6. NOT followed by `,` (initializer-list element pattern — safety net
+ *      for compound literals `(type){ MACRO, ... }` whose `{` was preceded
+ *      by `)` and misclassified as a function body)
  *
  * String/char literals, line/block comments, and preprocessor directives
  * are skipped verbatim. The output preserves the exact byte length of the
@@ -162,6 +171,74 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
   const out: string[] = [];
   let i = 0;
   let parenDepth = 0;
+  // Brace context stack: true = initializer list / aggregate body (don't
+  // replace macros), false = function body / statement block (replace OK).
+  // Without this, macros like NULL inside `{ NULL, 0 }` initializer lists get
+  // wrongly replaced with `0;` because parenDepth is 0 and the next token is
+  // ',' (not ';' or '{'), producing illegal syntax that breaks tree-sitter.
+  const braceStack: boolean[] = [];
+
+  // Scan back over `out` to find the last non-whitespace character — used to
+  // classify a `{` as function body (preceded by ')', ':', ';', '}') vs
+  // initializer list (preceded by '=', ',', '(', identifier, etc.).
+  const prevNonSpaceChar = (): string => {
+    let k = out.length - 1;
+    while (k >= 0 && /\s/.test(out[k]!)) k--;
+    return k >= 0 ? out[k]! : '';
+  };
+  // Scan back over `out` to find the last complete identifier token — used to
+  // recognize keywords like `return`, `do`, `else`, `try` before a `{`.
+  const prevWord = (): string => {
+    let k = out.length - 1;
+    while (k >= 0 && /\s/.test(out[k]!)) k--;
+    let end = k + 1;
+    while (k >= 0 && isIdentPart(out[k]!)) k--;
+    return out.slice(k + 1, end).join('');
+  };
+  // Scan back from the pending `{` to find the nearest `class`/`struct`/
+  // `enum`/`namespace` keyword, skipping type names, inheritance (`: public
+  // Base`), and template parameters (`<T, U>`).  Stops at statement boundaries
+  // (`;`, `}`, `{`, `)`).  Used to classify `{` after a type name: a class/
+  // struct/namespace body needs macro replacement (contains method bodies
+  // with statement-level macros), while an enum body does not.
+  const findTypeKeyword = (): string => {
+    let k = out.length - 1;
+    while (k >= 0 && /\s/.test(out[k]!)) k--;
+    // Limit the backward scan to avoid O(n²) on large files — a type keyword
+    // (class/struct/enum/namespace) always appears within a few hundred chars
+    // of the `{` it introduces (type name + optional inheritance/templates).
+    const limit = k - 512;
+    while (k >= 0 && k > limit) {
+      const ch = out[k]!;
+      if (isIdentPart(ch)) {
+        const end = k + 1;
+        while (k >= 0 && isIdentPart(out[k]!)) k--;
+        const word = out.slice(k + 1, end).join('');
+        if (word === 'class' || word === 'struct' || word === 'enum' || word === 'namespace') {
+          // `enum class Foo {` / `enum struct Foo {` are scoped enums — the
+          // body is an enum body (enumerator initializers), not a class body.
+          if (word === 'class' || word === 'struct') {
+            let k2 = k;
+            while (k2 >= 0 && /\s/.test(out[k2]!)) k2--;
+            if (k2 >= 0 && isIdentPart(out[k2]!)) {
+              const end2 = k2 + 1;
+              while (k2 >= 0 && isIdentPart(out[k2]!)) k2--;
+              if (out.slice(k2 + 1, end2).join('') === 'enum') return 'enum';
+            }
+          }
+          return word;
+        }
+        // Not a type keyword — skip whitespace and continue scanning.
+        while (k >= 0 && /\s/.test(out[k]!)) k--;
+      } else if (ch === ';' || ch === '}' || ch === '{' || ch === ')') {
+        return '';
+      } else {
+        k--;
+      }
+    }
+    return '';
+  };
+
   const n = source.length;
 
   while (i < n) {
@@ -257,8 +334,32 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
     if (c === '(') { parenDepth++; out.push(c); i++; continue; }
     if (c === ')') { parenDepth--; out.push(c); i++; continue; }
 
+    // Track brace context — classify each `{` as function body (false) or
+    // initializer list / aggregate body (true).  This prevents macro
+    // replacement inside `{ NULL, 0 }` etc. where parenDepth is 0 but the
+    // context is NOT a statement context.
+    if (c === '{') {
+      const pc = prevNonSpaceChar();
+      const pw = prevWord();
+      const tk = findTypeKeyword();
+      const isFuncBody = (pc === ')' || pc === ':' || pc === ';' || pc === '}') ||
+                         (pw === 'do' || pw === 'else' || pw === 'try' || pw === 'finally') ||
+                         (tk === 'class' || tk === 'struct' || tk === 'namespace');
+      braceStack.push(!isFuncBody);
+      out.push(c);
+      i++;
+      continue;
+    }
+    if (c === '}') {
+      if (braceStack.length > 0) braceStack.pop();
+      out.push(c);
+      i++;
+      continue;
+    }
+
     // Identifier at depth 0 — candidate statement-level macro.
-    if (isIdentStart(c) && parenDepth === 0) {
+    const inNoReplace = braceStack.length > 0 && braceStack[braceStack.length - 1] === true;
+    if (isIdentStart(c) && parenDepth === 0 && !inNoReplace) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
@@ -306,6 +407,15 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
         if (nextTok === ';' || nextTok === '{') {
           // Regular call (tree-sitter handles it) or the
           // MACRO(params) { body } pattern (handled by isMisparsedFunction).
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+        if (nextTok === ',') {
+          // Safety net: macro followed by ',' is an initializer-list element
+          // pattern, not a statement-level macro.  This catches compound
+          // literals `(type){ MACRO, ... }` whose `{` was preceded by ')' and
+          // thus misclassified as a function body by braceStack.
           out.push(source.slice(i, invEnd));
           i = invEnd;
           continue;
