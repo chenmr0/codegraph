@@ -370,6 +370,14 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
         let invEnd = j;
         let k = j;
         while (k < n && (at(k) === ' ' || at(k) === '\t')) k++;
+        // Whether the invocation's arguments contain a `{` (a compound block,
+        // e.g. `OX(SMART_VAR(...) { ... })`). When they do, tree-sitter sees
+        // those braces directly and parses the invocation as a call_expression
+        // without closing the enclosing compound_statement early — so replacing
+        // it with `0;` (which blanks the internal `{ }` to spaces) only breaks
+        // the parse. Skip replacement for such invocations; verbatim handling
+        // is safe and preserves the real function body for callee extraction.
+        let hasBrace = false;
         if (k < n && at(k) === '(') {
           let depth = 1;
           invEnd = k + 1;
@@ -377,6 +385,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
             const ch = at(invEnd);
             if (ch === '(') depth++;
             else if (ch === ')') depth--;
+            else if (ch === '{') hasBrace = true;
             // Don't follow parens inside string/char literals.
             else if (ch === '"') {
               invEnd++;
@@ -404,6 +413,16 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
         while (nextIdx < n && (at(nextIdx) === ' ' || at(nextIdx) === '\t' || at(nextIdx) === '\n' || at(nextIdx) === '\r')) nextIdx++;
         const nextTok = nextIdx < n ? at(nextIdx) : '';
 
+        // Invocation arguments contain a compound block (`{ ... }`). tree-sitter
+        // already handles these verbatim (the braces are visible to it), so
+        // keep the original text — replacing with `0;` would erase the braces
+        // and trigger error recovery that swallows the enclosing namespace into
+        // a single oversized declaration node (see OX/SMART_VAR pattern).
+        if (hasBrace) {
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
         if (nextTok === ';' || nextTok === '{') {
           // Regular call (tree-sitter handles it) or the
           // MACRO(params) { body } pattern (handled by isMisparsedFunction).

@@ -2453,9 +2453,24 @@ export class TreeSitterExtractor {
               const fnName = getNodeText(idNode, this.source);
               if (fnName && !C_CPP_KEYWORD_NAMES.has(fnName)
                 && !this.extractor.isMisparsedFunction?.(fnName, node, this.fileMacroNames)) {
-                this.createNode('function', fnName, node, {
+                // Guard against tree-sitter error-recovery `declaration` nodes
+                // that span an entire namespace/file (caused by macro
+                // replacement erasing braces, or by the Most Vexing Parse
+                // triggering recovery). A real prototype is never > 100 lines
+                // or > 2000 bytes; when the declaration node is oversized,
+                // use the function_declarator (`child`) for both the node
+                // position and the signature — that is the real prototype
+                // location and text, not the error-recovery blob.
+                const declSpan = node.endPosition.row - node.startPosition.row;
+                const declLen = node.endIndex - node.startIndex;
+                const oversized = declSpan > 100 || declLen > 2000;
+                const posNode = oversized ? child : node;
+                const signature = oversized
+                  ? this.source.substring(child.startIndex, child.endIndex)
+                  : this.source.substring(node.startIndex, node.endIndex);
+                this.createNode('function', fnName, posNode, {
                   docstring,
-                  signature: this.source.substring(node.startIndex, node.endIndex),
+                  signature,
                   isExported: isExported || !isExtern,
                   isDeclaration: true,
                 });
