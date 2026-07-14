@@ -900,11 +900,16 @@ export class TreeSitterExtractor {
    * (`MACRO_NAME(params) { body }`) matches the function_definition
    * grammar rule.
    *
-   * `#define` directives are always at the top level of a translation
-   * unit in C/C++ (possibly nested inside `#if`/`#ifdef` blocks, but
-   * never inside functions or classes), so a shallow recursion that
-   * descends into preproc containers but stops at non-preproc nodes is
-   * sufficient — no deep traversal into function bodies needed.
+   * Top-level `#define` directives are collected here (possibly nested
+   * inside `#if`/`#ifdef` blocks). `#define` can also appear inside
+   * function bodies — those are extracted as macro nodes by
+   * visitFunctionBody's macroTypes branch, but are NOT collected here
+   * (this scan stops at non-preproc nodes to avoid walking every
+   * function body). The consequence: a function-local macro invoked
+   * later as `MACRO(args){body}` is not in fileMacroNames, so
+   * isMisparsedFunction won't suppress it — a known, low-risk gap
+   * (function-local macros are typically used only within their
+   * defining function).
    */
   private collectMacroNames(): void {
     if (!this.tree) return;
@@ -4084,6 +4089,20 @@ export class TreeSitterExtractor {
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
+
+      // C/C++: function-body-local `#define` directives. tree-sitter parses
+      // `#define` inside a compound_statement as preproc_def /
+      // preproc_function_def, but visitFunctionBody — unlike visitNode —
+      // had no macroTypes branch, so function-local macros were silently
+      // dropped AND their parameter identifiers fell through to the default
+      // identifier handling below, emitting spurious `references` edges
+      // (macro params treated as external variable refs). Extract the macro
+      // and stop: macro bodies/params are not sub-symbols and must not be
+      // walked (mirrors visitNode's macroTypes + skipChildren behavior).
+      if (this.extractor!.macroTypes?.includes(nodeType)) {
+        this.extractMacro(node);
+        return;
+      }
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
