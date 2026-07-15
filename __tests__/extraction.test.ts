@@ -3197,6 +3197,24 @@ void k() {
       expect(macro?.signature).toContain('\\');
     });
 
+    it('preserves multi-line macro body with CRLF line continuation', () => {
+      // Regression: on CRLF files, the backslash before \r\n was not
+      // recognized as a line continuation — the continuation line was
+      // split from the #directive and its macro invocations (CK_0 here)
+      // were replaced with `0;`, corrupting the macro body.
+      // globalMacroNames is required so preprocessStatementMacros runs.
+      const code = '#define CK_0(x, y) x y\r\n' +
+                   '#define CK_1(a1) \\\r\n' +
+                   '  CK_0(#a1, a1)\r\n';
+      const macroNames = new Set(['CK_0', 'CK_1']);
+      const result = extractFromSource('test.c', code, undefined, undefined, macroNames);
+
+      const ck1 = result.nodes.find((n) => n.kind === 'macro' && n.name === 'CK_1');
+      expect(ck1).toBeDefined();
+      expect(ck1?.signature).toContain('CK_0(#a1, a1)');
+      expect(ck1?.signature).not.toContain('0;');
+    });
+
     it('extracts macro inside #ifdef conditional', () => {
       const code = `
 #ifdef DEBUG

@@ -318,8 +318,11 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
           out.push(at(i));
           if (at(i) === '\n') {
             // Honor line continuation: a backslash immediately before the
-            // newline keeps the directive alive on the next line.
-            if (at(i - 1) === '\\') { i++; continue; }
+            // newline keeps the directive alive on the next line.  On CRLF
+            // files the char before \n is \r, so skip it before checking.
+            let p = i - 1;
+            if (at(p) === '\r') p--;
+            if (at(p) === '\\') { i++; continue; }
             i++;
             break;
           }
