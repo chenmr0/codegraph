@@ -443,6 +443,57 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
           continue;
         }
 
+        // Type / template context — the identifier is used as a type, not a
+        // statement-level macro invocation.  Replacing it would corrupt:
+        //   `T *ptr` / `T &ref`      (pointer / reference declarator)
+        //   `T>` / `T >`             (template parameter close)
+        //   `T...>`                  (variadic parameter close, nextTok is '.')
+        //   `obj.field`              (member access — rare for macros, safe to keep)
+        // These next-token shapes never start a statement that a macro would
+        // expand into, so skipping replacement has no downside.  This guard is
+        // what prevents the "T-macro pollution" class of bug: when a project
+        // `#define`s a common single-letter name (e.g. oceanbase test files
+        // `#define T(t1,res) ...`), the global macro scan puts `T` in the set,
+        // and without this guard every `template<class T>` / `T *x` in every
+        // file gets corrupted into `template<class ;>` / `; *x`, collapsing
+        // entire template classes into one misparsed function node.
+        if (nextTok === '*' || nextTok === '&' || nextTok === '>' || nextTok === '.') {
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+        // Object-like macro (no '(' after the identifier, so invEnd === j)
+        // followed by an identifier on the SAME line is a declaration, not a
+        // statement macro: `T func()`, `T var = ...`, `T data;`.  The statement-
+        // macro pattern `MACRO\n  next_stmt()` has the next token on a DIFFERENT
+        // line (coding style: statement macros sit on their own line), which we
+        // detect by scanning for a newline between the macro and nextIdx.  This
+        // distinguishes `T atoi_negative_unchecked(...)` (return type, same
+        // line → keep) from open5gs `DEFAULT\n  ogs_error(...)` (statement
+        // macro, next line → replace).  Restricted to object-like (invEnd === j)
+        // so function-like `MACRO(args) bar;` on one line still replaces.
+        //
+        // Restricted to SINGLE-CHARACTER macro names: the pollution this guard
+        // fixes is single-letter template params (T/U/V) that got `#define`d by
+        // a test file and leaked into globalMacroNames.  Multi-char object-like
+        // macros followed by an identifier (`OB_INLINE void`, `const uint8_t`,
+        // `inline T`) are storage-class/qualifier prefixes, NOT types — keeping
+        // them verbatim makes tree-sitter misparse the leading identifier as the
+        // function name, collapsing the declaration.  Replacing them with `0;`
+        // (the pre-fix behavior) terminates the prefix as a no-op statement and
+        // lets tree-sitter cleanly parse the real declaration that follows.
+        if (invEnd === j && ident.length === 1) {
+          let sameLine = true;
+          for (let k = invEnd; k < nextIdx; k++) {
+            if (at(k) === '\n') { sameLine = false; break; }
+          }
+          if (sameLine && nextTok && isIdentStart(nextTok)) {
+            out.push(source.slice(i, invEnd));
+            i = invEnd;
+            continue;
+          }
+        }
+
         // Statement-level macro → replace with `0;` + spaces.
         out.push(replaceWithSemicolon(source.slice(i, invEnd)));
         i = invEnd;

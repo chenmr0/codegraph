@@ -261,4 +261,118 @@ enum class ScopedFlags {
     const e = result.nodes.find(n => n.kind === 'enum' && n.name === 'ScopedFlags');
     expect(e).toBeDefined();
   });
+
+  // ── N. T-macro pollution: template param close + pointer declarator ──
+  // Regression for the oceanbase page_arena.h collapse: `#define T(...)` in
+  // test files puts `T` in the global macro set, and without the type-context
+  // guard every `template<class T>` / `T *x` gets corrupted into
+  // `template<class ;>` / `; *x`, collapsing the whole template class into one
+  // misparsed function node.  The guard must keep these type usages verbatim.
+  it('does NOT replace T used as template param / pointer type (T-macro pollution)', () => {
+    const macroNames = new Set(['T']);
+    const code = `
+template <typename CharT, class PageAllocatorT>
+class PageArena
+{
+public:
+  template<class T>
+  T *new_object()
+  {
+    T *ret = NULL;
+    return ret;
+  }
+  CharT *_alloc_aligned(const int64_t sz) { return NULL; }
+  int64_t reuse_size() const { return 0; }
+};
+`;
+    const result = extractFromSource('page_arena.h', code, undefined, undefined, macroNames);
+    // The class itself must be extracted (not collapsed into one function).
+    const cls = result.nodes.find(n => n.kind === 'class' && n.name === 'PageArena');
+    expect(cls).toBeDefined();
+    // The template method `new_object` must survive as a method node.
+    const newObject = result.nodes.find(n => n.kind === 'method' && n.name === 'new_object');
+    expect(newObject).toBeDefined();
+    // `_alloc_aligned` and `reuse_size` must survive too (they follow the
+    // previously-corrupted `new_object` in the class body).
+    expect(result.nodes.find(n => n.kind === 'method' && n.name === '_alloc_aligned')).toBeDefined();
+    expect(result.nodes.find(n => n.kind === 'method' && n.name === 'reuse_size')).toBeDefined();
+  });
+
+  // ── O. T-macro pollution: variadic `T...>` close ─────────────────────
+  // Variadic template parameter `T...>` has nextTok === '.' (start of `...`),
+  // which the type-context guard must treat as a type context, not a statement
+  // macro.  Without the guard, `T...>` → `;...>` and the variadic struct
+  // definition collapses.
+  it('does NOT replace T used as variadic template param (T...>)', () => {
+    const macroNames = new Set(['T']);
+    const code = `
+template <typename... T>
+struct get_type {
+  using type = int;
+};
+template <typename... T>
+struct has_serialize {
+  static constexpr bool value = true;
+};
+`;
+    const result = extractFromSource('ob_tuple.h', code, undefined, undefined, macroNames);
+    const s1 = result.nodes.find(n => n.kind === 'struct' && n.name === 'get_type');
+    expect(s1).toBeDefined();
+    const s2 = result.nodes.find(n => n.kind === 'struct' && n.name === 'has_serialize');
+    expect(s2).toBeDefined();
+  });
+
+  // ── P. T-macro pollution: return type + variable declaration ─────────
+  // `T atoi_neg(...)` (return type T) and `T result = 0;` (var decl) have an
+  // identifier on the SAME line after `T`.  The same-line object-like guard
+  // must keep them verbatim, distinguishing from open5gs `DEFAULT\n  call()`
+  // (next token on a different line → still replaced, see test J).
+  it('does NOT replace T used as return type / variable decl (same-line identifier)', () => {
+    const macroNames = new Set(['T']);
+    const code = `
+template <class T>
+class ObFastAtoi
+{
+public:
+  T atoi_negative_unchecked(char const* p, char const* e)
+  {
+    T result = 0;
+    T cutoff = 0;
+    return result;
+  }
+  T data;
+};
+`;
+    const result = extractFromSource('ob_fast_convert.h', code, undefined, undefined, macroNames);
+    const cls = result.nodes.find(n => n.kind === 'class' && n.name === 'ObFastAtoi');
+    expect(cls).toBeDefined();
+    const fn = result.nodes.find(n => n.kind === 'method' && n.name === 'atoi_negative_unchecked');
+    expect(fn).toBeDefined();
+  });
+
+  // ── Q. statement-macro + next-line call still replaces (no regression) ─
+  // The same-line guard must NOT suppress the open5gs pattern where the macro
+  // and the next statement are on different lines — that's the whole point of
+  // preprocessStatementMacros.  Sanity check that the guard is precise.
+  it('still replaces object-like statement macro followed by a next-line call', () => {
+    const macroNames = new Set(['DEFAULT']);
+    const code = `
+void handle(int id) {
+  DEFAULT
+  ogs_error("unknown");
+  rv = -1;
+}
+int g_after = 7;
+`;
+    const result = extractFromSource('test.c', code, undefined, undefined, macroNames);
+    const fn = result.nodes.find(n => n.kind === 'function' && n.name === 'handle');
+    expect(fn).toBeDefined();
+    // ogs_error call must be attributed to handle (compound_statement stayed
+    // open because DEFAULT was replaced with `0;`).
+    const callees = result.unresolvedReferences
+      .filter(r => r.fromNodeId === fn!.id && r.referenceKind === 'calls')
+      .map(r => r.referenceName);
+    expect(callees).toContain('ogs_error');
+    expect(result.nodes.find(n => n.kind === 'variable' && n.name === 'g_after')).toBeDefined();
+  });
 });
