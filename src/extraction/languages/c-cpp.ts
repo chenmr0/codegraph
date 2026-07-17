@@ -506,13 +506,26 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
               i = invEnd;
               continue;
             }
-            // Guard 2b: multi-char macro + same-line identifier → check for
-            // function-definition pattern (identifier immediately followed by '(')
+            // Guard 2b: multi-char macro + same-line identifier → the macro is
+            // used as a type specifier for a declaration on the same line. We
+            // keep it verbatim whenever the identifier is followed by a
+            // declarator token: '(' (function def/decl), ';' / '[' / ',' / '='
+            // / ':' (variable, array, multi-declaration, initializer, bitfield).
+            // Without this, an object-like type macro like #define VOS_UINT32
+            // unsigned int in the global set gets replaced with `0;` and the
+            // declaration breaks into a bare identifier / subscript / comma
+            // expression — `VOS_UINT32 g_x;` → `0; g_x;` drops the variable
+            // node entirely (only `= initializer` variables were rescued by
+            // the assignment-expression extraction path). Statement-level
+            // macros sit on their OWN line (sameLine === false here), so this
+            // same-line declarator check never traps a real statement macro.
             let afterIdent = nextIdx + 1;
             while (afterIdent < n && isIdentPart(at(afterIdent))) afterIdent++;
-            // Skip whitespace (but not newlines — '(' must be on the same line)
+            // Skip whitespace (but not newlines — the declarator must be on
+            // the same line as the identifier).
             while (afterIdent < n && (at(afterIdent) === ' ' || at(afterIdent) === '\t')) afterIdent++;
-            if (afterIdent < n && at(afterIdent) === '(') {
+            const declTok = afterIdent < n ? at(afterIdent) : '';
+            if (declTok === '(' || declTok === ';' || declTok === '[' || declTok === ',' || declTok === '=' || declTok === ':') {
               out.push(source.slice(i, invEnd));
               i = invEnd;
               continue;
