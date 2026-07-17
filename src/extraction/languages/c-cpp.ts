@@ -473,24 +473,50 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
         // macro, next line → replace).  Restricted to object-like (invEnd === j)
         // so function-like `MACRO(args) bar;` on one line still replaces.
         //
-        // Restricted to SINGLE-CHARACTER macro names: the pollution this guard
+        // Guard 2a — SINGLE-CHARACTER macro names: the pollution this guard
         // fixes is single-letter template params (T/U/V) that got `#define`d by
-        // a test file and leaked into globalMacroNames.  Multi-char object-like
-        // macros followed by an identifier (`OB_INLINE void`, `const uint8_t`,
-        // `inline T`) are storage-class/qualifier prefixes, NOT types — keeping
-        // them verbatim makes tree-sitter misparse the leading identifier as the
-        // function name, collapsing the declaration.  Replacing them with `0;`
-        // (the pre-fix behavior) terminates the prefix as a no-op statement and
-        // lets tree-sitter cleanly parse the real declaration that follows.
-        if (invEnd === j && ident.length === 1) {
+        // a test file and leaked into globalMacroNames.  For single-char macros,
+        // ANY same-line identifier signals a declaration context (return type,
+        // variable type) — keep verbatim.  Variable declarations whose type
+        // macro gets replaced (`T var = ...` → `; var = ...`) are still rescued
+        // by the expression_statement→assignment_expression extraction path, so
+        // a broad keep here is safe.
+        //
+        // Guard 2b — MULTI-CHARACTER macro names: when the next identifier on
+        // the same line is immediately followed by '(' (function definition /
+        // declaration pattern, e.g. `VOS_UINT32 func(int x)`), keep the macro
+        // verbatim as a return type.  Without this, `#define VOS_UINT32 uint32_t`
+        // in the global macro set causes preParse to replace the return type
+        // with `0;`, and tree-sitter-c then misparses `func(int x) {}` as a
+        // `macro_type_specifier` instead of `function_definition`, dropping the
+        // function entirely.  We only extend to the function-definition pattern
+        // (ident + '(') because storage-class macros like `OB_INLINE` followed
+        // by `void func()` have the TYPE name (void) — not the function name —
+        // as the next identifier; those must still be replaced or tree-sitter
+        // misparses the storage-class name as the function name.
+        if (invEnd === j) {
           let sameLine = true;
           for (let k = invEnd; k < nextIdx; k++) {
             if (at(k) === '\n') { sameLine = false; break; }
           }
           if (sameLine && nextTok && isIdentStart(nextTok)) {
-            out.push(source.slice(i, invEnd));
-            i = invEnd;
-            continue;
+            if (ident.length === 1) {
+              // Guard 2a: single-char macro + same-line identifier → declaration
+              out.push(source.slice(i, invEnd));
+              i = invEnd;
+              continue;
+            }
+            // Guard 2b: multi-char macro + same-line identifier → check for
+            // function-definition pattern (identifier immediately followed by '(')
+            let afterIdent = nextIdx + 1;
+            while (afterIdent < n && isIdentPart(at(afterIdent))) afterIdent++;
+            // Skip whitespace (but not newlines — '(' must be on the same line)
+            while (afterIdent < n && (at(afterIdent) === ' ' || at(afterIdent) === '\t')) afterIdent++;
+            if (afterIdent < n && at(afterIdent) === '(') {
+              out.push(source.slice(i, invEnd));
+              i = invEnd;
+              continue;
+            }
           }
         }
 
