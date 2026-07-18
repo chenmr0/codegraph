@@ -2758,6 +2758,7 @@ export class TreeSitterExtractor {
         }
       }
       this.nodeStack.pop();
+      this.emitTypedefAliasNodes(node, structNode, name);
       return true;
     }
 
@@ -2785,6 +2786,7 @@ export class TreeSitterExtractor {
         }
       }
       this.nodeStack.pop();
+      this.emitTypedefAliasNodes(node, enumNode, name);
       return true;
     }
 
@@ -2829,7 +2831,68 @@ export class TreeSitterExtractor {
         }
       }
     }
+    this.emitTypedefAliasNodes(node, typeAliasNode, name);
     return false;
+  }
+
+  /**
+   * 收集 C/C++ typedef 声明的全部名字：type_definition 的直接 type_identifier
+   * 子节点（即各 typedef 别名），以及 struct_specifier / enum_specifier 的标签名。
+   * tree-sitter 的 type_definition.declarator 字段只指向第一个 declarator，
+   * 其余别名是兄弟 type_identifier 子节点、tag 在 specifier 的 name 字段，
+   * 它们都没有字段指向 —— 本方法把它们一次性收集齐，供补建节点。
+   */
+  private collectTypedefNames(node: SyntaxNode): { aliases: string[]; tag?: string } {
+    const aliases: string[] = [];
+    let tag: string | undefined;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'type_identifier') {
+        const name = getNodeText(child, this.source);
+        if (name) aliases.push(name);
+      } else if (child.type === 'struct_specifier' || child.type === 'enum_specifier') {
+        const nameNode = getChildByField(child, 'name');
+        if (nameNode && nameNode.type === 'type_identifier') {
+          tag = getNodeText(nameNode, this.source);
+        }
+      }
+    }
+    return { aliases, tag };
+  }
+
+  /**
+   * 为 typedef 多别名声明补建被丢弃的别名 / 标签节点（不加边、不设 signature）。
+   * 主节点（第一个 declarator，已含字段）由 extractTypeAlias 上游逻辑建立，
+   * primaryName 为主名；此处仅为「其余别名」和「struct/enum tag 名」各建一个
+   * kind=type_alias 节点，使其能被 query / codegraph_search / codegraph_node 命中。
+   * 节点定位取自 type_definition 整块，故 codegraph_node <别名> 带 includeCode 时
+   * 可看到完整 typedef 声明源码。
+   *
+   * 仅作用于 C / C++ / ObjC 的 type_definition —— 只有 typedef 支持「多 declarator」
+   * 语法；其他语言的 type_alias（Kotlin/Swift/Scala/Luau/Go）是单别名，多收会把
+   * 别名的值类型误当声明名。与主名相同者（如 `typedef struct Foo {...} Foo;`）去重跳过。
+   */
+  private emitTypedefAliasNodes(
+    typeDefNode: SyntaxNode,
+    primaryNode: Node | null,
+    primaryName: string,
+  ): void {
+    if (!primaryNode) return;
+    if (this.language !== 'c' && this.language !== 'cpp' && this.language !== 'objc') return;
+    if (typeDefNode.type !== 'type_definition') return;
+
+    const { aliases, tag } = this.collectTypedefNames(typeDefNode);
+    const seen = new Set<string>([primaryName]);
+    const emit = (aliasName: string) => {
+      if (!aliasName || seen.has(aliasName)) return;
+      seen.add(aliasName);
+      this.createNode('type_alias', aliasName, typeDefNode, {
+        isExported: primaryNode.isExported,
+      });
+    };
+    for (const a of aliases) emit(a);
+    if (tag) emit(tag);
   }
 
   /**
