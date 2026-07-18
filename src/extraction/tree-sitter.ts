@@ -575,20 +575,40 @@ export class TreeSitterExtractor {
       !this.isInsideFunctionNode() &&
       !this.isInsideCompoundStatement(node)
     ) {
-      this.extractVariable(node);
-      // C/C++: a declaration may wrap an ERROR child — stacked attribute
-      // macros (e.g. `EXTERN VOS_VOID TlmFree(...) CALLEE_RET_ALIGN();`) can
-      // cause tree-sitter-c to nest the function_declarator inside an ERROR
-      // that is itself inside a declaration. extractVariable skips ERROR
-      // children (not in DECLARATOR_TYPES), so don't skipChildren in that
-      // case — let the body walker reach the ERROR so the ERROR-node rescue
-      // below can extract the function declaration.
-      const hasErrorWithFd =
+      // C/C++ split-prototype stray half: this declaration is the spurious
+      // `(declaration type:(type_identifier) declarator:(identifier) (MISSING
+      // ";"))` that tree-sitter-c emits as the FIRST half of a misparsed
+      // `<TYPE1> <TYPE2> *name(args);` prototype. The real function name lives
+      // in the following expression_statement's call_expression, which the
+      // expression_statement rescue recovers as a function node. Suppress the
+      // bogus variable here (it would be named after the second type macro,
+      // e.g. LDAP_CHAR) so the prototype yields exactly one function node.
+      // A real variable declaration never has a MISSING ";" + a following
+      // `*name(args)` expression_statement, so this never suppresses a
+      // legitimate symbol. See isBrokenTypeSplitDeclaration /
+      // rescueSplitPrototypeExprStmt.
+      if (
         (this.language === 'c' || this.language === 'cpp') &&
-        node.namedChildren.some(
-          (c) => c.type === 'ERROR' && c.descendantsOfType('function_declarator').length > 0
-        );
-      skipChildren = !hasErrorWithFd;
+        this.isBrokenTypeSplitDeclaration(node) &&
+        this.rescueSplitPrototypeExprStmt(node.nextNamedSibling) !== null
+      ) {
+        skipChildren = true;
+      } else {
+        this.extractVariable(node);
+        // C/C++: a declaration may wrap an ERROR child — stacked attribute
+        // macros (e.g. `EXTERN VOS_VOID TlmFree(...) CALLEE_RET_ALIGN();`) can
+        // cause tree-sitter-c to nest the function_declarator inside an ERROR
+        // that is itself inside a declaration. extractVariable skips ERROR
+        // children (not in DECLARATOR_TYPES), so don't skipChildren in that
+        // case — let the body walker reach the ERROR so the ERROR-node rescue
+        // below can extract the function declaration.
+        const hasErrorWithFd =
+          (this.language === 'c' || this.language === 'cpp') &&
+          node.namedChildren.some(
+            (c) => c.type === 'ERROR' && c.descendantsOfType('function_declarator').length > 0
+          );
+        skipChildren = !hasErrorWithFd;
+      }
     }
     // C/C++: expression_statement at translation_unit/namespace scope is a
     // misparse caused by unrecognized macros before a variable declaration
@@ -618,6 +638,37 @@ export class TreeSitterExtractor {
             this.createNode('variable', name, left, {
               signature: initSignature,
               isExported,
+            });
+          }
+        }
+      }
+      else if (inner?.type === 'pointer_expression') {
+        // C/C++ split-prototype rescue: `<TYPE1> <TYPE2> *name(args);` where
+        // the leading type macros are neither in the project global `#define`
+        // set (so preParse doesn't replace them) nor recognized types gets
+        // split by tree-sitter-c into a spurious `(declaration … (MISSING
+        // ";"))` (stray variable, suppressed by the variableTypes guard) +
+        // this `expression_statement(pointer_expression(call_expression name
+        // args))`. The function name lands in the call_expression and would be
+        // lost. Reconstruct the function declaration from the combined span of
+        // the broken declaration + this expression_statement. An
+        // expression_statement at file/namespace scope is always error
+        // recovery (never valid C/C++), so this never traps real code. See
+        // isBrokenTypeSplitDeclaration / rescueSplitPrototypeExprStmt.
+        const name = this.rescueSplitPrototypeExprStmt(node);
+        if (name) {
+          const prev = node.previousNamedSibling;
+          if (prev && this.isBrokenTypeSplitDeclaration(prev)) {
+            // prev is the minimal broken `type_identifier identifier (MISSING
+            // ";")` immediately preceding this expression_statement, so the
+            // span is just the one prototype line. Cap defensively (matches
+            // the assignment_expression rescue's slice cap) so a pathological
+            // pair can never yield an oversized signature node.
+            let signature = this.source.slice(prev.startIndex, node.endIndex);
+            if (signature.length > 2000) signature = signature.slice(0, 2000) + '...';
+            this.createNode('function', name, node, {
+              signature,
+              isDeclaration: true,
             });
           }
         }
@@ -1110,6 +1161,66 @@ export class TreeSitterExtractor {
       parent = parent.parent;
     }
     return false;
+  }
+
+  /**
+   * C/C++: recognize the spurious FIRST half of a split-prototype misparse.
+   *
+   * When a function prototype of the form `<TYPE1> <TYPE2> *name(args);` has
+   * leading type macros that are neither in the project's global `#define`
+   * set (so `preprocessStatementMacros` leaves them in place) nor recognized
+   * types, tree-sitter-c can't commit to a declaration parse and splits the
+   * line into:
+   *
+   *   (declaration type:(type_identifier) declarator:(identifier) (MISSING ";"))
+   *   (expression_statement (pointer_expression (call_expression name args)))
+   *
+   * The first node is this broken declaration — the first type macro becomes
+   * a `type_identifier`, the second a bare `identifier` "variable", and the
+   * terminator is a MISSING ";". The real function name lives in the
+   * `call_expression` of the following `expression_statement` and would be
+   * lost without rescue. See `rescueSplitPrototypeExprStmt`.
+   *
+   * The MISSING ";" is the hallmark: a real declaration never lacks its
+   * terminator, so this never matches a legitimate variable.
+   */
+  private isBrokenTypeSplitDeclaration(node: SyntaxNode | null): boolean {
+    if (!node || node.type !== 'declaration') return false;
+    let hasTypeIdentifier = false;
+    let hasBareIdentifierDeclarator = false;
+    for (const c of node.namedChildren) {
+      if (c.type === 'type_identifier') hasTypeIdentifier = true;
+      else if (c.type === 'identifier') hasBareIdentifierDeclarator = true;
+    }
+    if (!hasTypeIdentifier || !hasBareIdentifierDeclarator) return false;
+    return node.children.some((c) => c.isMissing && c.type === ';');
+  }
+
+  /**
+   * C/C++: detect the SECOND half of the split-prototype misparse — an
+   * `expression_statement` at translation_unit / namespace scope whose single
+   * expression is `*name(args)`, i.e. a `pointer_expression` wrapping a
+   * `call_expression` whose function is a plain (non-keyword) `identifier`
+   * with an `argument_list`. Returns the function name when this node is the
+   * rescue target, else null. The caller has already gated scope (not inside
+   * class / function / compound).
+   *
+   * An `expression_statement` at file/namespace scope is never valid C/C++ —
+   * it is always tree-sitter error recovery — so this pattern is specific to
+   * the misparse.
+   */
+  private rescueSplitPrototypeExprStmt(node: SyntaxNode | null): string | null {
+    if (!node || node.type !== 'expression_statement') return null;
+    const inner = node.namedChild(0);
+    if (inner?.type !== 'pointer_expression') return null;
+    const call = inner.namedChild(0);
+    if (call?.type !== 'call_expression') return null;
+    const fn = call.namedChild(0);
+    const argList = call.namedChild(1);
+    if (fn?.type !== 'identifier' || argList?.type !== 'argument_list') return null;
+    const name = getNodeText(fn, this.source);
+    if (!name || C_CPP_KEYWORD_NAMES.has(name)) return null;
+    return name;
   }
 
   /**
