@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `codegraph query <name>` now does a **strict, case-sensitive exact match** on the symbol name by default: it returns only nodes whose name is byte-equal to what you typed, with no prefix, substring, or fuzzy fallback. Previously `query` shared the FTS → substring → edit-distance chain used by the MCP search, so `codegraph query getUser` also returned `GetUser`, `getuser`, `getUserById`, and near-miss typo matches. Pass `--fuzzy` to opt back into that old prefix / substring / edit-distance behavior. The `kind:` / `lang:` / `path:` field filters still narrow the result in either mode. The MCP `codegraph_search` tool is unchanged and keeps its forgiving fuzzy behavior for agents.
+
 ### Security
 
 - Closed a path-traversal hole where a symbolic link inside an indexed project that pointed *outside* the project root could make CodeGraph serve that out-of-root file's contents (for example a file under your home directory) to the AI agent. CodeGraph now resolves symlinks when validating file access and refuses to read anything whose real location is outside the project, while still allowing symlinks that stay within it. Thanks @sulthonzh. (#527)

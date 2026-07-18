@@ -849,12 +849,13 @@ program
  */
 program
   .command('query <search>')
-  .description('Search for symbols in the codebase')
+  .description('Search for symbols by exact, case-sensitive name match (use --fuzzy for the old prefix/substring/edit-distance behavior)')
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
   .option('-j, --json', 'Output as JSON')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean }) => {
+  .option('--fuzzy', 'Use fuzzy matching (FTS prefix + substring + edit-distance fallback) instead of strict exact match')
+  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean; fuzzy?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -867,9 +868,15 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
+      // Default is a strict case-sensitive exact match: `query getUser`
+      // returns only nodes named exactly `getUser` — no prefix / case-folded
+      // / fuzzy fallback. Pass `--fuzzy` to opt back into the FTS → substring
+      // → edit-distance chain. `kind:` / `lang:` / `path:` filters narrow
+      // either mode.
       const rawResults = cg.searchNodes(search, {
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
+        exact: !options.fuzzy,
       });
 
       // Mirror the MCP search down-rank so the CLI also surfaces the

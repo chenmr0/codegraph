@@ -416,6 +416,15 @@ export interface SearchOptions {
 
   /** Whether search is case-sensitive */
   caseSensitive?: boolean;
+
+  /**
+   * Strict exact-match lookup: return only nodes whose `name` is byte-equal
+   * to the query — case-sensitive, with no prefix / substring / edit-distance
+   * fallback. The CLI `query` command enables this so a symbol lookup isn't
+   * buried under prefix or case-folded matches. When false (default) the
+   * FTS → LIKE → fuzzy chain is used.
+   */
+  exact?: boolean;
 }
 
 /**

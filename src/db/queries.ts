@@ -804,6 +804,16 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
+    // Strict exact-match mode: skip the FTS/LIKE/fuzzy chain entirely and
+    // return only nodes whose name is byte-equal to the text portion. Used by
+    // the CLI `query` command so a symbol lookup is case-sensitive and isn't
+    // buried under prefix / case-folded / fuzzy matches. Path: filters still
+    // apply as a hard gate; the field-only (no text) case falls through to
+    // the filter-only path below.
+    if (options.exact) {
+      return this.searchNodesExact(text, { kinds, languages, limit, offset, pathFilters });
+    }
+
     // First try FTS5 with prefix matching
     let results = text
       ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
@@ -895,6 +905,61 @@ export class QueryBuilder {
     }
 
     return results;
+  }
+
+  /**
+   * Strict exact-match lookup used when `SearchOptions.exact` is set.
+   *
+   * Returns only nodes whose `name` is byte-equal to `text` — SQLite's
+   * default BINARY collation is case-sensitive, and `idx_nodes_name` covers
+   * the equality probe, so this is O(log n) with no FTS / LIKE / edit-distance
+   * fallback. `kind`/`language` narrow the set; `path:` filters apply as a
+   * hard gate after the SQL fetch. When `text` is empty (a field-only query
+   * like `kind:function`), it falls back to the filter-only path so those
+   * queries still work in exact mode.
+   */
+  private searchNodesExact(
+    text: string,
+    options: {
+      kinds?: NodeKind[];
+      languages?: Language[];
+      limit: number;
+      offset: number;
+      pathFilters: string[];
+    }
+  ): SearchResult[] {
+    const { kinds, languages, limit, offset, pathFilters } = options;
+
+    const applyPathGate = (results: SearchResult[]): SearchResult[] => {
+      if (pathFilters.length === 0) return results;
+      const lowered = pathFilters.map((p) => p.toLowerCase());
+      return results.filter((r) => {
+        const fp = r.node.filePath.toLowerCase();
+        return lowered.some((p) => fp.includes(p));
+      });
+    };
+
+    // No text (e.g. `kind:function` alone) — reuse the filter-only path.
+    if (!text) {
+      const filtered = this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      return applyPathGate(filtered).slice(0, limit);
+    }
+
+    let sql = 'SELECT * FROM nodes WHERE name = ?';
+    const params: (string | number)[] = [text];
+    if (kinds && kinds.length > 0) {
+      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+      params.push(...kinds);
+    }
+    if (languages && languages.length > 0) {
+      sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+      params.push(...languages);
+    }
+    sql += ' ORDER BY file_path, start_line LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+    return applyPathGate(rows.map((row) => ({ node: rowToNode(row), score: 1 })));
   }
 
   /**
