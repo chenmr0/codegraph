@@ -58,9 +58,20 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
       const innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (innerName) {
-        // Unwrap parenthesized_declarator: int (foo)(int) → foo
+        // Unwrap parenthesized_declarator: int (foo)(int) → foo, and the
+        // function-pointer typedef/field form `T (*foo)(int)` whose
+        // parenthesized_declarator wraps a pointer_declarator — keep unwrapping
+        // pointer/reference declarators so we return `foo`, not `*foo` (without
+        // this, `typedef VOS_BOOL (*FnPtr)(void)` and struct fields
+        // `VOS_UINT32 (*cb)(void)` are named `*FnPtr` / `(*cb)`, which exact-name
+        // query never matches).
         if (innerName.type === 'parenthesized_declarator') {
-          const innermost = getChildByField(innerName, 'declarator') || innerName.namedChild(0);
+          let innermost = getChildByField(innerName, 'declarator') || innerName.namedChild(0);
+          while (innermost && (innermost.type === 'pointer_declarator' || innermost.type === 'reference_declarator')) {
+            const inner = getChildByField(innermost, 'declarator') || innermost.namedChild(0);
+            if (!inner) break;
+            innermost = inner;
+          }
           return innermost ? getNodeText(innermost, source) : getNodeText(innerName, source);
         }
         return getNodeText(innerName, source);
@@ -298,12 +309,20 @@ export class TreeSitterExtractor {
   // function nodes caused by macros defined in OTHER files (via #include).
   private globalMacroNames: Set<string> | null = null;
 
-  constructor(filePath: string, source: string, language?: Language, globalMacroNames?: Set<string>) {
+  // Project-wide bodyless object-like macro names (`#define NAME` with empty
+  // body) collected by the orchestrator's pre-scan. Passed to preParse so the
+  // C/C++ preprocessor transform can blank them (they expand to nothing),
+  // turning `typedef SAFE VOS_BOOL (*FnPtr)(...)` into the clean shape
+  // tree-sitter parses correctly. See c-cpp.ts preprocessStatementMacros.
+  private globalBodylessMacroNames: Set<string> | null = null;
+
+  constructor(filePath: string, source: string, language?: Language, globalMacroNames?: Set<string>, bodylessMacroNames?: Set<string>) {
     this.filePath = filePath;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
     this.globalMacroNames = globalMacroNames ?? null;
+    this.globalBodylessMacroNames = bodylessMacroNames ?? null;
   }
 
   /**
@@ -358,7 +377,7 @@ export class TreeSitterExtractor {
       // this.source so downstream getNodeText reads the same bytes the parser
       // saw (identical outside the blanked directive lines).
       if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source, this.globalMacroNames ?? undefined);
+        this.source = this.extractor.preParse(this.source, this.globalMacroNames ?? undefined, this.globalBodylessMacroNames ?? undefined);
       }
       this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
@@ -1845,7 +1864,11 @@ export class TreeSitterExtractor {
         }
         if (innerDecl) {
           let idNode: SyntaxNode | null = innerDecl;
-          while (idNode && (idNode.type === 'pointer_declarator' || idNode.type === 'reference_declarator')) {
+          // Unwrap parenthesized_declarator (function-pointer field
+          // `T (*cb)(void)` → parenthesized_declarator wraps a
+          // pointer_declarator) in addition to pointer/reference, so we land on
+          // the field_identifier `cb` instead of naming the node `(*cb)`.
+          while (idNode && (idNode.type === 'pointer_declarator' || idNode.type === 'reference_declarator' || idNode.type === 'parenthesized_declarator')) {
             idNode = getChildByField(idNode, 'declarator') || idNode.namedChild(0) || null;
           }
           if (idNode) {
@@ -5707,7 +5730,8 @@ export function extractFromSource(
   source: string,
   language?: Language,
   frameworkNames?: string[],
-  globalMacroNames?: Set<string>
+  globalMacroNames?: Set<string>,
+  bodylessMacroNames?: Set<string>
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -5749,7 +5773,7 @@ export function extractFromSource(
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
   } else {
-    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage, globalMacroNames);
+    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage, globalMacroNames, bodylessMacroNames);
     result = extractor.extract();
   }
 

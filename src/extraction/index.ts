@@ -660,6 +660,13 @@ export class ExtractionOrchestrator {
    * (via #include). Cached on the orchestrator; reset each indexAll run.
    */
   private globalMacroNames: Set<string> | null = null;
+  // Project-wide bodyless object-like macro names (`#define NAME` with empty
+  // body, NOT function-like). Collected in the same pre-scan as
+  // globalMacroNames and passed to extractFromSource so the C/C++ preParse
+  // transform can blank them (they expand to nothing), unbreaking
+  // `typedef SAFE TYPE (*FnPtr)(...)` style declarations. Cached/reset
+  // alongside globalMacroNames.
+  private globalBodylessMacroNames: Set<string> | null = null;
   /**
    * Accumulates source file paths of nodes whose incoming edges couldn't be
    * re-wired during a sync pass. Populated by storeExtractionResult, consumed
@@ -763,6 +770,15 @@ export class ExtractionOrchestrator {
     const fileList = files ?? scanDirectory(this.rootDir);
     const macroRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)/gm;
     const names = new Set<string>();
+    // Bodyless object-like macros: `#define NAME` with an EMPTY body (only
+    // whitespace/comments follow on the line), and NOT function-like
+    // (`NAME(` immediately after — `(?!\s*\()` rejects both `NAME(` and
+    // the object-with-body form `NAME (x)`). These expand to nothing and are
+    // blanked by preParse so prefix-attribute macros like `SAFE`/`BORROW` in
+    // `typedef SAFE VOS_BOOL (*FnPtr)(...)` don't push tree-sitter into the
+    // error-recovery path that buries the real name.
+    const bodylessRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)(?!\s*\()(?:[ \t]*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/[ \t]*)?)?[ \t]*$/gm;
+    const bodyless = new Set<string>();
 
     // Filter to C/C++/ObjC files — only these have the preprocessor and
     // the macro-misparse-as-function problem.
@@ -796,10 +812,17 @@ export class ExtractionOrchestrator {
           const name = m[1];
           if (name) names.add(name);
         }
+        let bm: RegExpExecArray | null;
+        bodylessRegex.lastIndex = 0;
+        while ((bm = bodylessRegex.exec(content)) !== null) {
+          const name = bm[1];
+          if (name) bodyless.add(name);
+        }
       }
     }
 
     this.globalMacroNames = names;
+    this.globalBodylessMacroNames = bodyless;
     return names;
   }
 
@@ -860,7 +883,9 @@ export class ExtractionOrchestrator {
     // defined in header A, used in file B → tree-sitter has no
     // preprocessor and would otherwise emit a fake function node in B).
     this.globalMacroNames = null;
+    this.globalBodylessMacroNames = null;
     const globalMacroNames = await this.ensureGlobalMacroNames(files);
+    const globalBodylessMacroNames = this.globalBodylessMacroNames!;
 
     if (signal?.aborted) {
       return {
@@ -1021,13 +1046,13 @@ export class ExtractionOrchestrator {
       // recycle/crash the worker is destroyed and ensureWorker() respawns,
       // so this re-sends automatically. Sending once (rather than with
       // every parse message) avoids serializing 10k+ names per file.
-      if (globalMacroNames.size > 0) {
+      if (globalMacroNames.size > 0 || globalBodylessMacroNames.size > 0) {
         await new Promise<void>((resolve, reject) => {
           parseWorker!.once('message', (msg: { type: string }) => {
             if (msg.type === 'global-macros-set') resolve();
             else reject(new Error(`Unexpected message: ${msg.type}`));
           });
-          parseWorker!.postMessage({ type: 'set-global-macros', macroNames: [...globalMacroNames] });
+          parseWorker!.postMessage({ type: 'set-global-macros', macroNames: [...globalMacroNames], bodylessMacroNames: [...globalBodylessMacroNames] });
         });
       }
 
@@ -1061,7 +1086,8 @@ export class ExtractionOrchestrator {
           content,
           detectLanguage(filePath, content),
           frameworkNames,
-          globalMacroNames
+          globalMacroNames,
+          globalBodylessMacroNames
         );
       }
 
@@ -1522,7 +1548,7 @@ export class ExtractionOrchestrator {
     // route nodes / middleware / etc.
     const frameworkNames = this.ensureDetectedFrameworks();
     const globalMacroNames = await this.ensureGlobalMacroNames();
-    const result = extractFromSource(relativePath, content, language, frameworkNames, globalMacroNames);
+    const result = extractFromSource(relativePath, content, language, frameworkNames, globalMacroNames, this.globalBodylessMacroNames ?? undefined);
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {

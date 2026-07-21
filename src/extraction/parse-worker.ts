@@ -60,8 +60,12 @@ const parseCounts = new Map<Language, number>();
 // 10k+ names with every parse message). Persists for the worker's lifetime;
 // on recycle/crash, ensureWorker() re-sends it.
 let globalMacroNames: Set<string> | undefined = undefined;
+// Bodyless object-like macro names (`#define NAME` with empty body) collected
+// by the orchestrator's pre-scan. Passed to extractFromSource so the C/C++
+// preParse transform can blank them. See c-cpp.ts preprocessStatementMacros.
+let globalBodylessMacroNames: Set<string> | undefined = undefined;
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; bodylessMacroNames?: string[]; grammarBuffers?: Record<string, Uint8Array> }) => {
   if (msg.type === 'load-grammars') {
     // grammarBuffers (when the orchestrator pre-read them) let a spawn/respawn
     // load grammars from memory instead of re-reading from disk — on slow
@@ -72,6 +76,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
     parentPort!.postMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'set-global-macros') {
     globalMacroNames = new Set(msg.macroNames);
+    globalBodylessMacroNames = new Set(msg.bodylessMacroNames);
     parentPort!.postMessage({ type: 'global-macros-set' });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
@@ -83,7 +88,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
     const t0 = performance.now();
     try {
       const language = detectLanguage(filePath!, content);
-      const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames, globalMacroNames);
+      const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames, globalMacroNames, globalBodylessMacroNames);
 
       // Periodic parser reset to reclaim WASM heap memory
       const count = (parseCounts.get(language) ?? 0) + 1;

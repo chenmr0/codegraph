@@ -157,8 +157,8 @@ function replaceWithSemicolon(text: string): string {
  * input (replaced text is space-padded, newlines kept) so node positions
  * and getNodeText remain correct.
  */
-function preprocessStatementMacros(source: string, macroNames?: Set<string>): string {
-  if (!macroNames || macroNames.size === 0) return source;
+function preprocessStatementMacros(source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>): string {
+  if ((!macroNames || macroNames.size === 0) && (!bodylessMacroNames || bodylessMacroNames.size === 0)) return source;
 
   const isIdentStart = (c: string) => /[A-Za-z_]/.test(c);
   const isIdentPart = (c: string) => /[A-Za-z0-9_]/.test(c);
@@ -333,6 +333,34 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
       // Otherwise fall through (an inline `#` outside directives — rare).
     }
 
+    // Bodyless object-like macro (`#define NAME` with empty body, NOT
+    // function-like `NAME(...)`) expands to nothing, so blank the whole
+    // identifier to spaces (byte-length preserved — keeps offsets/line
+    // numbers exact so getNodeText stays correct). These only ever appear as
+    // attribute/placeholder prefixes in valid C (a bodyless macro used as a
+    // value would already expand to invalid C), so blanking is safe in any
+    // declarator / parameter / initializer context. NOT gated by parenDepth
+    // or braceStack: `BORROW` inside a parameter list `T * BORROW name`
+    // (parenDepth=1) must still be blanked, and a bodyless macro inside an
+    // initializer list also expands to nothing. String/char/comment/
+    // preprocessor-directive contexts are already skipped above. This runs
+    // before the statement-level `0;` logic so a bodyless prefix macro like
+    // `typedef SAFE VOS_BOOL (*FnPtr)(...)` is reduced to the clean
+    // `typedef  VOS_BOOL (*FnPtr)(...)` shape that tree-sitter parses
+    // correctly (without it, `SAFE` is taken as the `type` and the real name
+    // is buried in an error-recovery `parameter_list`, so the typedef is
+    // named `VOS_BOOL (*FnPtr)` and never matches an exact-name query).
+    if (bodylessMacroNames && bodylessMacroNames.size > 0 && isIdentStart(c)) {
+      let j = i + 1;
+      while (j < n && isIdentPart(at(j))) j++;
+      const ident = source.slice(i, j);
+      if (bodylessMacroNames.has(ident)) {
+        out.push(' '.repeat(j - i));
+        i = j;
+        continue;
+      }
+    }
+
     // Track paren depth.
     if (c === '(') { parenDepth++; out.push(c); i++; continue; }
     if (c === ')') { parenDepth--; out.push(c); i++; continue; }
@@ -367,7 +395,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
 
-      if (macroNames.has(ident)) {
+      if (macroNames && macroNames.has(ident)) {
         // Find the end of the invocation: function-like MACRO(...) includes
         // through the matching `)`; object-like MACRO is just the identifier.
         let invEnd = j;
@@ -458,6 +486,25 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>): st
         // file gets corrupted into `template<class ;>` / `; *x`, collapsing
         // entire template classes into one misparsed function node.
         if (nextTok === '*' || nextTok === '&' || nextTok === '>' || nextTok === '.') {
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+        // Function-pointer declarator — the identifier is used as the return
+        // type of a `TYPE (*name)(params)` / `TYPE (*name[N])(params)` field or
+        // typedef, NOT a statement-level macro invocation.  The matching `)` of
+        // the (mis)detected `TYPE( ... )` invocation is immediately followed by
+        // `(` — the parameter list of the function pointer — which never occurs
+        // after a real statement macro (open5gs SWITCH/CASE/DEFAULT/END are
+        // followed by `{`/`;`/EOL, never `(`).  Without this guard, a project-
+        // wide `#define TYPE ...` (object- OR function-like) puts TYPE in the
+        // global macro set, and `TYPE (*name)(params)` in an unrelated file
+        // gets replaced with `0;`, destroying the field and the enclosing
+        // struct/typedef — the "small module works, full build returns
+        // nothing" regression.  Trade-off: the very rare `MACRO(a)(b)` double-
+        // call statement macro is kept verbatim (tree-sitter still parses it as
+        // a call_expression, no worse than before).
+        if (nextTok === '(') {
           out.push(source.slice(i, invEnd));
           i = invEnd;
           continue;
