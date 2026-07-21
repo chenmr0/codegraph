@@ -6,6 +6,7 @@
  */
 
 import { parentPort } from 'worker_threads';
+import { performance } from 'node:perf_hooks';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import type { Language, ExtractionResult } from '../types';
@@ -60,15 +61,26 @@ const parseCounts = new Map<Language, number>();
 // on recycle/crash, ensureWorker() re-sends it.
 let globalMacroNames: Set<string> | undefined = undefined;
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[] }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; grammarBuffers?: Record<string, Uint8Array> }) => {
   if (msg.type === 'load-grammars') {
-    await loadGrammarsForLanguages(msg.languages!);
+    // grammarBuffers (when the orchestrator pre-read them) let a spawn/respawn
+    // load grammars from memory instead of re-reading from disk — on slow
+    // storage each respawn's grammar re-read otherwise amplifies the very I/O
+    // contention that caused the respawn (#1231). Missing languages fall back
+    // to the worker's own disk read inside loadGrammarsForLanguages.
+    await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
     parentPort!.postMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'set-global-macros') {
     globalMacroNames = new Set(msg.macroNames);
     parentPort!.postMessage({ type: 'global-macros-set' });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
+    // The worker's own clock for the parse — immune to main-thread stalls
+    // (sync SQLite store on slow disks) that make the main-thread timer fire
+    // before an already-delivered result is processed. Surfaced as `parseMs`
+    // so the orchestrator can tell a real timeout from a stalled main thread
+    // and accept the late result instead of false-rejecting (#1231).
+    const t0 = performance.now();
     try {
       const language = detectLanguage(filePath!, content);
       const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames, globalMacroNames);
@@ -80,7 +92,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
         resetParser(language);
       }
 
-      parentPort!.postMessage({ type: 'parse-result', id, result });
+      parentPort!.postMessage({ type: 'parse-result', id, result, parseMs: performance.now() - t0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
 
@@ -94,6 +106,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       parentPort!.postMessage({
         type: 'parse-result',
         id,
+        parseMs: performance.now() - t0,
         result: {
           nodes: [],
           edges: [],

@@ -7,6 +7,7 @@
  */
 
 import * as path from 'path';
+import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
@@ -174,11 +175,62 @@ export async function initGrammars(): Promise<void> {
 }
 
 /**
+ * Resolve the on-disk path of a language's grammar WASM file.
+ *
+ * Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
+ * tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+ * ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
+ * 0.25 (drops nested calls/imports on every file after the first); we
+ * vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
+ * build (ABI 13) has no primary-constructor support and parses
+ * `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+ * vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+ * primary constructors natively.
+ */
+export function resolveWasmPath(lang: GrammarLanguage): string {
+  const wasmFile = WASM_GRAMMAR_FILES[lang];
+  return (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp')
+    ? path.join(__dirname, 'wasm', wasmFile)
+    : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+}
+
+/**
+ * Pre-read grammar WASM bytes for the given languages, keyed by language.
+ * Forwarding these to a worker's `load-grammars` message lets a spawn/respawn
+ * load grammars from memory instead of re-reading them from disk — on slow
+ * storage each respawn's grammar re-read otherwise amplifies the very I/O
+ * contention that caused the respawn (#1231). Best-effort: a language whose
+ * WASM can't be read is simply omitted, and the worker falls back to its own
+ * disk read via {@link resolveWasmPath}.
+ */
+export async function readGrammarWasmBytes(languages: Language[]): Promise<Record<string, Uint8Array>> {
+  const out: Record<string, Uint8Array> = {};
+  const langs = [...new Set(languages)].filter(
+    (lang): lang is GrammarLanguage => lang in WASM_GRAMMAR_FILES
+  );
+  await Promise.all(langs.map(async (lang) => {
+    try {
+      out[lang] = await fsp.readFile(resolveWasmPath(lang));
+    } catch {
+      // best-effort — worker falls back to its own disk read
+    }
+  }));
+  return out;
+}
+
+/**
  * Load grammar WASM files for specific languages only.
  * Skips languages that are already loaded or have no WASM grammar.
  * Must be called after initGrammars().
+ *
+ * `wasmBytes` (when provided) supplies in-memory WASM bytes keyed by language,
+ * so a worker that already has the bytes can load from memory instead of
+ * re-reading the file from disk — see {@link readGrammarWasmBytes}.
  */
-export async function loadGrammarsForLanguages(languages: Language[]): Promise<void> {
+export async function loadGrammarsForLanguages(
+  languages: Language[],
+  wasmBytes?: Record<string, Uint8Array>
+): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
   }
@@ -194,21 +246,8 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   // Load grammars sequentially to avoid web-tree-sitter WASM race condition on Node 20+
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
-    const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
-      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
-      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
-      // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
-      // build (ABI 13) has no primary-constructor support and parses
-      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
-      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp')
-        ? path.join(__dirname, 'wasm', wasmFile)
-        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
-      const language = await WasmLanguage.load(wasmPath);
+      const language = await WasmLanguage.load(wasmBytes?.[lang] ?? resolveWasmPath(lang));
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

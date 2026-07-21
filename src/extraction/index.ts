@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, EXTENSION_MAP } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, EXTENSION_MAP } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -38,8 +38,33 @@ const FILE_IO_BATCH_SIZE = 10;
  * Maximum time (ms) to wait for a single file to parse in the worker thread.
  * If tree-sitter hangs or WASM runs out of memory, this prevents the entire
  * indexing run from freezing. The worker is restarted after a timeout.
+ *
+ * Slow storage (HDD, network folders) can need a larger budget; override with
+ * the `CODEGRAPH_PARSE_TIMEOUT_MS` env var (non-numeric / non-positive falls
+ * back to the default 10s).
  */
-const PARSE_TIMEOUT_MS = 10_000;
+const PARSE_TIMEOUT_MS = resolveParseTimeoutMs(process.env.CODEGRAPH_PARSE_TIMEOUT_MS);
+
+/**
+ * A worker is only killed once a parse has gone this many × its budget with no
+ * result. The base timer firing is NOT proof the parse is still running: after
+ * a long synchronous main-thread stretch (the SQLite store on slow disks,
+ * issue #1231) Node runs the timers phase before the poll phase, so the
+ * expired timer fires BEFORE an already-delivered `parse-result` is processed.
+ * Killing at the base timeout therefore produced false timeouts on parses that
+ * finished instantly (even 0-byte files). Instead the base timer only marks
+ * the job late; a result that arrives before this backstop is accepted, and
+ * only a worker that stays silent the whole window is treated as hung.
+ */
+const HARD_KILL_MULTIPLIER = 3;
+
+function resolveParseTimeoutMs(envVal: string | undefined): number {
+  if (envVal !== undefined && envVal !== '') {
+    const n = Number(envVal);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  return 10_000;
+}
 
 /**
  * Number of files to parse before recycling the worker thread.
@@ -784,7 +809,14 @@ export class ExtractionOrchestrator {
   async indexAll(
     onProgress?: (progress: IndexProgress) => void,
     signal?: AbortSignal,
-    verbose?: boolean
+    verbose?: boolean,
+    /**
+     * Writer-side WAL backpressure gate from {@link WalCheckpointValve}. Called
+     * at a between-transactions boundary (before each store); returns null
+     * while WAL growth is under the hard cap, or a promise the writer awaits
+     * when the disk is saturated and the WAL needs a full backfill (#1231).
+     */
+    walBackpressure?: () => Promise<void> | null
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
@@ -869,10 +901,21 @@ export class ExtractionOrchestrator {
     const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
     const useWorker = fs.existsSync(parseWorkerPath);
     let WorkerClass: typeof import('worker_threads').Worker | null = null;
+    // Pre-read grammar WASM bytes once so every (re)spawn loads grammars from
+    // memory instead of re-reading from disk — on slow storage each respawn's
+    // grammar re-read otherwise amplifies the very I/O contention that caused
+    // the respawn (#1231). Best-effort: a missing language falls back to the
+    // worker's own disk read. Reused across spawns by closure.
+    let grammarBuffers: Record<string, Uint8Array> | undefined;
 
     if (useWorker) {
       const { Worker } = await import('worker_threads');
       WorkerClass = Worker;
+      try {
+        grammarBuffers = await readGrammarWasmBytes(neededLanguages);
+      } catch {
+        grammarBuffers = undefined; // best-effort — worker reads from disk
+      }
     } else {
       // In-process fallback: load grammars locally
       await loadGrammarsForLanguages(neededLanguages);
@@ -881,7 +924,11 @@ export class ExtractionOrchestrator {
     // --- Worker lifecycle management ---
     // The worker can crash (OOM in WASM) or hang on pathological files.
     // We track pending parse promises and handle both cases:
-    //   - Timeout: terminate + restart the worker, reject the timed-out request
+    //   - Timeout: the base timer marks the job late and arms a hard-kill
+    //     backstop; a late result that arrives in the grace window is
+    //     ACCEPTED (the main thread was stalled, not the parse — #1231).
+    //     Only a worker silent past the full window is killed + the request
+    //     rejected and re-attempted in the retry pass.
     //   - Crash: reject all pending promises, restart for remaining files
     let parseWorker: import('worker_threads').Worker | null = null;
     let nextId = 0;
@@ -890,25 +937,48 @@ export class ExtractionOrchestrator {
       resolve: (result: ExtractionResult) => void;
       reject: (err: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      /** The base timer fired with no result yet — accept a late result, kill at the backstop. */
+      timerExpired: boolean;
+      hardKillTimer?: ReturnType<typeof setTimeout>;
+      /** Full budget for this parse (base timeout + size scaling), for late-result logging. */
+      budgetMs?: number;
+      filePath: string;
     }>();
 
     function rejectAllPending(reason: string): void {
       for (const [id, pending] of pendingParses) {
         clearTimeout(pending.timer);
+        if (pending.hardKillTimer) clearTimeout(pending.hardKillTimer);
         pendingParses.delete(id);
         pending.reject(new Error(reason));
       }
     }
 
     function attachWorkerHandlers(w: import('worker_threads').Worker): void {
-      w.on('message', (msg: { type: string; id?: number; result?: ExtractionResult }) => {
+      w.on('message', (msg: { type: string; id?: number; result?: ExtractionResult; parseMs?: number }) => {
         if (msg.type === 'parse-result' && msg.id !== undefined) {
           const pending = pendingParses.get(msg.id);
-          if (pending) {
-            clearTimeout(pending.timer);
-            pendingParses.delete(msg.id);
-            pending.resolve(msg.result!);
+          if (!pending) return; // stale (post-recycle / already settled)
+          pendingParses.delete(msg.id);
+          clearTimeout(pending.timer);
+          if (pending.hardKillTimer) clearTimeout(pending.hardKillTimer);
+          if (pending.timerExpired) {
+            // The base timer fired before this result was processed. That almost
+            // always means the MAIN THREAD was stalled (sync SQLite store on
+            // slow disks) while the parse itself finished long ago — the worker's
+            // own clock (parseMs) tells the two apart. Either way the result is
+            // here and valid: accept it instead of the old behaviour (kill worker
+            // + reject), which turned every main-thread stall into false
+            // timeouts and dropped files (#1231).
+            const parseMs = typeof msg.parseMs === 'number' ? Math.round(msg.parseMs) : undefined;
+            const detail = parseMs === undefined
+              ? ''
+              : parseMs < (pending.budgetMs ?? PARSE_TIMEOUT_MS)
+                ? ` (parse took ${parseMs}ms in-worker — the main thread was stalled, not the parse)`
+                : ` (parse genuinely took ${parseMs}ms)`;
+            log(`Late parse-result accepted: ${pending.filePath}${detail}`);
           }
+          pending.resolve(msg.result!);
         }
       });
 
@@ -937,13 +1007,14 @@ export class ExtractionOrchestrator {
       parseWorker = new WorkerClass!(parseWorkerPath);
       attachWorkerHandlers(parseWorker);
 
-      // Load grammars in the new worker
+      // Load grammars in the new worker. grammarBuffers (pre-read above) make
+      // this a memory load instead of a per-spawn disk read.
       await new Promise<void>((resolve, reject) => {
         parseWorker!.once('message', (msg: { type: string }) => {
           if (msg.type === 'grammars-loaded') resolve();
           else reject(new Error(`Unexpected message: ${msg.type}`));
         });
-        parseWorker!.postMessage({ type: 'load-grammars', languages: neededLanguages });
+        parseWorker!.postMessage({ type: 'load-grammars', languages: neededLanguages, grammarBuffers });
       });
 
       // Send project-wide macro names once to the new worker. On
@@ -1012,18 +1083,36 @@ export class ExtractionOrchestrator {
       );
 
       return new Promise<ExtractionResult>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          pendingParses.delete(id);
-          log(`TIMEOUT: ${filePath} exceeded ${timeoutMs}ms — killing worker`);
-          // Reject FIRST — worker.terminate() can hang if WASM is stuck
-          parseWorker = null;
-          workerParseCount = 0;
-          reject(new Error(`Parse timed out after ${timeoutMs}ms`));
-          // Fire-and-forget: kill the stuck worker in the background
-          worker.terminate().catch(() => {});
-        }, timeoutMs);
+        const entry = { resolve, reject, timer: null as unknown as ReturnType<typeof setTimeout>, timerExpired: false, budgetMs: timeoutMs, filePath, hardKillTimer: undefined as ReturnType<typeof setTimeout> | undefined };
 
-        pendingParses.set(id, { resolve, reject, timer });
+        // Base timer: does NOT prove the parse is still running. After a long
+        // synchronous main-thread stretch (the SQLite store on slow disks),
+        // Node services the timers phase before the poll phase, so this fires
+        // BEFORE an already-delivered `parse-result` is processed. Mark the
+        // job late (a result that shows up is accepted in attachWorkerHandlers)
+        // and arm the hard-kill backstop for a worker that's genuinely hung.
+        const timer = setTimeout(() => {
+          if (!pendingParses.has(id)) return;
+          const graceMs = timeoutMs * (HARD_KILL_MULTIPLIER - 1);
+          log(`TIMEOUT: ${filePath} exceeded ${timeoutMs}ms with no result — waiting up to ${graceMs}ms more for a late result before killing the worker`);
+          entry.timerExpired = true;
+          entry.hardKillTimer = setTimeout(() => {
+            if (!pendingParses.has(id)) return;
+            log(`TIMEOUT: ${filePath} got no result after ${timeoutMs * HARD_KILL_MULTIPLIER}ms — killing worker`);
+            pendingParses.delete(id);
+            // Reject FIRST — worker.terminate() can hang if WASM is stuck
+            parseWorker = null;
+            workerParseCount = 0;
+            reject(new Error(`Parse timed out after ${timeoutMs * HARD_KILL_MULTIPLIER}ms`));
+            // Fire-and-forget: kill the stuck worker in the background
+            worker.terminate().catch(() => {});
+          }, graceMs);
+          entry.hardKillTimer.unref?.();
+        }, timeoutMs);
+        timer.unref?.();
+        entry.timer = timer;
+
+        pendingParses.set(id, entry);
         worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames });
       });
     }
@@ -1122,6 +1211,12 @@ export class ExtractionOrchestrator {
 
         processed++;
 
+        // WAL backpressure: a between-transactions boundary, safe to pause the
+        // writer here if the disk is saturated and the WAL needs a full
+        // backfill (#1231). null = under the hard cap, no wait.
+        const bp = walBackpressure?.();
+        if (bp) await bp;
+
         // Store in database on main thread (SQLite is not thread-safe)
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
@@ -1207,6 +1302,8 @@ export class ExtractionOrchestrator {
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
+          const bp = walBackpressure?.();
+          if (bp) await bp;
           this.storeExtractionResult(filePath, content, language, stats, result);
 
           const idx = errors.indexOf(errEntry);
@@ -1258,6 +1355,8 @@ export class ExtractionOrchestrator {
           if (result.nodes.length > 0 || result.errors.length === 0) {
             const language = detectLanguage(filePath, fullContent);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
+            const bp = walBackpressure?.();
+            if (bp) await bp;
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
 
             const idx = errors.indexOf(errEntry);

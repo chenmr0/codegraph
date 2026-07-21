@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Full indexing on slow storage — a mechanical drive, a network folder, or a virtualized disk — is now dramatically faster and no longer drops files or fills the disk. SQLite's default WAL auto-checkpoint was deferred during a bulk index (it re-wrote hot pages over and over, the bulk of disk I/O on slow storage), and a checkpoint valve now bounds WAL growth off-thread so deferral can't run away; the writer pauses for a full backfill only when the disk genuinely can't keep up. A parse-timeout race that fired *before* an already-finished parse was processed (after a long synchronous store on a slow disk) stopped silently dropping files — a late result is now accepted and the worker is only killed when it's truly hung. Grammar WASM is pre-read into memory so each worker respawn loads from memory instead of re-reading from the very disk whose I/O contention caused the respawn. `CODEGRAPH_WAL_VALVE_MB` tunes the WAL growth threshold, `CODEGRAPH_PARSE_TIMEOUT_MS` raises the parse budget for pathologically slow disks, and `CODEGRAPH_NO_WAL_DEFER=1` opts out of WAL deferral entirely. On SSD there is no behavior change.
+
 ### Breaking Changes
 
 - `codegraph query <name>` now does a **strict, case-sensitive exact match** on the symbol name by default: it returns only nodes whose name is byte-equal to what you typed, with no prefix, substring, or fuzzy fallback. Previously `query` shared the FTS → substring → edit-distance chain used by the MCP search, so `codegraph query getUser` also returned `GetUser`, `getuser`, `getUserById`, and near-miss typo matches. Pass `--fuzzy` to opt back into that old prefix / substring / edit-distance behavior. The `kind:` / `lang:` / `path:` field filters still narrow the result in either mode. The MCP `codegraph_search` tool is unchanged and keeps its forgiving fuzzy behavior for agents.

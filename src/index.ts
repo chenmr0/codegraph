@@ -23,6 +23,7 @@ import {
   FindRelevantContextOptions,
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
+import { WalCheckpointValve } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -342,76 +343,118 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
-        const result = await this.orchestrator.indexAll(options.onProgress, options.signal, options.verbose);
 
-        // Re-detect frameworks now that the index is populated. The resolver
-        // is constructed with createResolver() before any files exist, so
-        // framework resolvers whose detect() consults the indexed file list
-        // (e.g. UIKit/SwiftUI scanning for imports, swift-objc-bridge looking
-        // for both Swift and ObjC files) all return false on that initial pass
-        // and silently drop themselves. Re-initializing here gives them a
-        // chance to see the actual project before resolution runs.
-        if (result.success && result.filesIndexed > 0) {
-          this.resolver.initialize();
-          // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
-          // before resolution so updated names show up in subsequent reads.
-          this.resolver.runPostExtract();
+        // WAL checkpoint valve (#1231): defer auto-checkpointing during the bulk
+        // index so the store is pure sequential WAL appends instead of re-writing
+        // hot B-tree/FTS pages over and over (the difference between 45s and 19+
+        // minutes on HDD-class storage). The valve bounds WAL growth off-thread
+        // so deferral can't fill the disk. Only in WAL mode — on the WASM backend
+        // (or any mount where WAL couldn't be enabled) getJournalMode() is 'delete'
+        // and the whole mechanism is a no-op. CODEGRAPH_NO_WAL_DEFER=1 disables it.
+        const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+        let priorAutocheckpoint = 0;
+        const walValve = deferWal
+          ? new WalCheckpointValve(this.db, undefined, undefined, options.verbose ? (msg: string) => console.log(`[wal] ${msg}`) : undefined)
+          : null;
+        if (deferWal) {
+          priorAutocheckpoint = this.db.getWalAutocheckpoint();
+          this.db.setWalAutocheckpoint(0);
+          walValve!.start();
         }
 
-        // Resolve references to create call/import/extends edges
-        if (result.success && result.filesIndexed > 0) {
-          // Get count without loading all refs into memory
-          const unresolvedCount = this.queries.getUnresolvedReferencesCount();
+        try {
+          const result = await this.orchestrator.indexAll(
+            options.onProgress,
+            options.signal,
+            options.verbose,
+            walValve ? () => walValve.backpressure() : undefined
+          );
 
-          options.onProgress?.({
-            phase: 'resolving',
-            current: 0,
-            total: unresolvedCount,
-          });
+          // Phase-boundary fold: backfill the ENTIRE WAL before resolution's first
+          // read, so the next phase never pages a bulk-write-sized WAL on the main
+          // thread (the post-parse read against a multi-GB WAL is what blew the
+          // #850 watchdog's 60s window in the #1231 repro).
+          if (walValve) await walValve.foldNow();
 
-          await this.resolveReferencesBatched((current, total) => {
+          // Re-detect frameworks now that the index is populated. The resolver
+          // is constructed with createResolver() before any files exist, so
+          // framework resolvers whose detect() consults the indexed file list
+          // (e.g. UIKit/SwiftUI scanning for imports, swift-objc-bridge looking
+          // for both Swift and ObjC files) all return false on that initial pass
+          // and silently drop themselves. Re-initializing here gives them a
+          // chance to see the actual project before resolution runs.
+          if (result.success && result.filesIndexed > 0) {
+            this.resolver.initialize();
+            // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
+            // before resolution so updated names show up in subsequent reads.
+            this.resolver.runPostExtract();
+          }
+
+          // Resolve references to create call/import/extends edges
+          if (result.success && result.filesIndexed > 0) {
+            // Get count without loading all refs into memory
+            const unresolvedCount = this.queries.getUnresolvedReferencesCount();
+
             options.onProgress?.({
               phase: 'resolving',
-              current,
-              total,
+              current: 0,
+              total: unresolvedCount,
             });
-          });
 
-          // Second pass: chained calls whose method lives on a supertype the
-          // receiver conforms to (protocol-extension / inherited / default-
-          // interface). Needs the implements/extends edges the main pass just
-          // built, so it runs after resolution (#750).
-          this.resolver.resolveChainedCallsViaConformance();
+            await this.resolveReferencesBatched((current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            });
+
+            // Second pass: chained calls whose method lives on a supertype the
+            // receiver conforms to (protocol-extension / inherited / default-
+            // interface). Needs the implements/extends edges the main pass just
+            // built, so it runs after resolution (#750).
+            this.resolver.resolveChainedCallsViaConformance();
+          }
+
+          // Stop the valve and drain any in-flight/backpressure, then refresh
+          // planner stats + checkpoint the WAL after bulk writes. runMaintenance
+          // now runs the checkpoint off-thread so a multi-GB WAL can't block the
+          // main thread past the watchdog window. Best-effort; never load-bearing.
+          if (walValve) { walValve.stop(); await walValve.drain(); }
+          if (result.success && result.filesIndexed > 0) {
+            await this.db.runMaintenance();
+          }
+
+          // The orchestrator only sees extraction-phase counts; resolution and
+          // synthesizer edges (often >50% of the graph on JVM repos) come later.
+          // Recompute against the DB so the CLI summary reports the true totals.
+          if (result.success && result.filesIndexed > 0) {
+            const after = this.queries.getNodeAndEdgeCount();
+            result.nodesCreated = after.nodes - before.nodes;
+            result.edgesCreated = after.edges - before.edges;
+          }
+
+          // Stamp the index with the engine that built it, so `codegraph status`
+          // and `codegraph upgrade` can recommend a re-index when the running
+          // engine produces richer extraction than the one on disk. Only on a
+          // real full index — a sync touches a subset, so it must NOT advance the
+          // extraction stamp (the bulk would still be stale). See extraction-version.ts.
+          if (result.success && result.filesIndexed > 0) {
+            try {
+              this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+              this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+            } catch { /* metadata is advisory — never fail an index over it */ }
+          }
+
+          return result;
+        } finally {
+          // Restore auto-checkpointing even on error/abort so subsequent syncs
+          // don't keep running with it disabled.
+          if (walValve) { walValve.stop(); await walValve.drain(); }
+          if (deferWal) {
+            try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* best-effort */ }
+          }
         }
-
-        // Refresh planner stats + checkpoint the WAL after bulk writes.
-        // Cheap and non-blocking; never load-bearing for correctness.
-        if (result.success && result.filesIndexed > 0) {
-          this.db.runMaintenance();
-        }
-
-        // The orchestrator only sees extraction-phase counts; resolution and
-        // synthesizer edges (often >50% of the graph on JVM repos) come later.
-        // Recompute against the DB so the CLI summary reports the true totals.
-        if (result.success && result.filesIndexed > 0) {
-          const after = this.queries.getNodeAndEdgeCount();
-          result.nodesCreated = after.nodes - before.nodes;
-          result.edgesCreated = after.edges - before.edges;
-        }
-
-        // Stamp the index with the engine that built it, so `codegraph status`
-        // and `codegraph upgrade` can recommend a re-index when the running
-        // engine produces richer extraction than the one on disk. Only on a
-        // real full index — a sync touches a subset, so it must NOT advance the
-        // extraction stamp (the bulk would still be stale). See extraction-version.ts.
-        if (result.success && result.filesIndexed > 0) {
-          try {
-            this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
-            this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
-          } catch { /* metadata is advisory — never fail an index over it */ }
-        }
-
-        return result;
       } finally {
         this.fileLock.release();
       }
@@ -534,7 +577,7 @@ export class CodeGraph {
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
-          this.db.runMaintenance();
+          await this.db.runMaintenance();
         }
 
         return result;
