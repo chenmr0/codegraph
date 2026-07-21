@@ -43,9 +43,13 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
   if (nameNode) {
-    // Unwrap pointer_declarator(s) for C/C++ pointer return types
+    // Unwrap pointer_declarator / reference_declarator(s) for C/C++ pointer /
+    // reference return types. Without unwrapping `reference_declarator`, a
+    // reference-return function (`T& get_instance()`) is named `& get_instance()`
+    // — the `&` and trailing `()` stay in the declarator text, so calls never
+    // resolve by name. Covers `&`, `&&`, and `*&` chains (loop keeps unwrapping).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator') {
+    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
@@ -1826,10 +1830,18 @@ export class TreeSitterExtractor {
       // its out-of-line .cpp definition by the decl-def synthesizer. Without
       // this the declaration is dropped and only the .cpp definition exists.
       const fnDeclField = getChildByField(node, 'declarator');
-      if (fnDeclField && fnDeclField.type === 'function_declarator') {
-        let innerDecl = getChildByField(fnDeclField, 'declarator');
+      // Unwrap pointer/reference declarators first: a reference-return member
+      // declaration (`static T& instance();`) is wrapped as
+      // reference_declarator → function_declarator → field_identifier, so the raw
+      // declarator field is a reference_declarator, not a function_declarator.
+      let fnDecl = fnDeclField;
+      while (fnDecl && (fnDecl.type === 'pointer_declarator' || fnDecl.type === 'reference_declarator')) {
+        fnDecl = getChildByField(fnDecl, 'declarator') || fnDecl.namedChild(0) || null;
+      }
+      if (fnDecl && fnDecl.type === 'function_declarator') {
+        let innerDecl = getChildByField(fnDecl, 'declarator');
         if (!innerDecl) {
-          innerDecl = fnDeclField.namedChildren.find(c => c.type === 'field_identifier') ?? null;
+          innerDecl = fnDecl.namedChildren.find(c => c.type === 'field_identifier') ?? null;
         }
         if (innerDecl) {
           let idNode: SyntaxNode | null = innerDecl;
@@ -1857,9 +1869,12 @@ export class TreeSitterExtractor {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (!child) continue;
-        // Unwrap pointer/array declarators to reach the field_identifier
+        // Unwrap pointer/array/reference declarators to reach the field_identifier.
+        // A reference data member (`std::vector<int>& ref_member;`) is wrapped as
+        // reference_declarator → field_identifier; without unwrapping it the field
+        // is dropped (OceanBase `columns_` regression).
         let current: SyntaxNode | null = child;
-        while (current && (current.type === 'pointer_declarator' || current.type === 'array_declarator')) {
+        while (current && (current.type === 'pointer_declarator' || current.type === 'array_declarator' || current.type === 'reference_declarator')) {
           const inner: SyntaxNode | null = getChildByField(current, 'declarator') || current.namedChild(0) || null;
           current = inner;
         }
