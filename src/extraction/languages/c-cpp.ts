@@ -96,6 +96,56 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 /**
+ * Build a compact function signature for a C/C++ `function_definition` so
+ * `codegraph_search` can return parameters (every other language already
+ * does via `getSignature`; C/C++ was the lone gap on definitions — prototypes
+ * set their signature inline in the walker). Returns `retType name(params)`
+ * (e.g. `int foo(int a, char** b)`, `void Foo::bar(int x)`); constructors /
+ * destructors / conversion operators have no `type` field and yield just
+ * `name(params)`. Whitespace is folded and the result is capped at 200 chars
+ * so a heavily-templated signature doesn't dominate the one-line-per-result
+ * search output.
+ *
+ * Only invoked on `function_definition` nodes (definitions with a body) via
+ * extractFunction/extractMethod — the prototype path sets signature itself and
+ * is unaffected.
+ */
+function extractCppSignature(node: SyntaxNode, source: string): string | undefined {
+  const decl = getChildByField(node, 'declarator');
+  if (!decl) return undefined;
+  // Find the function_declarator inside the declarator tree. A pointer/
+  // reference return wraps the function_declarator (`int* foo(...)`,
+  // `std::vector<int>& bar(...)`), and tree-sitter doesn't always expose the
+  // inner one via the `declarator` field (a reference_declarator holds it as an
+  // untagged named child), so BFS the declarator subtree. Skip `parameter_list`
+  // so a callback parameter (`void (*cb)(int)`) — which has its own
+  // function_declarator — isn't mistaken for the function being signed.
+  let fd: SyntaxNode | undefined;
+  const queue: SyntaxNode[] = [decl];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    if (cur.type === 'function_declarator') { fd = cur; break; }
+    for (let i = 0; i < cur.namedChildCount; i++) {
+      const c = cur.namedChild(i);
+      if (c && c.type !== 'parameter_list') queue.push(c);
+    }
+  }
+  if (!fd) return undefined;
+  const typeNode = getChildByField(node, 'type');
+  // Slice from the return type's start through the parameter list's end so a
+  // pointer/reference return (`int* foo(...)`, `std::vector<int>& bar(...)`)
+  // keeps its `*`/`&` — those live in the declarator wrapping the name, not
+  // in the `type` field, so joining `type` + `function_declarator` text would
+  // drop them. Constructors/destructors/conversion operators have no `type`.
+  let sig = typeNode
+    ? source.substring(typeNode.startIndex, fd.endIndex)
+    : getNodeText(fd, source);
+  sig = sig.replace(/\s+/g, ' ').trim();
+  if (sig.length > 200) sig = sig.slice(0, 200) + '...';
+  return sig || undefined;
+}
+
+/**
  * Replace a statement-like macro invocation with `0;` (padded to the same
  * byte length, newlines preserved) so tree-sitter's C/C++ parser doesn't
  * close the enclosing compound_statement early. The original text is the
@@ -668,6 +718,7 @@ export const cExtractor: LanguageExtractor = {
   paramsField: 'parameters',
   preParse: preprocessStatementMacros,
   getReturnType: extractCppReturnType,
+  getSignature: extractCppSignature,
   isConst: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);
@@ -771,6 +822,7 @@ export const cppExtractor: LanguageExtractor = {
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
+  getSignature: extractCppSignature,
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;

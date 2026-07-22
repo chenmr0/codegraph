@@ -1875,11 +1875,13 @@ export class TreeSitterExtractor {
             const fnName = getNodeText(idNode, this.source);
             if (fnName) {
               const returnType = this.extractor.getReturnType?.(node, this.source);
+              const signature = this.extractor.getSignature?.(node, this.source);
               this.createNode('method', fnName, node, {
                 docstring,
                 visibility,
                 isStatic,
                 returnType,
+                signature,
                 isDeclaration: true,
               });
               return;
