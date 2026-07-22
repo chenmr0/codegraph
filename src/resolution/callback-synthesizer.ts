@@ -617,6 +617,74 @@ function cDeclDefEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * C/C++ variable declaration-definition pairing. An `extern` variable
+ * declaration in a header (`extern const T g_x[];`) and its definition in a
+ * .c/.cpp source file (`const T g_x[] = {...};`) are extracted as two separate
+ * nodes — the declaration with isDeclaration=true (see extractVariable's C/C++
+ * branch). Bridge them with a `defines` edge so codegraph_node's Trail and
+ * impact traversal connect the header signature to the definition, mirroring
+ * the function prototype↔definition bridge in cDeclDefEdges. Without this the
+ * two nodes are islands: the declaration has no body, the definition is where
+ * references resolve, so an agent that picks the declaration sees an empty
+ * Trail.
+ *
+ * STRICT MODE: only pair when the declaration is in a header file
+ * (.h/.hpp/.hh/.hxx) — the verifiable signal that it's a public extern meant
+ * to pair with a source definition. Same over-approximation trade-off as the
+ * function synthesizer: two unrelated same-named globals plus one header
+ * extern → both defs link the decl; reachability-correct.
+ */
+function cCppVarDeclDefEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const HEADER_EXTS = ['.h', '.hpp', '.hh', '.hxx', '.h++'];
+  const isHeader = (p: string) => {
+    const lower = p.toLowerCase();
+    return HEADER_EXTS.some((ext) => lower.endsWith(ext));
+  };
+
+  for (const kind of ['variable', 'constant'] as const) {
+    // Group variable/constant nodes by bare name.
+    const byName = new Map<string, Node[]>();
+    for (const n of queries.iterateNodesByKind(kind)) {
+      if ((n.language !== 'c' && n.language !== 'cpp') || !n.name) continue;
+      const arr = byName.get(n.name);
+      if (arr) arr.push(n);
+      else byName.set(n.name, [n]);
+    }
+
+    for (const [, nodes] of byName) {
+      const decls = nodes.filter((n) => n.isDeclaration === true);
+      const defs = nodes.filter((n) => n.isDeclaration !== true);
+      if (defs.length === 0 || decls.length === 0) continue;
+
+      for (const def of defs) {
+        for (const decl of decls) {
+          if (def.filePath === decl.filePath) continue;       // cross-file only
+          if (!isHeader(decl.filePath)) continue;             // strict: decl in header
+          const key = `${kind}:${def.id}>${decl.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          edges.push({
+            source: def.id,
+            target: decl.id,
+            kind: 'defines',
+            line: def.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'c-cpp-var-decl-def',
+              registeredAt: `${decl.filePath}:${decl.startLine}`,
+            },
+          });
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Phase 5.5: interface / abstract dispatch (Java, Kotlin). A call through an
  * injected interface (`@Autowired FooService svc; svc.list()`) or an abstract
  * base dispatches at runtime to the implementing class's override — a vtable
@@ -1843,6 +1911,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const cppEdges = cppOverrideEdges(queries);
   const cppDeclDef = cppDeclDefEdges(queries);
   const cDeclDef = cDeclDefEdges(queries);
+  const varDeclDef = cCppVarDeclDefEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
   const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
@@ -1868,6 +1937,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...cppEdges,
     ...cppDeclDef,
     ...cDeclDef,
+    ...varDeclDef,
     ...ifaceEdges,
     ...kotlinExpectActual,
     ...goGrpcEdges,

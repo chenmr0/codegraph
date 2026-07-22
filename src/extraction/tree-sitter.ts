@@ -2616,9 +2616,16 @@ export class TreeSitterExtractor {
         'parenthesized_declarator', 'qualified_identifier',
       ]);
 
-      // Track whether this declaration uses `extern`. Extern variables are
-      // skipped (the actual definition lives in another file), but extern
-      // function declarations are extracted — they're the public API signature.
+      // Track whether this declaration uses `extern`. An `extern` declarator
+      // WITH an initializer is a definition (C: `extern T g_x = ...;`), extracted
+      // normally. An `extern` declarator WITHOUT an initializer is extracted as a
+      // declaration node (isDeclaration=true) — mirroring how `extern` function
+      // prototypes are kept as the public API signature. This was previously
+      // skipped unconditionally on the assumption the definition lives in another
+      // indexed file, which lost the symbol entirely when that file wasn't
+      // indexed (or its parse was broken by macro pollution) — the header's
+      // `extern` decl was the only place the symbol existed. The header↔.c pair
+      // is bridged by a `defines` edge in cCppVarDeclDefEdges.
       const isExtern = this.hasStorageClass(node, 'extern');
 
       outer: for (const child of node.namedChildren) {
@@ -2672,8 +2679,12 @@ export class TreeSitterExtractor {
           continue;
         }
 
-        // Extern variable declarations: skip (the definition is elsewhere)
-        if (isExtern) continue;
+        // Extern variable declarations are no longer skipped — see the isExtern
+        // note above. A bodiless `extern` declarator becomes a declaration node
+        // (isDeclaration=true); an `extern` declarator with an initializer is a
+        // definition and is extracted as such.
+        const hasInit = child.type === 'init_declarator' && !!getChildByField(child, 'value');
+        const isExternDecl = isExtern && !hasInit;
 
         const resolved = unwrapDeclarator(child);
 
@@ -2701,6 +2712,7 @@ export class TreeSitterExtractor {
                       docstring,
                       signature: initSignature,
                       isExported,
+                      isDeclaration: isExternDecl,
                     });
                   }
                   break; // exit ERROR children loop — already created the node
@@ -2739,6 +2751,7 @@ export class TreeSitterExtractor {
           docstring,
           signature: initSignature,
           isExported,
+          isDeclaration: isExternDecl,
         });
       }
     } else {

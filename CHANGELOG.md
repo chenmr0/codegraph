@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- C/C++ header files no longer lose `extern` variable declarations such as `extern const T g_table[];`. The declaration is now kept as a findable symbol and linked to its definition in a `.c` / `.cpp` file, so the symbol appears in `codegraph query` and `codegraph_explore` even when the definition lives in a file that isn't indexed (a library source, or one whose parse was broken by macros). Previously these declarations were skipped on the assumption the definition was always indexed elsewhere, which made the symbol vanish entirely from large builds — the classic "small module finds it, full build returns nothing" case.
+
 ### New Features
 
 - Full indexing on slow storage — a mechanical drive, a network folder, or a virtualized disk — is now dramatically faster and no longer drops files or fills the disk. SQLite's default WAL auto-checkpoint was deferred during a bulk index (it re-wrote hot pages over and over, the bulk of disk I/O on slow storage), and a checkpoint valve now bounds WAL growth off-thread so deferral can't run away; the writer pauses for a full backfill only when the disk genuinely can't keep up. A parse-timeout race that fired *before* an already-finished parse was processed (after a long synchronous store on a slow disk) stopped silently dropping files — a late result is now accepted and the worker is only killed when it's truly hung. Grammar WASM is pre-read into memory so each worker respawn loads from memory instead of re-reading from the very disk whose I/O contention caused the respawn. `CODEGRAPH_WAL_VALVE_MB` tunes the WAL growth threshold, `CODEGRAPH_PARSE_TIMEOUT_MS` raises the parse budget for pathologically slow disks, and `CODEGRAPH_NO_WAL_DEFER=1` opts out of WAL deferral entirely. On SSD there is no behavior change.

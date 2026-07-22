@@ -330,9 +330,11 @@ describe('Sync Module', () => {
       cg = await CodeGraph.init(testDir);
       await cg.indexAll();
 
-      // Verify initial callers
+      // Verify initial callers. The header's `extern` decl is also a variable
+      // node (isDeclaration=true); references resolve to the definition, so
+      // query the definition node for callers.
       const varNode1 = (await cg.searchNodes('g_counter', { limit: 10 }))
-        .find(r => r.node.kind === 'variable');
+        .find(r => r.node.kind === 'variable' && !r.node.isDeclaration);
       expect(varNode1).toBeDefined();
       const callers1 = await cg.getCallers(varNode1!.node.id);
       const callerNames1 = callers1.map(c => c.node.name);
@@ -354,7 +356,7 @@ describe('Sync Module', () => {
 
       // Verify cross-file caller is still present after sync
       const varNode2 = (await cg.searchNodes('g_counter', { limit: 10 }))
-        .find(r => r.node.kind === 'variable');
+        .find(r => r.node.kind === 'variable' && !r.node.isDeclaration);
       expect(varNode2).toBeDefined();
       const callers2 = await cg.getCallers(varNode2!.node.id);
       const callerNames2 = callers2.map(c => c.node.name);
@@ -373,7 +375,7 @@ describe('Sync Module', () => {
       await cg.indexAll();
 
       const varNode1 = (await cg.searchNodes('g_counter', { limit: 10 }))
-        .find(r => r.node.kind === 'variable');
+        .find(r => r.node.kind === 'variable' && !r.node.isDeclaration);
       const callers1 = await cg.getCallers(varNode1!.node.id);
       expect(callers1.map(c => c.node.name)).toContain('read');
 
@@ -387,7 +389,7 @@ describe('Sync Module', () => {
       expect(result.filesModified).toBeGreaterThanOrEqual(1);
 
       const varNode2 = (await cg.searchNodes('g_counter', { limit: 10 }))
-        .find(r => r.node.kind === 'variable');
+        .find(r => r.node.kind === 'variable' && !r.node.isDeclaration);
       const callers2 = await cg.getCallers(varNode2!.node.id);
       expect(callers2.map(c => c.node.name)).toContain('read');
     });

@@ -3381,10 +3381,23 @@ void process() {
       expect(varNode).toBeUndefined();
     });
 
-    it('skips extern declaration', () => {
+    it('extracts extern declaration as a declaration node', () => {
       const result = extractFromSource('foo.h', 'extern int g_barcode;');
       const varNode = result.nodes.find(n => n.kind === 'variable');
-      expect(varNode).toBeUndefined();
+      expect(varNode).toBeDefined();
+      // A bodiless `extern` declaration is kept as a declaration node (the
+      // definition lives elsewhere); the header↔.c pair is bridged by a
+      // `defines` edge at resolution time. Previously skipped entirely, which
+      // lost the symbol when the definition file wasn't indexed.
+      expect(varNode!.isDeclaration).toBe(true);
+    });
+
+    it('extracts extern definition with initializer as a definition', () => {
+      // `extern T g_x = ...;` is a definition in C, not a declaration.
+      const result = extractFromSource('foo.c', 'extern int g_barcode = 5;');
+      const varNode = result.nodes.find(n => n.kind === 'variable' && n.name === 'g_barcode');
+      expect(varNode).toBeDefined();
+      expect(varNode!.isDeclaration).not.toBe(true);
     });
 
     it('does not extract local variable inside function', () => {
@@ -3661,8 +3674,8 @@ void process() {
       expect(refs.length).toBe(1);
     });
 
-    // Edge case: extern declaration in leaked body — still skipped
-    it('skips extern declaration in leaked body', () => {
+    // Edge case: extern declaration in leaked body — extracted as a declaration
+    it('extracts extern declaration in leaked body as a declaration node', () => {
       const result = extractFromSource('test.c',
         'void broken(void) {\n' +
         '  #define M(x) (x)\n' +
@@ -3672,7 +3685,8 @@ void process() {
       const varNode = result.nodes.find(
         n => n.kind === 'variable' && n.name === 'g_external'
       );
-      expect(varNode).toBeUndefined();
+      expect(varNode).toBeDefined();
+      expect(varNode!.isDeclaration).toBe(true);
     });
 
     // Edge case: static global variable in leaked body

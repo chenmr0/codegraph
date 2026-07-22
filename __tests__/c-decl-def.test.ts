@@ -531,3 +531,144 @@ void Shape::resize(int w, int h) {
     expect(edge.registeredAt).toMatch(/shape\.h:\d+/);
   });
 });
+
+describe('c-cpp-var-decl-def synthesizer (extern variable declarations)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'var-decldef-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const definesEdges = (db: any) =>
+    db
+      .prepare(
+        `SELECT s.name src_name, s.kind src_kind, s.file_path src_path,
+                s.is_declaration src_isdecl,
+                t.name tgt_name, t.kind tgt_kind, t.file_path tgt_path,
+                t.is_declaration tgt_isdecl,
+                e.provenance, json_extract(e.metadata,'$.synthesizedBy') synthBy
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE e.kind = 'defines'`
+      )
+      .all() as any[];
+
+  it('keeps the extern declaration AND the definition, bridged by a defines edge (user-reported regression)', async () => {
+    // Reproduces the reported case: a header with only an `extern` declaration
+    // of a TLV table. Previously the `extern` variable declaration was skipped
+    // unconditionally, so when the definition lived in a file that wasn't
+    // indexed (or whose parse was broken), the symbol vanished entirely. Now
+    // the declaration is kept as a node (isDeclaration=true) and bridged to the
+    // definition with a `defines` edge.
+    fs.writeFileSync(
+      path.join(dir, 'tlv.h'),
+      `typedef struct { int a; int b; } CBB_MSGCDC_TLV_TABLE_STRU;
+extern const CBB_MSGCDC_TLV_TABLE_STRU g_netm_astSrioTopoEsnRspTlvTbl[];
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'tlv.c'),
+      `#include "tlv.h"
+const CBB_MSGCDC_TLV_TABLE_STRU g_netm_astSrioTopoEsnRspTlvTbl[] = {
+  { 0, 0 },
+  { 1, 1 }
+};
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    // The symbol must now be findable from the header alone — the regression fix.
+    const found = await cg.searchNodes('g_netm_astSrioTopoEsnRspTlvTbl');
+    const nodes = found.map((r) => r.node);
+    const decl = nodes.find((n) => n.filePath.endsWith('tlv.h'));
+    const def = nodes.find((n) => n.filePath.endsWith('tlv.c'));
+    expect(decl).toBeDefined();
+    expect(def).toBeDefined();
+    expect(decl!.isDeclaration).toBe(true);
+    expect(def!.isDeclaration).not.toBe(true);
+
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db).filter(
+      (e) => e.src_name === 'g_netm_astSrioTopoEsnRspTlvTbl'
+    );
+    cg.close?.();
+
+    expect(edges.length).toBe(1);
+    expect(edges[0]!.src_path.endsWith('tlv.c')).toBe(true);
+    expect(edges[0]!.tgt_path.endsWith('tlv.h')).toBe(true);
+    expect(edges[0]!.src_isdecl).toBe(0);
+    expect(edges[0]!.tgt_isdecl).toBe(1);
+    expect(edges[0]!.synthBy).toBe('c-cpp-var-decl-def');
+  });
+
+  it('treats an extern declarator WITH an initializer as a definition (isDeclaration=false)', async () => {
+    // `extern T g_x = ...;` is a definition in C, not a declaration. It must
+    // be extracted as a definition node and NOT paired with itself.
+    fs.writeFileSync(
+      path.join(dir, 'init.c'),
+      `typedef struct { int a; } T;
+extern T g_with_init = { 1 };
+T g_with_init_ref = { 2 };
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const found = await cg.searchNodes('g_with_init');
+    const node = found.map((r) => r.node).find((n) => n.name === 'g_with_init');
+    expect(node).toBeDefined();
+    expect(node!.isDeclaration).not.toBe(true);
+    cg.close?.();
+  });
+
+  it('does NOT pair when the declaration is not in a header (strict mode)', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'decl.c'),
+      `typedef struct { int a; } T;
+extern T g_strict;
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'def.c'),
+      `typedef struct { int a; } T;
+T g_strict = { 0 };
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const edges = definesEdges(db).filter((e) => e.src_name === 'g_strict');
+    cg.close?.();
+
+    // Strict mode: the declaration must be in a .h file to be paired.
+    expect(edges.length).toBe(0);
+  });
+
+  it('keeps the extern declaration findable even when the definition file is absent', async () => {
+    // The core regression: header-only. The definition lives in a file that
+    // isn't indexed (e.g. a library .c). The `extern` declaration must still
+    // produce a findable node.
+    fs.writeFileSync(
+      path.join(dir, 'only.h'),
+      `typedef struct { int a; int b; } T;
+extern const T g_only_decl[];
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const found = await cg.searchNodes('g_only_decl');
+    const node = found.map((r) => r.node).find((n) => n.name === 'g_only_decl');
+    expect(node).toBeDefined();
+    expect(node!.isDeclaration).toBe(true);
+    cg.close?.();
+  });
+});
