@@ -2,9 +2,7 @@
 
 > 面向 C/C++ 千万行级存量代码仓的本地代码知识图谱 —— 让 AI 编程助手不再`grep → read → grep → read`地瞎摸，一次查询就能拿到符号、源码、调用链和影响面。
 
-CodeGraph-CPP 基于开源 [CodeGraph](https://github.com/colbymchenry/codegraph) 演进，专门补强 C/C++ 大仓场景：宏、全局变量、结构体字段、typedef、头文件原型、`#include`、`compile_commands.json` 等静态解析极易丢失或误抽的实体，在这里都被正确识别为图谱节点。所有数据 100% 留在本机，一个 `.codegraph/` 目录搞定。
-
-> 命令行入口仍为 `codegraph`。把代码里的包名/下载地址换成你自己的发布坐标即可。
+CodeGraph-CPP 基于开源 [CodeGraph](https://github.com/colbymchenry/codegraph) 演进，重点增强 C/C++ 大型代码仓的静态解析能力。项目针对宏、全局变量、结构体字段、`typedef`、头文件原型、`#include` 关系以及 `compile_commands.json` 编译信息等常见难点进行了专项适配，尽可能减少符号丢失、类型误判和跨文件关系断裂。所有数据 100% 留在本地，一个 `.codegraph/` 目录搞定。
 
 ---
 
@@ -60,9 +58,28 @@ mindmap
 | **更稳** | 改代码前先查影响面，谁调用、谁依赖、哪个测试受影响一目了然，告别盲改。 |
 | **更全** | C/C++ 容易丢的宏、全局变量、结构体字段、头文件原型都能被索引到，AI 拿到的上下文不再残缺。 |
 
+## 从代码到 AI 上下文
+
+```mermaid
+flowchart LR
+    S["C / C++ 源代码"] --> P["tree-sitter 解析"]
+    P --> E["提取符号实体"]
+    P --> R["提取调用、引用、包含等关系"]
+    E --> DB[("本地图谱数据库\n.codegraph/")]
+    R --> DB
+    DB --> CLI["CLI 查询"]
+    DB --> MCP["MCP 工具"]
+    MCP --> AI["AI 编程助手"]
+    CLI --> U["开发者"]
+
+    classDef default fill:#ffffff,stroke:#444,color:#111;
+    classDef store fill:#f2f2f2,stroke:#111,stroke-width:2px,color:#111;
+    class DB store;
+```
+
 ---
 
-## 常见使用场景
+## 使用场景
 
 ### 场景一：代码检索 —— “这东西在哪？谁在用？”
 
@@ -197,30 +214,34 @@ CodeGraph-CPP 是 CodeGraph 的 C/C++ 增强版，重点解决 C/C++ 大仓静�
 - ✅ **`codegraph query` 默认精确匹配**：按名搜索默认改为精确、区分大小写，不再连带返回大小写不同或名字相近的近似命中；需要模糊匹配时加 `--fuzzy`。MCP 的 `codegraph_search` 仍保留对 AI 友好的模糊匹配。
 - ✅ **宏处理不误伤合法代码**：初始化列表/聚合体里的宏、CRLF 续接的多行 `#define`、以及 `template<class T>` 等模板代码，都不会被宏处理破坏。
 
-> 简单说：上游 CodeGraph 在 C/C++ 上容易“丢字段、丢原型、把宏当函数、声明与定义断开”；CodeGraph-CPP 把这些洞补上了，并针对慢盘大仓做了索引提速。完整改动清单见 [C/C++ 增强发布说明](RELEASE_NOTES_C_CPP.md)。
+> 简单说：上游 CodeGraph 在 C/C++ 上容易“丢字段、丢原型、把宏当函数、声明与定义断开”；CodeGraph-CPP 把这些洞补上了。
 
 ---
 
 ## 它是怎么工作的
 
 ```mermaid
-flowchart LR
-    subgraph 建图["🛠️ 建图（一次性 / 增量）"]
-        direction TB
-        S1["📄 源代码"] --> S2["🔬 tree-sitter 解析"]
-        S2 --> S3["🧱 提取符号 + 关系"]
-        S3 --> S4[("🗄️ SQLite + FTS5<br/>.codegraph/")]
+flowchart TB
+    subgraph INDEX["索引阶段"]
+        S1["扫描源码和头文件"] --> S2["tree-sitter 语法解析"]
+        S2 --> S3["提取函数、变量、宏、类型和字段"]
+        S2 --> S4["提取调用、引用、包含和继承关系"]
+        S3 --> S5["符号归一化与跨文件关联"]
+        S4 --> S5
+        S5 --> DB[("SQLite / FTS5\n.codegraph/codegraph.db")]
     end
-    subgraph 使用["📡 使用（每次查询）"]
-        direction TB
-        Q1["🤖 AI 助手 / CLI 提问"] --> Q2["查图谱"]
-        Q2 --> Q3["⚡ 毫秒级返回<br/>符号+源码+调用链+影响面"]
+
+    subgraph QUERY["查询阶段"]
+        Q1["CLI 或 MCP 请求"] --> Q2["符号与关系查询"]
+        Q2 --> Q3["返回源码、调用链和影响面"]
     end
-    S4 -. "文件监听 ~2 秒自动同步" .-> S2
-    Q2 -. "只读查询" .-> S4
-    style 建图 fill:#74b9ff,stroke:#0984e3,color:#fff
-    style 使用 fill:#fd79a8,stroke:#e84393,color:#fff
-    style S4 fill:#a29bfe,stroke:#6c5ce7,color:#fff
+
+    DB --> Q2
+    W["文件变化"] -.触发增量同步.-> S1
+
+    classDef default fill:#ffffff,stroke:#444,color:#111;
+    classDef store fill:#f2f2f2,stroke:#111,stroke-width:2px,color:#111;
+    class DB store;
 ```
 
 整张图就是项目里一个 `.codegraph/codegraph.db` 文件，可以复制、备份、带走——完全便携。
@@ -240,14 +261,13 @@ int init_device(int id) {
 
 ```mermaid
 flowchart LR
-    V["📦 变量 g_count<br/>int g_count = 0"]:::var
-    F["🔧 函数 init_device<br/>int init_device(int id)"]:::fn
-    F -->|"读/写引用"| V
-    P["📄 原型 init_device<br/>（在 device.h 里）"]:::proto
-    P -.->|"识别为同一符号"| F
-    classDef var fill:#fd79a8,stroke:#e84393,color:#fff
-    classDef fn fill:#74b9ff,stroke:#0984e3,color:#fff
-    classDef proto fill:#a29bfe,stroke:#6c5ce7,color:#fff
+    P["函数原型\ninit_device(int id)"] -.声明与定义关联.-> F["函数定义\ninit_device(int id)"]
+    F -->|"读写引用"| V["全局变量\ng_count"]
+    C["其他函数"] -->|"调用"| F
+
+    classDef default fill:#ffffff,stroke:#444,color:#111;
+    classDef key fill:#f2f2f2,stroke:#111,stroke-width:2px,color:#111;
+    class F,V key;
 ```
 
 查 `init_device` 的调用方时，连只 `#include "device.h"` 的文件也能被追到——因为原型和定义已连成同一个节点。
@@ -301,7 +321,6 @@ AI 助手默认可用的 **7 个 MCP 工具**：
 
 ## 部署说明
 
-- 自包含 bundle 可携带 Node 运行时、tree-sitter WASM 和生产依赖，无 native addon。
 - 优先使用 Node 内置 `node:sqlite`，不可用时回退 `sql.js` WASM；`CODEGRAPH_FORCE_WASM=1` 可强制 WASM。
 - 无 `better-sqlite3` 依赖，降低低版本 glibc / 受限环境部署成本。
 - 文件监听不稳定时可用 `codegraph serve --mcp --no-watch`。
