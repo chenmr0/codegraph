@@ -1,126 +1,279 @@
-# CodeGraph-WX
+# CodeGraph-CPP
 
-CodeGraph-WX 是面向 C/C++ 千万行级代码仓的本地代码知识图谱增强项目，基于开源 [CodeGraph](https://github.com/colbymchenry/codegraph) 演进。项目通过静态解析源代码，将函数、变量、结构体、字段、枚举、typedef、include 等代码实体抽象为图谱节点，并建立调用、引用、包含、继承、跨文件依赖等关系，为 AI Agent、WEBIDE 和研发工具链提供符号级代码查询与影响面分析能力。
+> 面向 C/C++ 千万行级存量代码仓的本地代码知识图谱 —— 让 AI 编程助手不再`grep → read → grep → read`地瞎摸，一次查询就能拿到符号、源码、调用链和影响面。
 
-> 当前命令行入口仍为 `codegraph`。企业内部发布时，可将本文中的上游包名和下载地址替换为内部地址。
+CodeGraph-CPP 基于开源 [CodeGraph](https://github.com/colbymchenry/codegraph) 演进，专门补强 C/C++ 大仓场景：宏、全局变量、结构体字段、typedef、头文件原型、`#include`、`compile_commands.json` 等静态解析极易丢失或误抽的实体，在这里都被正确识别为图谱节点。所有数据 100% 留在本机，一个 `.codegraph/` 目录搞定。
 
-## 适用场景
+> 命令行入口仍为 `codegraph`。把代码里的包名/下载地址换成你自己的发布坐标即可。
 
-- 大型 C/C++ 存量代码理解和模块梳理
-- 函数调用链、接口影响面和跨文件依赖分析
-- 全局变量读写引用追踪
-- 结构体字段、typedef、枚举等符号级检索
-- AI 编码助手上下文增强，减少大文件读取和反复 `grep`
-- WEBIDE、嵌入式软件、系统软件、通信软件等企业研发环境集成
+---
 
-## 核心能力
+## 它能为你做什么？
 
-- **符号图谱构建**：提取文件、函数、方法、结构体、字段、变量、常量、枚举、类型别名等节点。
-- **关系建模**：建立 `contains`、`calls`、`references`、`imports`、`extends`、`implements` 等边。
-- **C/C++ 增强**：支持全局变量、常量、多声明器、指针/数组声明、结构体字段、C++ 类成员、typedef/using 和 include 提取。
-- **跨文件解析**：结合 include、`compile_commands.json`、常见 include 目录和名称匹配解析跨文件调用与引用。
-- **本地查询**：基于 SQLite + FTS5 存储，支持符号搜索、调用方/被调方、影响面、调用路径和任务上下文查询。
-- **增量同步**：基于文件大小、mtime 和内容哈希同步变更，MCP 模式下可自动监听文件变化。
-- **企业部署**：支持自包含 bundle、内置运行时、无 native addon 依赖，并提供 `node:sqlite` / `sql.js` WASM 后端。
+如果你有过下面任何一种经历，CodeGraph-CPP 就值得装：
 
-## C/C++ 增强点
+- 👉 问 AI“这个函数在哪被调用？改它会影响谁？”，看着它`grep`几十个文件、读十几个头文件，烧掉一堆 Token 才敢回答。
+- 👉 接手一个千万行的 C/C++ 老项目，找一条调用链要靠人肉跳转，跨文件跳到第三跳就迷路。
+- 👉 改一个全局变量或接口，心里没底——不知道哪个模块在用、哪个测试会挂。
+- 👉 想让 AI 生成新代码，但它给的上下文总是缺胳膊少腿，因为它根本没看全相关符号。
 
-CodeGraph-WX 相比上游重点补强 C/C++ 大仓场景：
+CodeGraph-CPP 把整个代码库提前解析成一张**可查询的图**：函数、变量、结构体、字段、宏、typedef、`#include` 都是节点，调用、引用、包含、继承都是边。AI（或你自己）直接查图，毫秒级拿到答案，**不再读文件**。
 
-- 宏提取：`#define MAX 100` 和 `#define LOG(fmt, ...) ...` 生成 `macro` 节点，可搜索和追踪引用
-- 宏误解析过滤：收集文件内所有 `#define` 名称，过滤 tree-sitter 因宏调用误解析出的虚假函数节点
-- 多宏修饰符函数名修复：`RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 func(VOS_VOID)` 正确提取 `func` 而非 `(VOS_VOID)`
-- 函数体泄漏检测与恢复：`#ifdef` 等预处理指令导致 tree-sitter 边界破裂时，将泄漏到函数体内的声明恢复到文件作用域
-- 嵌套结构体函数声明恢复：多行宏（如 `UV_HANDLE_FIELDS`）导致 struct 吞入后续函数声明时，递归恢复被包裹的函数节点
-- 函数声明/原型提取：`.h` 头文件中的 `int foo();` 和 `extern int bar(void);` 提取为函数节点，公共 API 完整可见
-- 文件级变量提取：`int g_counter = 0;`
-- 静态变量识别：`static int s_counter = 0;` 标记为非导出
-- 常量提取：`const int MAX = 100;` 生成 `constant`
-- 多声明器拆分：`int x, y, z;`
-- 指针、数组、引用声明名称解析：`int *p`、`int arr[10]`
-- 跳过 `extern` 变量声明（定义在另一文件），但提取 `extern` 函数声明
-- 结构体和类字段提取：`struct S { int id; char name[32]; };`
-- 函数体内全局变量引用追踪（`g_` 前缀），并排除同名局部变量、参数和函数调用目标
-- `#include "foo.h"` / `#include <vector>` 提取与解析
-- 从 `compile_commands.json` 读取 `-I`、`-isystem` 路径，缺失时启用常见目录探测
-- 移除 1MB 文件大小硬限制，大型源文件正常解析，超时时间随文件大小自适应缩放（上限 3 分钟）
-- 回调边合成阶段流式处理，峰值内存降至约 1KB，不随方法数量增长
-
-## 架构
-
-```text
-源代码
-  -> 文件扫描与语言识别
-  -> Tree-sitter WASM 静态解析
-  -> 符号节点提取
-  -> 调用、引用、include、继承等关系收集
-  -> 跨文件引用解析
-  -> SQLite 图谱持久化
-  -> CLI / MCP 查询
+```mermaid
+timeline title 找一个函数的调用方
+    无图谱
+        : grep "init" → 80 个匹配
+        : 读 5 个 .c/.h 文件
+        : 人肉分辨同名局部变量
+        : 大概率漏掉跨文件调用
+    有 CodeGraph-CPP
+        : 一次 query 定位定义
+        : 一次 callers 拿全引用点
+        : 毫秒级返回，0 次读文件
 ```
 
-主要模块：
+---
 
-- `src/extraction/`：扫描、解析、符号提取、增量索引
-- `src/extraction/languages/c-cpp.ts`：C/C++ 提取配置
-- `src/resolution/`：引用解析、include/import 解析
-- `src/db/`：SQLite schema 与数据库适配
-- `src/graph/`：图遍历、上下文和影响面查询
-- `src/mcp/`：MCP Server 与 AI Agent 工具
-- `src/bin/codegraph.ts`：CLI 入口
+## 四个核心价值
 
-## 快速开始
+```mermaid
+mindmap
+  root((CodeGraph-CPP<br/>四大价值))
+    更快
+      1～5 次查询闭环
+      省下几十次 grep / read
+    更省
+      Token 用在理解与编写
+      不再烧在找代码上
+    更稳
+      改前先查影响面
+      告别盲改踩雷
+    更全
+      宏 / 字段 / 原型不丢
+      C/C++ 大仓上下文完整
+```
 
-### 安装
+| 价值 | 说明 |
+|---|---|
+| **更快** | 一个流程问题，AI 用 1～5 次图谱查询就能闭环，省下几十次 `grep`/`read`。 |
+| **更省** | Token 不再烧在“找代码”上，而是用在“理解 + 写代码”上。 |
+| **更稳** | 改代码前先查影响面，谁调用、谁依赖、哪个测试受影响一目了然，告别盲改。 |
+| **更全** | C/C++ 容易丢的宏、全局变量、结构体字段、头文件原型都能被索引到，AI 拿到的上下文不再残缺。 |
+
+---
+
+## 常见使用场景
+
+### 场景一：代码检索 —— “这东西在哪？谁在用？”
+
+> “`g_session_counter` 这个全局变量都在哪些文件里被读写？”
+
+没有图谱时，AI 得 `grep "g_session_counter"`，然后逐个读文件分辨“这是定义还是引用、是不是同名局部变量”。有了 CodeGraph-CPP，一次 `codegraph_search` + `codegraph_callers` 直接拿到：定义位置、所有引用点，且已排除同名局部变量和函数调用目标。
+
+### 场景二：代码修复 —— “改这个函数会炸到谁？”
+
+> “我要给 `init_device` 加个参数，影响面有多大？”
+
+```mermaid
+flowchart LR
+    F["init_device<br/>改动点"]:::change --> D1["深度1 · 直接调用方"]:::layer
+    D1 --> A["power_on"]:::fn
+    D1 --> B["board_setup"]:::fn
+    D1 --> C["self_test"]:::fn
+    A --> D2["深度2 · 间接调用方"]:::layer
+    D2 --> X["run_sequence"]:::fn
+    D2 --> Y["boot_check"]:::fn
+    C -.无测试覆盖.-> W["⚠️ 盲区"]:::warn
+    classDef change fill:#ff6b6b,stroke:#d63031,color:#fff,stroke-width:3px
+    classDef layer fill:#dfe6e9,stroke:#b2bec3
+    classDef fn fill:#74b9ff,stroke:#0984e3,color:#fff
+    classDef warn fill:#ffeaa7,stroke:#fdcb6e
+```
+
+一条 `codegraph impact init_device --depth 3`，5 秒内拿到完整影响半径：谁调用了它、谁又调用了那些调用方、哪些测试文件覆盖了这条链。改之前就知道风险，而不是改完上线才发现。
+
+### 场景三：代码生成 —— 给 AI 喂“完整上下文”
+
+> “帮我实现一个新的 `close_device` 函数，风格和现有设备管理一致。”
+
+AI 写新代码最怕上下文不全。用 `codegraph_node` 逐个读取 `init_device`、`deinit_device` 的**完整源码**（外加 caller/callee 调用链），再 `codegraph_node` 看一眼设备结构体和相关宏，AI 看着真实代码照葫芦画瓢，生成的代码命名、错误处理、日志风格都和项目一致，而不是凭空臆造。
+
+### 场景四：代码理解 —— 接手老项目不再迷路
+
+> “一个请求从入口 `process_request` 到最终写盘，经过哪些函数？”
+
+从入口 `process_request` 起步，用 `codegraph_callees` 看它调用了谁，再沿调用方逐层下钻（`callees` 迭代 + `codegraph_impact --depth 4` 反向看影响面），跨文件、跨头文件的调用链就能拼出来，不用再手动跳转。配合 `codegraph_node` 随时读取某一跳的源码看具体实现。
+
+### 场景五：CI 增量测试 —— 不再全量重跑
 
 ```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+git diff --name-only HEAD | codegraph affected --stdin --quiet | xargs your-test-runner
+```
+
+改了 3 个文件，只跑受影响的 5 个测试，而不是全量跑 2000 个。
+
+---
+
+## 三分钟上手
+
+### 1. 安装
+
+```bash
+# 已有 Node.js（推荐，最简单）
+npm i -g codegraph-cpp
+# 或零安装一次性运行
+npx codegraph-cpp
+
+# macOS / Linux 一键脚本
+curl -fsSL https://your-host/install.sh | sh
 
 # Windows PowerShell
-irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
+irm https://your-host/install.ps1 | iex
 ```
 
-已有 Node.js 时也可使用：
+安装脚本自带运行时，没有 Node.js 也能跑，无需编译。
 
-```bash
-npx @colbymchenry/codegraph
-npm i -g @colbymchenry/codegraph
-```
-
-### 初始化索引
-
-```bash
-cd your-c-or-cpp-project
-codegraph init -i
-codegraph status
-```
-
-索引数据保存在项目根目录 `.codegraph/` 下，不应提交到代码仓。
-
-## 常用命令
-
-```bash
-codegraph query g_counter --kind variable      # 搜索符号
-codegraph callers g_counter                    # 查询调用方/引用方
-codegraph callees init_device                  # 查询被调方
-codegraph impact init_device --depth 3         # 影响面分析
-codegraph context "分析接口变更影响"            # 构建任务上下文
-codegraph files --filter src --format tree     # 查看文件结构
-codegraph sync                                 # 增量同步
-codegraph index --force                        # 强制全量重建
-codegraph uninit                               # 删除本项目索引
-```
-
-## MCP 集成
-
-交互式配置 AI 编码助手：
+### 2. 配置 AI 助手
 
 ```bash
 codegraph install
 ```
 
-手动 MCP 配置示例：
+自动检测你装了 Claude Code / Cursor / Codex CLI / opencode 等，帮你写好 MCP 配置。也支持 `codegraph install --yes` 一键全配。
+
+### 3. 给项目建索引
+
+```bash
+cd your-c-or-cpp-project
+codegraph init -i      # 交互式初始化 + 构建索引
+codegraph status       # 查看索引：节点数、边数、后端类型
+```
+
+索引数据存在项目根目录 `.codegraph/` 下，**不要提交到代码仓**（加进 `.gitignore`）。
+
+```mermaid
+sequenceDiagram
+    participant U as 你
+    participant T as 终端
+    participant AI as AI 助手
+    U->>T: npm i -g codegraph-cpp
+    U->>T: codegraph install
+    U->>T: codegraph init -i
+    T-->>U: ✅ 图谱建好（.codegraph/）
+    U->>AI: 正常提问（无需特殊指令）
+    AI->>T: 自动调用 codegraph 工具
+    AI-->>U: 带图谱上下文的答案
+```
+
+之后你在 AI 助手里正常提问即可，它会自动调用 CodeGraph 工具，无需手动操作。文件改动后索引会在约 2 秒内自动增量更新。
+
+---
+
+## 它和上游 CodeGraph 的区别
+
+CodeGraph-CPP 是 CodeGraph 的 C/C++ 增强版，重点解决 C/C++ 大仓静态解析的“丢符号”和“误抽符号”问题：
+
+- ✅ **宏可被搜索与追踪**：`#define MAX 100`、`#define LOG(fmt, ...)` 等宏能像函数一样按名搜索、追踪被谁引用。
+- ✅ **跨文件宏不再误判**：在头文件 A 中定义、在文件 B 中通过 `#include` 使用的宏，能被正确识别为宏，而不会被误当成函数定义。
+- ✅ **语句级宏不再吞符号**：`FOREACH(...)`、`SWITCH(x){...}` 这类语句级宏原本会破坏函数体、连带吞掉后续数百行声明；现在被破坏的函数和被吞的符号都能正常进图。
+- ✅ **不产生假函数**：宏调用不会被误解析成不存在的假函数，搜索结果更干净。
+- ✅ **同名宏与函数共存**：函数与 `#define` 同名（常见 debug 包装宏）时，真实的函数定义和声明都会保留，不会被宏吃掉。
+- ✅ **多宏修饰的函数名能取对**：`RRE_ATTRIBUTE_VISIBILITY VOS_UINT32 func(VOS_VOID)` 能正确识别出函数名 `func`，而不是把 `(VOS_VOID)` 当成函数名。
+- ✅ **头文件原型与定义连通**：`.h` 里的原型和 `.c`/`.cpp` 里的定义会被识别为同一个符号——在原型上查调用方/被调方，就能看到定义里真实的调用链，不再出现“查到原型却看不到函数体调了什么”的死端。
+- ✅ **头文件原型完整可见**：`int foo();`、`extern int bar(void);` 等原型都会被索引，公共 API 不会因“只有声明没有函数体”而丢失。
+- ✅ **`extern` 变量声明不丢**：`extern const T g_table[];` 这类声明会被保留并可搜索，即使它的定义在未纳入索引的第三方库源码里，也不会从声明所在头文件丢失。
+- ✅ **函数/方法都带参数签名**：函数定义和类内成员原型都会回显完整参数签名（保留 `int*`、`vector<T>&` 等修饰），同名重载一眼可辨。
+- ✅ **全局/静态/常量变量全支持**：`int g_counter = 0;`、`static int s_x;`、`const int MAX = 100;` 都能识别，`static` 变量标记为不导出。
+- ✅ **结构体/类字段逐个提取**：`struct S { int id; char name[32]; };` 的每个字段都能单独检索。
+- ✅ **类内类型定义不漏**：`class Foo { enum Color {...}; struct Err {...}; };` 这类写在类里的 `enum`/`struct`/`class` 定义及其成员，都会正常进图。
+- ✅ **`typedef` 多别名与 tag 名都可搜**：`typedef struct Tag {...} A, B;` 里除第一个别名 `A` 外，`B` 和结构体 tag 名 `Tag` 现在也都能被检索到。
+- ✅ **函数体内宏可检索**：函数体里 `#define` 的局部宏也能被搜索到，且不再产生把宏参数误当外部变量的虚假引用关系。
+- ✅ **C++ 引用返回/引用成员不丢**：`APIRegister& get_instance()` 的名字能正确识别（不再残留 `&`、`()`），只有声明的引用返回成员和引用数据成员也都会被索引。
+- ✅ **函数指针 typedef 名字正确**：`typedef TYPE (*NAME)(...)` 形式的函数指针 typedef，名字能正确识别（不再带 `*`）；整仓建库时也不会因宏污染连带丢失相关字段和结构体。
+- ✅ **多属性宏堆叠的原型能识别**：头文件里被多个属性宏前缀修饰、参数列表后还带尾随宏调用的函数原型，能被正确识别为声明（此前这类原型会整个丢失）。
+- ✅ **多声明器拆分**：`int x, y, z;` 会被拆成三个独立变量，都能单独检索。
+- ✅ **跨文件调用/引用连通**：`#include` 关系会被解析，配合 `compile_commands.json` 的 `-I` 路径，跨文件的调用和引用能正确连起来。
+- ✅ **全局变量引用追踪准确**：函数体内对 `g_` 前缀全局变量的读写会被追踪，并自动排除同名局部变量、参数和函数调用目标，不产生误连。
+- ✅ **`codegraph query` 默认精确匹配**：按名搜索默认改为精确、区分大小写，不再连带返回大小写不同或名字相近的近似命中；需要模糊匹配时加 `--fuzzy`。MCP 的 `codegraph_search` 仍保留对 AI 友好的模糊匹配。
+- ✅ **宏处理不误伤合法代码**：初始化列表/聚合体里的宏、CRLF 续接的多行 `#define`、以及 `template<class T>` 等模板代码，都不会被宏处理破坏。
+
+> 简单说：上游 CodeGraph 在 C/C++ 上容易“丢字段、丢原型、把宏当函数、声明与定义断开”；CodeGraph-CPP 把这些洞补上了，并针对慢盘大仓做了索引提速。完整改动清单见 [C/C++ 增强发布说明](RELEASE_NOTES_C_CPP.md)。
+
+---
+
+## 它是怎么工作的
+
+```mermaid
+flowchart LR
+    subgraph 建图["🛠️ 建图（一次性 / 增量）"]
+        direction TB
+        S1["📄 源代码"] --> S2["🔬 tree-sitter 解析"]
+        S2 --> S3["🧱 提取符号 + 关系"]
+        S3 --> S4[("🗄️ SQLite + FTS5<br/>.codegraph/")]
+    end
+    subgraph 使用["📡 使用（每次查询）"]
+        direction TB
+        Q1["🤖 AI 助手 / CLI 提问"] --> Q2["查图谱"]
+        Q2 --> Q3["⚡ 毫秒级返回<br/>符号+源码+调用链+影响面"]
+    end
+    S4 -. "文件监听 ~2 秒自动同步" .-> S2
+    Q2 -. "只读查询" .-> S4
+    style 建图 fill:#74b9ff,stroke:#0984e3,color:#fff
+    style 使用 fill:#fd79a8,stroke:#e84393,color:#fff
+    style S4 fill:#a29bfe,stroke:#6c5ce7,color:#fff
+```
+
+整张图就是项目里一个 `.codegraph/codegraph.db` 文件，可以复制、备份、带走——完全便携。
+
+比如这段 C 代码：
+
+```c
+int g_count = 0;
+
+int init_device(int id) {
+    g_count++;
+    return id;
+}
+```
+
+在 CodeGraph-CPP 里会变成这几个节点和边：
+
+```mermaid
+flowchart LR
+    V["📦 变量 g_count<br/>int g_count = 0"]:::var
+    F["🔧 函数 init_device<br/>int init_device(int id)"]:::fn
+    F -->|"读/写引用"| V
+    P["📄 原型 init_device<br/>（在 device.h 里）"]:::proto
+    P -.->|"识别为同一符号"| F
+    classDef var fill:#fd79a8,stroke:#e84393,color:#fff
+    classDef fn fill:#74b9ff,stroke:#0984e3,color:#fff
+    classDef proto fill:#a29bfe,stroke:#6c5ce7,color:#fff
+```
+
+查 `init_device` 的调用方时，连只 `#include "device.h"` 的文件也能被追到——因为原型和定义已连成同一个节点。
+
+---
+
+## 常用命令速查
+
+```bash
+codegraph init -i                  # 初始化 + 构建索引
+codegraph status                   # 查看索引统计
+codegraph query g_counter --kind variable   # 按名称/种类搜索符号
+codegraph callers g_counter        # 谁引用了它
+codegraph callees init_device      # 它调用了谁
+codegraph impact init_device --depth 3      # 影响面分析
+codegraph files --filter src --format tree  # 索引化的文件结构
+codegraph sync                     # 增量同步
+codegraph index --force            # 强制全量重建
+codegraph affected src/foo.c       # 受改动影响的测试文件
+```
+
+---
+
+## 配置 AI 助手（MCP）
+
+`codegraph install` 会自动写入配置。手动配置示例：
 
 ```json
 {
@@ -133,23 +286,25 @@ codegraph install
 }
 ```
 
-常用 MCP 工具：
+AI 助手默认可用的 **7 个 MCP 工具**：
 
-- `codegraph_search`：搜索符号
-- `codegraph_context`：为任务构建代码上下文
-- `codegraph_callers` / `codegraph_callees`：查询调用关系
-- `codegraph_impact`：分析影响范围
-- `codegraph_trace`：追踪两个符号之间的调用路径
-- `codegraph_node` / `codegraph_explore`：查看符号详情和相关源码
-- `codegraph_files` / `codegraph_status`：查看文件结构和索引状态
+- `codegraph_search` — 按名称搜索符号
+- `codegraph_node` — 读取符号详情、完整源码与调用链（读代码主力）
+- `codegraph_callers` / `codegraph_callees` — 查调用方 / 被调方
+- `codegraph_impact` — 修改影响面分析
+- `codegraph_files` — 索引化的文件结构
+- `codegraph_status` — 索引健康度与统计
+
+> 另有一个 `codegraph_explore`（一次调用批量取多个符号源码并串调用路径）**默认关闭**，需要时设环境变量 `CODEGRAPH_ENABLE_EXPLORE=1` 重启 MCP 服务器即可开放。完整用法见 **[用户手册](docs/manual/README.md)**。
+
+---
 
 ## 部署说明
 
-- 自包含 bundle 可携带 Node 运行时、编译产物、Tree-sitter WASM 和生产依赖。
-- 优先使用 Node 内置 `node:sqlite`，不可用时回退到 `sql.js` WASM。
-- 无 `better-sqlite3` 等 native addon，降低低版本 glibc 和受限环境部署成本。
-- 可通过 `CODEGRAPH_FORCE_WASM=1` 强制使用 WASM SQLite 后端。
-- 文件监听不稳定时可使用 `codegraph serve --mcp --no-watch`。
+- 自包含 bundle 可携带 Node 运行时、tree-sitter WASM 和生产依赖，无 native addon。
+- 优先使用 Node 内置 `node:sqlite`，不可用时回退 `sql.js` WASM；`CODEGRAPH_FORCE_WASM=1` 可强制 WASM。
+- 无 `better-sqlite3` 依赖，降低低版本 glibc / 受限环境部署成本。
+- 文件监听不稳定时可用 `codegraph serve --mcp --no-watch`。
 
 ## 开发
 
@@ -170,4 +325,4 @@ scripts/build-bundle.sh win32-x64
 
 ## 许可
 
-CodeGraph-WX 基于开源 CodeGraph 演进，沿用 MIT License。
+CodeGraph-CPP 基于开源 CodeGraph 演进，沿用 MIT License。
