@@ -366,6 +366,40 @@ export class TreeSitterExtractor {
       };
     }
 
+    // Fast path for pure-macro data headers (C only). Files that are entirely
+    // object-like #define macros with bare `{...}` initializer bodies and zero
+    // real declarations trigger tree-sitter-c's O(n^2) parse — every #define
+    // hangs off a single preproc_ifdef guard node, so the tree-balancing/
+    // traversal cost is quadratic (upstream tree-sitter-c#196,
+    // tree-sitter#1356). Yet such files yield no extractable symbols beyond
+    // macro names. Skip the parse and collect macro names via regex instead:
+    // O(n), and better recall than the broken parse path (which only reaches
+    // the first macro under the giant node before the slowdown swamps it).
+    // C++ is unaffected (different grammar shape), so this is C-only.
+    // Escape hatch: CODEGRAPH_FORCE_PARSE=1 forces the normal parse path.
+    if (this.language === 'c' && isPureMacroDataHeader(this.source)) {
+      const { nodes: macroNodes, edges: macroEdges } = extractMacrosByRegex(
+        this.filePath,
+        this.source,
+        this.language,
+      );
+      return {
+        nodes: macroNodes,
+        edges: macroEdges,
+        unresolvedReferences: [],
+        errors: [
+          {
+            message:
+              'Skipped parse for pure-macro data header (set CODEGRAPH_FORCE_PARSE=1 to force)',
+            filePath: this.filePath,
+            severity: 'warning',
+            code: 'skipped_macro_data_header',
+          },
+        ],
+        durationMs: Date.now() - startTime,
+      };
+    }
+
     try {
       // Reset per-file state
       this.currentLocalNames.clear();
@@ -5802,6 +5836,117 @@ export class TreeSitterExtractor {
   }
 }
 
+
+/**
+ * Detect a "pure-macro data header": a file made entirely of object-like
+ * #define macros with bare `{...}` initializer bodies and zero real
+ * declarations. Such files trigger tree-sitter-c's O(n^2) parse
+ * (tree-sitter-c#196 / tree-sitter#1356) yet yield no extractable symbols
+ * beyond macro names.
+ *
+ * Conditions are deliberately conservative — any file with a real
+ * declaration (a ';', a typedef/struct/enum/union keyword, or a function-like
+ * macro) is left on the normal parse path. The ';'-free check alone already
+ * covers every C file with a real function/variable/type definition, since
+ * those all end in ';'. C-only (cpp has a different grammar shape and is not
+ * affected by the upstream pathology). Escape hatch: CODEGRAPH_FORCE_PARSE=1.
+ */
+function isPureMacroDataHeader(source: string): boolean {
+  if (process.env.CODEGRAPH_FORCE_PARSE === '1') return false;
+  let defineCount = 0;
+  let semicolonCount = 0;
+  let typeKeywordCount = 0;
+  let paramMacroCount = 0;
+  const lines = source.split(/\r?\n/);
+  for (const raw of lines) {
+    // Strip // line comments so words inside them don't skew the keyword
+    // counts (only matters for the safe direction — a stray `struct` in a
+    // comment would keep the file on the slow path, not wrongly skip it).
+    const line = raw.replace(/\/\/.*$/, '');
+    if (/^\s*#\s*define\b/.test(line)) {
+      defineCount++;
+      // Function-like macro: NAME immediately followed by '(' (no space).
+      if (/^\s*#\s*define\s+[A-Za-z_]\w*\(/.test(line)) paramMacroCount++;
+      continue;
+    }
+    for (const c of line) if (c === ';') semicolonCount++;
+    if (/\b(?:typedef|struct|enum|union)\b/.test(line)) typeKeywordCount++;
+  }
+  return (
+    defineCount >= 20 &&
+    semicolonCount === 0 &&
+    typeKeywordCount === 0 &&
+    paramMacroCount === 0
+  );
+}
+
+/**
+ * Collect macro names from a source string via regex, used when
+ * isPureMacroDataHeader skips the tree-sitter parse. Produces `macro` nodes
+ * with the same shape as TreeSitterExtractor.extractMacro, plus `contains`
+ * edges from the file node. Recall is actually better than the broken parse
+ * path, which only reaches the first macro under the giant preproc_ifdef node
+ * before the O(n^2) slowdown swamps it.
+ */
+function extractMacrosByRegex(
+  filePath: string,
+  source: string,
+  language: Language,
+): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
+  const fileId = `file:${filePath}`;
+  const lineCount = source.split('\n').length;
+  nodes.push({
+    id: fileId,
+    kind: 'file',
+    name: path.basename(filePath),
+    qualifiedName: filePath,
+    filePath,
+    language,
+    startLine: 1,
+    endLine: lineCount,
+    startColumn: 0,
+    endColumn: 0,
+    isExported: false,
+    updatedAt: Date.now(),
+  });
+  // `^` is line-anchored under the `m` flag, so m.index is the line start.
+  const re = /^\s*#\s*define\s+([A-Za-z_]\w*)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const name = m[1]!;
+    const line = source.slice(0, m.index).split('\n').length;
+    // Column of the macro name within its line: the regex match starts at the
+    // line head, so the name's column is just the length of the prefix
+    // `  #define ` = m[0]!.length - name.length.
+    const startColumn = m[0]!.length - name.length;
+    const lineEnd = source.indexOf('\n', m.index);
+    const lineEndIdx = lineEnd === -1 ? source.length : lineEnd;
+    const signature = source
+      .slice(m.index, lineEndIdx)
+      .replace(/\\\s*$/, '')
+      .trimEnd();
+    const id = generateNodeId(filePath, 'macro', name, line);
+    nodes.push({
+      id,
+      kind: 'macro',
+      name,
+      qualifiedName: name,
+      filePath,
+      language,
+      startLine: line,
+      endLine: line,
+      startColumn,
+      endColumn: startColumn + name.length,
+      isExported: true,
+      signature,
+      updatedAt: Date.now(),
+    });
+    edges.push({ source: fileId, target: id, kind: 'contains' });
+  }
+  return { nodes, edges };
+}
 
 /**
  * Extract nodes and edges from source code.
