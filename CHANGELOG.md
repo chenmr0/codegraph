@@ -11,6 +11,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- C/C++ global pointer variables with a visibility-macro prefix — `DLL_EXPORT MyType *g_var = NULL;` — are no longer lost when the macro is defined in a header outside the indexed directory. CodeGraph pre-replaces statement-level macros from a project-wide `#define` scan; when only a subset of files is indexed and the macro's definition isn't in that subset, the scan missed it, the parser split the declaration, and the variable vanished (the type name was also wrongly emitted as a bogus variable). The split-declaration rescue now recovers `*g_ptr = init` forms and suppresses the bogus leading declaration, so the symbol appears in `codegraph query` and `codegraph_explore` again.
 - C/C++ header files no longer lose `extern` variable declarations such as `extern const T g_table[];`. The declaration is now kept as a findable symbol and linked to its definition in a `.c` / `.cpp` file, so the symbol appears in `codegraph query` and `codegraph_explore` even when the definition lives in a file that isn't indexed (a library source, or one whose parse was broken by macros). Previously these declarations were skipped on the assumption the definition was always indexed elsewhere, which made the symbol vanish entirely from large builds — the classic "small module finds it, full build returns nothing" case.
 
 ### New Features

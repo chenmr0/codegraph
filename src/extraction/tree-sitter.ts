@@ -613,7 +613,8 @@ export class TreeSitterExtractor {
       if (
         (this.language === 'c' || this.language === 'cpp') &&
         this.isBrokenTypeSplitDeclaration(node) &&
-        this.rescueSplitPrototypeExprStmt(node.nextNamedSibling) !== null
+        (this.rescueSplitPrototypeExprStmt(node.nextNamedSibling) !== null ||
+          this.rescuePointerInitExprStmtName(node.nextNamedSibling) !== null)
       ) {
         skipChildren = true;
       } else {
@@ -662,6 +663,40 @@ export class TreeSitterExtractor {
               signature: initSignature,
               isExported,
             });
+          }
+        }
+        else if (left?.type === 'pointer_expression') {
+          // C/C++ pointer-variable-init rescue: `MACRO TYPE *g_ptr = init;`
+          // where the leading visibility/type macro is NOT in the project
+          // global `#define` set (so preParse doesn't replace it) gets split by
+          // tree-sitter-c into a spurious `(declaration MACRO TYPE (MISSING
+          // ";"))` + this `expression_statement(assignment_expression(
+          // pointer_expression *g_ptr = init))`. The pointer variable name
+          // lands in the pointer_expression and would be lost — the existing
+          // assignment_expression rescue above only handles a bare-identifier
+          // left (`g_x = init`), not `*g_ptr = init`. Rescue it symmetrically:
+          // extract the identifier operand of the pointer_expression as a
+          // variable. Only a bare-identifier operand matches (`*g_ptr`),
+          // excluding `*id[idx]` / `*id.field` / `*name(args)` which are not
+          // simple variable initializations. An expression_statement at
+          // file/namespace scope is always error recovery (never valid C/C++),
+          // so this never traps real code. See eval-crsp-init-var-repro for
+          // the rescue matrix (left-non-bare-identifier was a known gap).
+          const operand = left.namedChild(0);
+          if (operand?.type === 'identifier') {
+            const name = getNodeText(operand, this.source);
+            if (name && !C_CPP_KEYWORD_NAMES.has(name)) {
+              const right = inner.namedChild(1);
+              const initValue = right
+                ? getNodeText(right, this.source).slice(0, 100) : undefined;
+              const initSignature = initValue
+                ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+              const isExported = this.extractor.isExported?.(operand, this.source) ?? false;
+              this.createNode('variable', name, operand, {
+                signature: initSignature,
+                isExported,
+              });
+            }
           }
         }
       }
@@ -1242,6 +1277,41 @@ export class TreeSitterExtractor {
     const argList = call.namedChild(1);
     if (fn?.type !== 'identifier' || argList?.type !== 'argument_list') return null;
     const name = getNodeText(fn, this.source);
+    if (!name || C_CPP_KEYWORD_NAMES.has(name)) return null;
+    return name;
+  }
+
+  /**
+   * C/C++: detect the SECOND half of the pointer-variable-init split misparse
+   * — an `expression_statement` at translation_unit / namespace scope whose
+   * single expression is `*id = init`, i.e. an `assignment_expression` whose
+   * left is a `pointer_expression` over a bare `identifier`. This is the
+   * counterpart to the assignment_expression rescue in the expression_statement
+   * branch above: when a leading visibility/type macro is not in the project
+   * `#define` set, tree-sitter-c splits `MACRO TYPE *g_ptr = init;` into a
+   * spurious `(declaration MACRO TYPE (MISSING ";"))` + this
+   * `expression_statement(*g_ptr = init)`. Returns the pointer variable name
+   * when this node is the rescue target, else null. The caller has already
+   * gated scope (not inside class / function / compound).
+   *
+   * Used to suppress the spurious leading declaration (so the type name, e.g.
+   * `BsiKmcServiceApis`, is not emitted as a bogus variable) — the
+   * expression_statement branch above performs the actual variable rescue.
+   * Only a bare-identifier operand matches, excluding `*id[idx]` /
+   * `*id.field` / `*name(args)` (the last is the split-prototype form handled
+   * by rescueSplitPrototypeExprStmt). An expression_statement at file/namespace
+   * scope is never valid C/C++ — always error recovery — so this never traps
+   * real code.
+   */
+  private rescuePointerInitExprStmtName(node: SyntaxNode | null): string | null {
+    if (!node || node.type !== 'expression_statement') return null;
+    const inner = node.namedChild(0);
+    if (inner?.type !== 'assignment_expression') return null;
+    const left = inner.namedChild(0);
+    if (left?.type !== 'pointer_expression') return null;
+    const operand = left.namedChild(0);
+    if (operand?.type !== 'identifier') return null;
+    const name = getNodeText(operand, this.source);
     if (!name || C_CPP_KEYWORD_NAMES.has(name)) return null;
     return name;
   }
