@@ -199,6 +199,10 @@ export async function resolveLatestVersion(timeoutMs = 30000): Promise<string> {
     encoding: 'utf-8',
     timeout: timeoutMs,
     windowsHide: true,
+    // Windows: `npm.cmd` is a batch script — Node (>=18.20.2, CVE-2024-27980)
+    // refuses to spawn `.cmd`/`.bat` directly without a shell. Run it through
+    // cmd.exe so resolution + execution behave like a manual `npm ...` in cmd.
+    shell: process.platform === 'win32',
   });
   if (r.error) {
     const msg = r.error.message;
@@ -395,7 +399,15 @@ export function hasCommand(cmd: string): boolean {
 }
 
 export function defaultRun(cmd: string, args: string[], env?: NodeJS.ProcessEnv): number {
-  const r = spawnSync(cmd, args, { stdio: 'inherit', env: env ?? process.env });
+  const r = spawnSync(cmd, args, {
+    stdio: 'inherit',
+    env: env ?? process.env,
+    // Windows: `npm.cmd` is a batch script — Node (>=18.20.2, CVE-2024-27980)
+    // refuses to spawn `.cmd`/`.bat` directly without a shell. Run it through
+    // cmd.exe (same as typing the command in cmd). Args here contain no shell
+    // metacharacters, so shell-quoting is safe.
+    shell: process.platform === 'win32',
+  });
   if (r.error) return -1;
   return r.status ?? -1;
 }
