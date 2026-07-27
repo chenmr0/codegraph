@@ -1,45 +1,45 @@
 /**
  * `codegraph upgrade`
  *
- * Self-update for the CLI, whatever way it was installed:
+ * Self-update for the CLI from the Huawei internal npm registry.
  *
- *   - **bundle** — the self-contained runtime+app installed by `install.sh`
- *     (Linux/macOS) or `install.ps1` (Windows). Upgrading re-runs the SAME
- *     canonical installer script (single source of truth) so the download /
- *     version-resolution / PATH logic never drifts between first-install and
- *     upgrade.
- *   - **npm** — installed via `npm i -g @colbymchenry/codegraph`. Upgrading
- *     shells out to npm.
- *   - **npx** — ephemeral; nothing to upgrade (next `npx` fetches latest).
- *   - **source** — a git checkout running its own `dist/`; `git pull` + rebuild.
+ * This fork is published as `@sdd/codegraph-wx` on
+ * `https://cmc.centralrepo.rnd.huawei.com/...`. Upgrading:
  *
- * Detection is structural (see `detectInstallMethod`): a bundle carries a
- * vendored `node` binary and a `bin/codegraph` launcher next to its `lib/`, so
- * we can recognize it from the running file's path without a marker file.
+ *   1. configures npm to point at the Huawei registries
+ *      (`npm config set registry / @sdd:registry / strict-ssl false`) —
+ *      idempotent, so re-runs are harmless;
+ *   2. resolves the latest published version via
+ *      `npm view @sdd/codegraph-wx version`;
+ *   3. if the running version is older, runs
+ *      `npm install -g @sdd/codegraph-wx@<version>`.
  *
- * Windows wrinkle: a running `node.exe` is locked and can't be deleted, so the
- * bundle's `current\` dir can't be overwritten in place by the process doing
- * the upgrade. We therefore spawn a DETACHED helper that waits for this
- * process to exit (releasing the lock), then runs `install.ps1`. This is the
- * conventional Windows self-update dance (rustup/nvm-windows do the same).
+ * Detection (`detectInstallMethod`) recognizes npm-global / npm-local / npx /
+ * source checkouts from the running file's path. The previous bundle
+ * (vendored-node) and GitHub-releases paths have been removed — this build is
+ * only ever installed via the Huawei npm registry.
+ *
+ * Windows note: a running `node.exe` is locked, but `npm install -g` replaces
+ * `dist/*.js` (not the node binary), so there is no file-lock issue. The
+ * running process keeps its already-loaded code in memory; the *next*
+ * `codegraph` invocation uses the new version — open a new terminal to see it.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as https from 'https';
 import { spawnSync } from 'child_process';
 
-export const REPO = 'colbymchenry/codegraph';
-export const NPM_PACKAGE = '@colbymchenry/codegraph';
-const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
-export const INSTALL_SH_URL = `${RAW_BASE}/install.sh`;
+export const NPM_PACKAGE = '@sdd/codegraph-wx';
+
+/** Huawei internal npm registries (default + @sdd scope) + TLS relax. */
+export const HUAWEI_REGISTRY = 'https://cmc.centralrepo.rnd.huawei.com/npm/';
+export const HUAWEI_SDD_REGISTRY = 'https://cmc.centralrepo.rnd.huawei.com/artifactory/api/npm/product_npm/';
 
 // ---------------------------------------------------------------------------
 // Install-method detection (pure — fully unit-testable via injected probes)
 // ---------------------------------------------------------------------------
 
 export type InstallMethod =
-  | { kind: 'bundle'; os: 'unix' | 'windows'; bundleRoot: string; installDir: string | null }
   | { kind: 'npm'; scope: 'global' | 'local' }
   | { kind: 'npx' }
   | { kind: 'source'; root: string }
@@ -58,39 +58,6 @@ function toPosix(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
-/**
- * Where the bundle installer keeps its install root, derived from the bundle
- * dir so an upgrade reuses a custom `CODEGRAPH_INSTALL_DIR`. Returns null when
- * the layout isn't the one the installer creates (then the installer falls
- * back to its own default).
- *
- *   unix:    <installDir>/versions/<vX.Y.Z>   (bundleRoot)  → <installDir>
- *   windows: <installDir>\current             (bundleRoot)  → <installDir>
- */
-export function deriveInstallDir(
-  bundleRoot: string,
-  os: 'unix' | 'windows',
-  exists: (p: string) => boolean
-): string | null {
-  // Use the TARGET platform's path semantics (not the host's), so this is
-  // deterministic when reasoning about a Windows layout from a POSIX host (CI)
-  // and vice-versa. In production `os` always matches the running platform.
-  const P = os === 'windows' ? path.win32 : path.posix;
-  if (os === 'windows') {
-    if (P.basename(bundleRoot).toLowerCase() === 'current') {
-      return P.dirname(bundleRoot);
-    }
-    return null;
-  }
-  // unix: bundleRoot is <installDir>/versions/<version>
-  const parent = P.dirname(bundleRoot);
-  if (P.basename(parent) === 'versions') {
-    const installDir = P.dirname(parent);
-    return exists(installDir) ? installDir : P.dirname(parent);
-  }
-  return null;
-}
-
 export function detectInstallMethod(input: DetectInput): InstallMethod {
   const exists = input.exists ?? fs.existsSync;
   const isWin = input.platform === 'win32';
@@ -98,20 +65,9 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   // (a Windows layout resolves correctly even when unit-tested on macOS/Linux).
   const P = isWin ? path.win32 : path.posix;
   const binDir = P.dirname(input.filename); // <…>/bin
-
-  // Bundle: <root>/lib/dist/bin/codegraph.js → <root> is up 3 from bin/.
-  // A bundle has a vendored node + a launcher script as siblings of lib/.
-  const bundleRoot = P.resolve(binDir, '..', '..', '..');
-  const vendoredNode = P.join(bundleRoot, isWin ? 'node.exe' : 'node');
-  const launcher = P.join(bundleRoot, 'bin', isWin ? 'codegraph.cmd' : 'codegraph');
-  if (exists(vendoredNode) && exists(launcher)) {
-    const os = isWin ? 'windows' : 'unix';
-    return { kind: 'bundle', os, bundleRoot, installDir: deriveInstallDir(bundleRoot, os, exists) };
-  }
-
   const norm = toPosix(input.filename);
 
-  // npx cache: <…>/_npx/<hash>/node_modules/@colbymchenry/codegraph/…
+  // npx cache: <…>/_npx/<hash>/node_modules/@sdd/codegraph-wx/…
   if (norm.includes('/_npx/')) {
     return { kind: 'npx' };
   }
@@ -178,84 +134,93 @@ export function isUpdateAvailable(current: string, latest: string): boolean {
   }
 }
 
-/** `0.9.9` / `v0.9.9` → `v0.9.9` (release tags are v-prefixed). */
+/** `0.9.9` / `v0.9.9` → `v0.9.9` (display normalization). */
 export function normalizeVersion(v: string): string {
   const t = v.trim();
   return t.startsWith('v') ? t : `v${t}`;
 }
 
-/** Strip a leading `v`: `v0.9.9` → `0.9.9`. */
+/** Strip a leading `v`: `v0.9.9` → `0.9.9` (npm version specs carry no "v"). */
 export function stripV(v: string): string {
   const t = v.trim();
   return t.startsWith('v') ? t.slice(1) : t;
 }
 
 /**
- * Parse the release tag out of the `Location` header GitHub returns for
- * `/releases/latest` → `…/releases/tag/v0.9.9`. Pure so it's unit-tested.
+ * Parse the version out of `npm view <pkg> version` stdout. `npm view` may
+ * print advisory lines (deprecation notices, registry warnings) before the
+ * version, so we take the last trimmed line that parses as a semver. Pure so
+ * it's unit-tested without touching the network.
  */
-export function parseLatestTagFromLocation(location: string | undefined): string | null {
-  if (!location) return null;
-  const m = /\/releases\/tag\/([^/?#]+)/.exec(location);
-  return m ? decodeURIComponent(m[1]!) : null;
+export function parseNpmViewVersion(stdout: string): string | null {
+  const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (parseSemver(line)) return line;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// Latest-version resolution (network)
+// npm registry configuration + latest-version resolution (network)
 // ---------------------------------------------------------------------------
 
-function httpsGet(
-  url: string,
-  headers: Record<string, string>,
-  timeoutMs: number
-): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers }, (res) => {
-      let body = '';
-      res.on('data', (c) => (body += c));
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
-    });
-    req.on('error', reject);
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`request timed out after ${timeoutMs}ms`)));
-  });
+/**
+ * Run `npm config set` for the Huawei registries + `strict-ssl false`. Uses
+ * `deps.run` so the command sequence is unit-testable via a mock. Returns 0 on
+ * success, the failing exit code otherwise. Idempotent — safe to run on every
+ * upgrade.
+ */
+export function ensureNpmRegistryConfig(deps: UpgradeDeps): number {
+  const npm = deps.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const settings: Array<[string, string]> = [
+    ['registry', HUAWEI_REGISTRY],
+    ['@sdd:registry', HUAWEI_SDD_REGISTRY],
+    ['strict-ssl', 'false'],
+  ];
+  for (const [key, val] of settings) {
+    const code = deps.run(npm, ['config', 'set', key, val], process.env);
+    if (code !== 0) {
+      deps.error(`\`npm config set ${key} ${val}\` exited with code ${code}.`);
+      return code;
+    }
+  }
+  return 0;
 }
 
 /**
- * Resolve the latest release tag (e.g. `v0.9.9`).
- *
- * Primary: read the redirect `Location` from `github.com/<repo>/releases/latest`
- * — same trick install.sh uses, because the unauthenticated GitHub API is
- * rate-limited to 60 req/h/IP and 403s on shared/cloud hosts (issue #325). The
- * redirect has no such limit. Fall back to the API only if the redirect can't
- * be read.
+ * Resolve the latest published version of `@sdd/codegraph-wx` via
+ * `npm view <pkg> version`. Requires the Huawei registry to be configured
+ * (run `ensureNpmRegistryConfig` first). Returns a `v`-prefixed tag.
  */
-export async function resolveLatestVersion(repo = REPO, timeoutMs = 12000): Promise<string> {
-  try {
-    const res = await httpsGet(
-      `https://github.com/${repo}/releases/latest`,
-      { 'User-Agent': 'codegraph-upgrade' },
-      timeoutMs
-    );
-    const loc = res.headers.location;
-    const tag = parseLatestTagFromLocation(Array.isArray(loc) ? loc[0] : loc);
-    if (tag) return normalizeVersion(tag);
-  } catch {
-    /* fall through to API */
+export async function resolveLatestVersion(timeoutMs = 30000): Promise<string> {
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const r = spawnSync(npm, ['view', NPM_PACKAGE, 'version'], {
+    encoding: 'utf-8',
+    timeout: timeoutMs,
+    windowsHide: true,
+  });
+  if (r.error) {
+    const msg = r.error.message;
+    if (msg.includes('timed out')) {
+      throw new Error(
+        `npm view timed out after ${timeoutMs}ms — could not reach the Huawei npm registry. Check network and \`npm config\`.`
+      );
+    }
+    throw new Error(`could not run \`npm view ${NPM_PACKAGE} version\`: ${msg}`);
   }
-  try {
-    const res = await httpsGet(
-      `https://api.github.com/repos/${repo}/releases/latest`,
-      { 'User-Agent': 'codegraph-upgrade', Accept: 'application/vnd.github+json' },
-      timeoutMs
+  if (r.status !== 0) {
+    throw new Error(
+      `\`npm view ${NPM_PACKAGE} version\` exited with code ${r.status}. Check npm registry config and network.`
     );
-    const tag = JSON.parse(res.body)?.tag_name;
-    if (typeof tag === 'string' && tag) return normalizeVersion(tag);
-  } catch {
-    /* fall through to error */
   }
-  throw new Error(
-    'could not resolve the latest version from GitHub. Check your network, or pin a version: `codegraph upgrade <version>`.'
-  );
+  const v = parseNpmViewVersion(r.stdout ?? '');
+  if (!v) {
+    throw new Error(
+      `could not parse a version from \`npm view ${NPM_PACKAGE} version\` output: ${JSON.stringify(r.stdout)}`
+    );
+  }
+  return normalizeVersion(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +266,8 @@ export function reindexAdvisory(): string {
     `  ${c.cyan('codegraph sync')}        ${c.dim('# incremental, fast')}`,
     `  ${c.cyan('codegraph index -f')}    ${c.dim('# full rebuild')}`,
     c.dim('(`codegraph status` flags any index that predates the engine you’re running.)'),
+    c.dim('If a CodeGraph MCP daemon is still running, it holds the OLD version in memory.'),
+    c.dim('Restart it (or wait for its idle timeout) so the next `codegraph serve` picks up the new build.'),
   ].join('\n');
 }
 
@@ -309,6 +276,30 @@ export function reindexAdvisory(): string {
  */
 export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promise<number> {
   const { currentVersion, method } = deps;
+
+  // npx / source: short-circuit before any registry work — nothing to install.
+  if (method.kind === 'npx') {
+    deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));
+    deps.log(c.dim(`Force a fresh fetch with: npx ${NPM_PACKAGE}@latest`));
+    return 0;
+  }
+  if (method.kind === 'source') {
+    deps.warn(`Running from a source checkout at ${method.root}.`);
+    deps.log(c.dim('Upgrade it with: git pull && npm run build'));
+    return 0;
+  }
+  if (method.kind === 'unknown') {
+    deps.error(`Couldn’t determine how CodeGraph was installed (${method.reason}).`);
+    deps.log(c.dim(`Reinstall manually: npm install -g ${NPM_PACKAGE}`));
+    return 1;
+  }
+
+  // npm: point npm at the Huawei registry first, so `npm view` / `npm install`
+  // can reach it. Idempotent — safe on every upgrade/check.
+  const cfg = ensureNpmRegistryConfig(deps);
+  if (cfg !== 0) {
+    return cfg;
+  }
 
   // Resolve the target version (pinned or latest).
   let latest: string;
@@ -320,7 +311,9 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   }
 
   const currentDisplay = normalizeVersion(currentVersion);
-  deps.log(`${c.bold('CodeGraph')}  current ${c.cyan(currentDisplay)}  ${opts.version ? 'target' : 'latest'} ${c.cyan(latest)}`);
+  deps.log(
+    `${c.bold('CodeGraph')}  current ${c.cyan(currentDisplay)}  ${opts.version ? 'target' : 'latest'} ${c.cyan(latest)}`
+  );
 
   const updateAvailable = isUpdateAvailable(currentVersion, latest);
 
@@ -340,116 +333,9 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
     return 0;
   }
 
-  // Dispatch by install method.
-  switch (method.kind) {
-    case 'bundle':
-      return method.os === 'windows'
-        ? upgradeWindowsBundle(method, latest, deps)
-        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps);
-    case 'npm':
-      // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
-      // latter resolves as a nonexistent dist-tag).
-      return upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
-    case 'npx':
-      deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));
-      deps.log(c.dim(`Force a fresh fetch with: npx ${NPM_PACKAGE}@latest`));
-      return 0;
-    case 'source':
-      deps.warn(`Running from a source checkout at ${method.root}.`);
-      deps.log(c.dim('Upgrade it with: git pull && npm run build'));
-      return 0;
-    default:
-      deps.error(`Couldn’t determine how CodeGraph was installed (${method.reason}).`);
-      deps.log(c.dim(`Reinstall manually — see https://github.com/${REPO}#install`));
-      return 1;
-  }
-}
-
-function upgradeUnixBundle(
-  method: Extract<InstallMethod, { kind: 'bundle' }>,
-  pinned: string | undefined,
-  deps: UpgradeDeps
-): number {
-  const downloader = deps.hasCommand('curl')
-    ? `curl -fsSL ${INSTALL_SH_URL}`
-    : deps.hasCommand('wget')
-      ? `wget -qO- ${INSTALL_SH_URL}`
-      : null;
-  if (!downloader) {
-    deps.error('Neither curl nor wget is available to download the installer.');
-    deps.log(c.dim(`Install curl, or run manually:  ${INSTALL_SH_URL} | sh`));
-    return 1;
-  }
-
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  if (method.installDir) env.CODEGRAPH_INSTALL_DIR = method.installDir;
-  if (pinned) env.CODEGRAPH_VERSION = pinned;
-
-  deps.log(c.dim(`Running the installer (${downloader} | sh)…`));
-  const code = deps.run('sh', ['-c', `${downloader} | sh`], env);
-  if (code !== 0) {
-    deps.error(`Installer exited with code ${code}.`);
-    return 1;
-  }
-  deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal if the version looks unchanged (PATH cache).'));
-  deps.log(reindexAdvisory());
-  return 0;
-}
-
-/** Build the in-place Windows upgrade script (exported for unit-testing). */
-export function buildWindowsUpgradeScript(bundleRoot: string, version: string, arch: string): string {
-  const target = `win32-${arch}`;
-  const url = `https://github.com/${REPO}/releases/download/${version}/codegraph-${target}.zip`;
-  // Windows can't DELETE a running exe but CAN rename it, so we upgrade IN
-  // PLACE: download → rename the locked node.exe aside → extract the new bundle
-  // over current\. Synchronous, no detached helper (which dies under SSH/job
-  // objects and has worse UX). The running process keeps its renamed node.exe
-  // mapped; the NEXT `codegraph` invocation uses the new one. We can't reuse
-  // install.ps1 here — it `Remove-Item`s current\, which fails on the locked exe.
-  return [
-    `$ErrorActionPreference='Stop'`,
-    `$dest='${bundleRoot}'`,
-    `$url='${url}'`,
-    `Write-Host "Downloading $url"`,
-    `$tmp=Join-Path $env:TEMP ('cg-up-'+[guid]::NewGuid().ToString('N'))`,
-    `New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
-    `$zip=Join-Path $tmp 'cg.zip'`,
-    `Invoke-WebRequest -Uri $url -OutFile $zip`,
-    `$stage=Join-Path $tmp 'stage'`,
-    `Expand-Archive -Path $zip -DestinationPath $stage -Force`,
-    `$inner=Join-Path $stage 'codegraph-${target}'`,
-    `$src=if(Test-Path $inner){$inner}else{$stage}`,
-    `$node=Join-Path $dest 'node.exe'`,
-    `if(Test-Path $node){Rename-Item -Path $node -NewName ('node.exe.old-'+[guid]::NewGuid().ToString('N')) -Force}`,
-    `Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force`,
-    `Get-ChildItem -Path $dest -Filter 'node.exe.old-*' -ErrorAction SilentlyContinue | ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {} }`,
-    `Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue`,
-    `Write-Host "Installed CodeGraph ${version} to $dest"`,
-  ].join(';');
-}
-
-function upgradeWindowsBundle(
-  method: Extract<InstallMethod, { kind: 'bundle' }>,
-  latest: string,
-  deps: UpgradeDeps
-): number {
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-  const script = buildWindowsUpgradeScript(method.bundleRoot, latest, arch);
-  // -EncodedCommand (base64 UTF-16LE), NOT -Command: Node's Windows argv→command
-  // -line quoting mangles a long multi-statement script, so PowerShell never
-  // parses it. Encoding sidesteps all shell quoting — the canonical approach.
-  const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  deps.log(c.dim(`Downloading and installing ${latest}…`));
-  const code = deps.run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]);
-  if (code !== 0) {
-    deps.error(`Installer exited with code ${code}.`);
-    return 1;
-  }
-  deps.log('');
-  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal to be safe (PATH/version cache).'));
-  deps.log(reindexAdvisory());
-  return 0;
+  // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
+  // latter resolves as a nonexistent dist-tag).
+  return upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
 }
 
 function upgradeNpm(
@@ -472,7 +358,7 @@ function upgradeNpm(
     return 1;
   }
   deps.log('');
-  deps.log(c.green('✓ Upgrade complete.'));
+  deps.log(c.green('✓ Upgrade complete.') + c.dim(' Open a new terminal to see the new version.'));
   deps.log(reindexAdvisory());
   return 0;
 }

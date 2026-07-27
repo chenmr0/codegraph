@@ -4,17 +4,18 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import {
   detectInstallMethod,
-  deriveInstallDir,
   parseSemver,
   compareVersions,
   isUpdateAvailable,
   normalizeVersion,
   stripV,
-  parseLatestTagFromLocation,
+  parseNpmViewVersion,
+  ensureNpmRegistryConfig,
   reindexAdvisory,
   runUpgrade,
-  buildWindowsUpgradeScript,
   NPM_PACKAGE,
+  HUAWEI_REGISTRY,
+  HUAWEI_SDD_REGISTRY,
   type InstallMethod,
   type UpgradeDeps,
 } from '../src/upgrade';
@@ -26,47 +27,8 @@ import { CodeGraph } from '../src';
 // ---------------------------------------------------------------------------
 
 describe('detectInstallMethod', () => {
-  // A bundle exists if a vendored node + launcher sit next to lib/.
-  function bundleExists(present: Set<string>) {
-    return (p: string) => present.has(p.replace(/\\/g, '/'));
-  }
-
-  it('detects a unix bundle and derives the install dir from the versions/ layout', () => {
-    const root = '/home/u/.codegraph/versions/v0.9.9';
-    const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node`, `${root}/bin/codegraph`, '/home/u/.codegraph']);
-    const m = detectInstallMethod({
-      filename,
-      platform: 'linux',
-      cwd: '/home/u/project',
-      exists: bundleExists(present),
-    });
-    expect(m).toEqual({
-      kind: 'bundle',
-      os: 'unix',
-      bundleRoot: root,
-      installDir: '/home/u/.codegraph',
-    });
-  });
-
-  it('detects a windows bundle and derives the install dir from current\\', () => {
-    const root = 'C:/Users/u/AppData/Local/codegraph/current';
-    const filename = `${root}/lib/dist/bin/codegraph.js`;
-    const present = new Set([`${root}/node.exe`, `${root}/bin/codegraph.cmd`]);
-    const m = detectInstallMethod({
-      filename,
-      platform: 'win32',
-      cwd: 'C:/Users/u/project',
-      exists: bundleExists(present),
-    }) as Extract<InstallMethod, { kind: 'bundle' }>;
-    expect(m.kind).toBe('bundle');
-    expect(m.os).toBe('windows');
-    // win32 path math emits backslashes; compare separator-independently.
-    expect(m.installDir?.replace(/\\/g, '/')).toBe('C:/Users/u/AppData/Local/codegraph');
-  });
-
   it('detects a global npm install', () => {
-    const filename = '/usr/local/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
+    const filename = '/usr/local/lib/node_modules/@sdd/codegraph-wx/dist/bin/codegraph.js';
     const m = detectInstallMethod({
       filename,
       platform: 'linux',
@@ -78,13 +40,13 @@ describe('detectInstallMethod', () => {
 
   it('detects a local (project) npm install as local', () => {
     const cwd = '/home/u/project';
-    const filename = `${cwd}/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js`;
+    const filename = `${cwd}/node_modules/@sdd/codegraph-wx/dist/bin/codegraph.js`;
     const m = detectInstallMethod({ filename, platform: 'linux', cwd, exists: () => false });
     expect(m).toEqual({ kind: 'npm', scope: 'local' });
   });
 
   it('detects an npx run from the _npx cache', () => {
-    const filename = '/home/u/.npm/_npx/abc123/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js';
+    const filename = '/home/u/.npm/_npx/abc123/node_modules/@sdd/codegraph-wx/dist/bin/codegraph.js';
     const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: () => false });
     expect(m).toEqual({ kind: 'npx' });
   });
@@ -97,7 +59,7 @@ describe('detectInstallMethod', () => {
       filename,
       platform: 'darwin',
       cwd: repo,
-      exists: bundleExists(present),
+      exists: (p) => present.has(p.replace(/\\/g, '/')),
     });
     expect(m).toEqual({ kind: 'source', root: repo });
   });
@@ -110,21 +72,6 @@ describe('detectInstallMethod', () => {
       exists: () => false,
     });
     expect(m.kind).toBe('unknown');
-  });
-});
-
-describe('deriveInstallDir', () => {
-  it('unix: returns the dir above versions/', () => {
-    expect(deriveInstallDir('/a/b/.codegraph/versions/v1.2.3', 'unix', () => true)).toBe('/a/b/.codegraph');
-  });
-  it('unix: null when not under versions/', () => {
-    expect(deriveInstallDir('/a/b/somewhere', 'unix', () => true)).toBeNull();
-  });
-  it('windows: returns the parent of current\\', () => {
-    expect(deriveInstallDir('C:/x/codegraph/current', 'windows', () => true)?.replace(/\\/g, '/')).toBe('C:/x/codegraph');
-  });
-  it('windows: null when basename is not current', () => {
-    expect(deriveInstallDir('C:/x/codegraph/v1', 'windows', () => true)).toBeNull();
   });
 });
 
@@ -161,27 +108,71 @@ describe('version helpers', () => {
     expect(stripV('0.9.9')).toBe('0.9.9');
   });
 
-  it('parseLatestTagFromLocation extracts the tag from a releases redirect', () => {
-    expect(parseLatestTagFromLocation('https://github.com/colbymchenry/codegraph/releases/tag/v0.9.9')).toBe('v0.9.9');
-    expect(parseLatestTagFromLocation('https://github.com/o/r/releases/tag/v1.2.3?foo=bar')).toBe('v1.2.3');
-    expect(parseLatestTagFromLocation(undefined)).toBeNull();
-    expect(parseLatestTagFromLocation('https://github.com/o/r/releases')).toBeNull();
+  it('parseNpmViewVersion takes the last semver-shaped line (skips advisory noise)', () => {
+    expect(parseNpmViewVersion('0.9.9\n')).toBe('0.9.9');
+    expect(parseNpmViewVersion('npm warn ... deprecation\n0.9.10\n')).toBe('0.9.10');
+    expect(parseNpmViewVersion('\n  v1.2.3  \n')).toBe('v1.2.3');
+    expect(parseNpmViewVersion('not a version\nstill not')).toBeNull();
+    expect(parseNpmViewVersion('')).toBeNull();
   });
 
-  it('reindexAdvisory mentions the refresh commands', () => {
+  it('reindexAdvisory mentions the refresh commands + daemon restart hint', () => {
     const a = reindexAdvisory();
     expect(a).toContain('codegraph sync');
     expect(a).toContain('codegraph index -f');
+    expect(a).toMatch(/daemon/i);
+    expect(a).toMatch(/restart/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureNpmRegistryConfig — the three `npm config set` commands
+// ---------------------------------------------------------------------------
+
+describe('ensureNpmRegistryConfig', () => {
+  function makeDeps(platform: NodeJS.Platform, runExit: (args: string[]) => number = () => 0) {
+    const runs: Array<{ cmd: string; args: string[] }> = [];
+    const errors: string[] = [];
+    const deps: UpgradeDeps = {
+      currentVersion: '0.9.9',
+      method: { kind: 'npm', scope: 'global' },
+      resolveLatest: async () => 'v0.9.9',
+      run: (cmd, args) => {
+        runs.push({ cmd, args });
+        return runExit(args);
+      },
+      hasCommand: () => true,
+      log: () => {},
+      warn: () => {},
+      error: (m) => errors.push(m),
+      platform,
+    };
+    return { deps, runs, errors };
+  }
+
+  it('runs the three npm config set commands in order with the Huawei URLs', () => {
+    const { deps, runs, errors } = makeDeps('linux');
+    expect(ensureNpmRegistryConfig(deps)).toBe(0);
+    expect(errors).toHaveLength(0);
+    expect(runs).toHaveLength(3);
+    expect(runs[0].args).toEqual(['config', 'set', 'registry', HUAWEI_REGISTRY]);
+    expect(runs[1].args).toEqual(['config', 'set', '@sdd:registry', HUAWEI_SDD_REGISTRY]);
+    expect(runs[2].args).toEqual(['config', 'set', 'strict-ssl', 'false']);
   });
 
-  it('buildWindowsUpgradeScript targets the right asset per arch and renames-not-deletes the exe', () => {
-    const arm = buildWindowsUpgradeScript('C:\\cg\\current', 'v1.2.3', 'arm64');
-    expect(arm).toContain('releases/download/v1.2.3/codegraph-win32-arm64.zip');
-    expect(arm).toContain("$dest='C:\\cg\\current'");
-    expect(arm).toContain('Rename-Item'); // never Remove-Item on the locked exe
-    expect(arm).not.toMatch(/Remove-Item[^;]*\$dest'?\s*;/); // doesn't delete current\
-    const x64 = buildWindowsUpgradeScript('C:\\cg\\current', 'v1.2.3', 'x64');
-    expect(x64).toContain('codegraph-win32-x64.zip');
+  it('uses npm.cmd on win32', () => {
+    const { deps, runs } = makeDeps('win32');
+    ensureNpmRegistryConfig(deps);
+    expect(runs.every((r) => r.cmd === 'npm.cmd')).toBe(true);
+  });
+
+  it('stops and returns the failing exit code when a config set fails', () => {
+    const { deps, runs, errors } = makeDeps('linux', (args) =>
+      args[2] === '@sdd:registry' ? 1 : 0
+    );
+    expect(ensureNpmRegistryConfig(deps)).toBe(1);
+    expect(runs).toHaveLength(2); // registry succeeded, @sdd:registry failed, strict-ssl not run
+    expect(errors.join('\n')).toMatch(/@sdd:registry/);
   });
 });
 
@@ -206,7 +197,10 @@ function makeDeps(
     resolveLatest: overrides.resolveLatest ?? (async () => 'v0.9.9'),
     run: (cmd, args, env) => {
       calls.runs.push({ cmd, args, env });
-      return runExit;
+      // `npm install` is the real action under test; `npm config set` always
+      // succeeds in the orchestrator tests so we can isolate install behavior.
+      if (args[0] === 'install') return runExit;
+      return 0;
     },
     hasCommand: overrides.hasCommand ?? ((c) => c === 'curl'),
     log: (m) => calls.logs.push(m),
@@ -217,112 +211,57 @@ function makeDeps(
   return { deps, calls };
 }
 
-/** Decode a `-EncodedCommand` base64 (UTF-16LE) payload back to its script. */
-function decodeEncodedCommand(args: string[]): string {
-  const i = args.indexOf('-EncodedCommand');
-  if (i < 0) throw new Error('no -EncodedCommand in args');
-  return Buffer.from(args[i + 1]!, 'base64').toString('utf16le');
+/** The `npm install` call, if any, among the recorded runs. */
+function installRun(calls: Calls) {
+  return calls.runs.find((r) => r.args[0] === 'install');
 }
 
 describe('runUpgrade', () => {
-  it('does nothing when already up to date', async () => {
+  it('does nothing (no install) when already up to date, but still configures the registry', async () => {
     const { deps, calls } = makeDeps({ method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.9' });
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
-    expect(calls.runs).toHaveLength(0);
+    expect(installRun(calls)).toBeUndefined();
+    expect(calls.runs.filter((r) => r.args[0] === 'config')).toHaveLength(3);
     expect(calls.logs.join('\n')).toMatch(/up to date/i);
   });
 
-  it('--check reports an available update without running anything', async () => {
+  it('--check reports an available update without installing (registry still configured)', async () => {
     const { deps, calls } = makeDeps({
       method: { kind: 'npm', scope: 'global' },
       currentVersion: '0.9.8',
     });
     const code = await runUpgrade({ check: true }, deps);
     expect(code).toBe(0);
-    expect(calls.runs).toHaveLength(0);
+    expect(installRun(calls)).toBeUndefined();
+    expect(calls.runs.filter((r) => r.args[0] === 'config')).toHaveLength(3);
     expect(calls.logs.join('\n')).toMatch(/update is available/i);
   });
 
-  it('unix bundle: runs the installer via sh with the derived install dir', async () => {
-    const { deps, calls } = makeDeps({
-      method: { kind: 'bundle', os: 'unix', bundleRoot: '/h/.codegraph/versions/v0.9.8', installDir: '/h/.codegraph' },
-      currentVersion: '0.9.8',
-    });
-    const code = await runUpgrade({}, deps);
-    expect(code).toBe(0);
-    expect(calls.runs).toHaveLength(1);
-    expect(calls.runs[0].cmd).toBe('sh');
-    expect(calls.runs[0].args[0]).toBe('-c');
-    expect(calls.runs[0].args[1]).toContain('curl -fsSL');
-    expect(calls.runs[0].args[1]).toContain('| sh');
-    expect(calls.runs[0].env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
-    expect(calls.logs.join('\n')).toMatch(/codegraph sync/); // re-index advisory printed
-  });
-
-  it('unix bundle: falls back to wget, and errors when neither downloader exists', async () => {
-    const { deps, calls } = makeDeps({
-      method: { kind: 'bundle', os: 'unix', bundleRoot: '/h/.codegraph/versions/v0.9.8', installDir: null },
-      currentVersion: '0.9.8',
-      hasCommand: () => false,
-    });
-    const code = await runUpgrade({}, deps);
-    expect(code).toBe(1);
-    expect(calls.runs).toHaveLength(0);
-    expect(calls.errors.join('\n')).toMatch(/curl nor wget/i);
-  });
-
-  it('windows bundle: runs a synchronous in-place (rename + extract) powershell upgrade', async () => {
-    const { deps, calls } = makeDeps({
-      method: { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
-      currentVersion: '0.9.8',
-      platform: 'win32',
-    });
-    const code = await runUpgrade({}, deps);
-    expect(code).toBe(0);
-    expect(calls.runs).toHaveLength(1);
-    expect(calls.runs[0].cmd).toBe('powershell.exe');
-    const decoded = decodeEncodedCommand(calls.runs[0].args);
-    // Downloads the right asset, renames the locked exe aside, copies over current\.
-    expect(decoded).toContain('releases/download/v0.9.9/codegraph-win32-');
-    expect(decoded).toContain('Rename-Item');
-    expect(decoded).toContain('node.exe.old-');
-    expect(decoded).toContain('Copy-Item');
-  });
-
-  it('windows bundle: a non-zero installer exit is a failure', async () => {
-    const { deps, calls } = makeDeps(
-      {
-        method: { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
-        currentVersion: '0.9.8',
-        platform: 'win32',
-      },
-      1
-    );
-    const code = await runUpgrade({}, deps);
-    expect(code).toBe(1);
-    expect(calls.errors.join('\n')).toMatch(/exited with code/i);
-  });
-
-  it('npm global: shells out to npm install -g @pkg@latest', async () => {
+  it('npm global: configures registry then runs npm install -g @pkg@latest', async () => {
     const { deps, calls } = makeDeps({
       method: { kind: 'npm', scope: 'global' },
       currentVersion: '0.9.8',
     });
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
-    expect(calls.runs[0].cmd).toBe('npm');
-    expect(calls.runs[0].args).toEqual(['install', '-g', `${NPM_PACKAGE}@latest`]);
+    const inst = installRun(calls);
+    expect(inst).toBeDefined();
+    expect(inst!.cmd).toBe('npm');
+    expect(inst!.args).toEqual(['install', '-g', `${NPM_PACKAGE}@latest`]);
+    // registry config ran first
+    expect(calls.runs[0].args[0]).toBe('config');
   });
 
-  it('npm on win32 uses npm.cmd', async () => {
+  it('npm on win32 uses npm.cmd for both config and install', async () => {
     const { deps, calls } = makeDeps({
       method: { kind: 'npm', scope: 'global' },
       currentVersion: '0.9.8',
       platform: 'win32',
     });
     await runUpgrade({}, deps);
-    expect(calls.runs[0].cmd).toBe('npm.cmd');
+    expect(calls.runs.every((r) => r.cmd === 'npm.cmd')).toBe(true);
+    expect(installRun(calls)!.cmd).toBe('npm.cmd');
   });
 
   it('npm: a pinned version is passed through as @<version>', async () => {
@@ -331,11 +270,10 @@ describe('runUpgrade', () => {
       currentVersion: '0.9.9',
     });
     await runUpgrade({ version: '0.9.8' }, deps);
-    // npm spec carries no leading "v".
-    expect(calls.runs[0].args).toEqual(['install', '-g', `${NPM_PACKAGE}@0.9.8`]);
+    expect(installRun(calls)!.args).toEqual(['install', '-g', `${NPM_PACKAGE}@0.9.8`]);
   });
 
-  it('npm: surfaces a non-zero exit as failure', async () => {
+  it('npm: surfaces a non-zero install exit as failure', async () => {
     const { deps, calls } = makeDeps(
       { method: { kind: 'npm', scope: 'global' }, currentVersion: '0.9.8' },
       1
@@ -345,7 +283,30 @@ describe('runUpgrade', () => {
     expect(calls.errors.join('\n')).toMatch(/npm exited/i);
   });
 
-  it('npx: nothing to upgrade', async () => {
+  it('npm: a failing registry config aborts before resolve/install', async () => {
+    // Custom run: fail the first `npm config set`.
+    const calls: Calls = { runs: [], logs: [], errors: [] };
+    const deps: UpgradeDeps = {
+      currentVersion: '0.9.8',
+      method: { kind: 'npm', scope: 'global' },
+      resolveLatest: async () => 'v0.9.9',
+      run: (cmd, args) => {
+        calls.runs.push({ cmd, args });
+        return args[0] === 'config' && args[2] === 'registry' ? 1 : 0;
+      },
+      hasCommand: () => true,
+      log: (m) => calls.logs.push(m),
+      warn: (m) => calls.logs.push(m),
+      error: (m) => calls.errors.push(m),
+      platform: 'linux',
+    };
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(1);
+    expect(installRun(calls)).toBeUndefined();
+    expect(calls.errors.join('\n')).toMatch(/npm config set registry/);
+  });
+
+  it('npx: nothing to upgrade, no registry config', async () => {
     const { deps, calls } = makeDeps({ method: { kind: 'npx' }, currentVersion: '0.9.8' });
     const code = await runUpgrade({}, deps);
     expect(code).toBe(0);
@@ -362,6 +323,17 @@ describe('runUpgrade', () => {
     expect(code).toBe(0);
     expect(calls.runs).toHaveLength(0);
     expect(calls.logs.join('\n')).toMatch(/git pull/);
+  });
+
+  it('unknown: errors and suggests a manual reinstall', async () => {
+    const { deps, calls } = makeDeps({
+      method: { kind: 'unknown', reason: 'weird layout' },
+      currentVersion: '0.9.8',
+    });
+    const code = await runUpgrade({}, deps);
+    expect(code).toBe(1);
+    expect(calls.runs).toHaveLength(0);
+    expect(calls.logs.join('\n')).toContain(NPM_PACKAGE);
   });
 });
 
