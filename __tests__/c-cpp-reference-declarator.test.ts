@@ -120,4 +120,78 @@ APIRegister& APIRegister::get_instance() { static APIRegister i; return i; }`,
     expect(methods).toContain('writeLog');
     expect(methods).toContain('get_instance');
   });
+
+  // Free-function PROTOTYPE (bodiless declaration) at file/namespace scope with
+  // reference return. tree-sitter-cpp wraps the function_declarator in a
+  // reference_declarator; childForFieldName("declarator") returns null on
+  // reference_declarator (a web-tree-sitter quirk that does NOT affect
+  // pointer_declarator), so the prototype path's getChildByField came back
+  // empty and the whole prototype was silently dropped — even though the
+  // .cpp definition survived via extractName's namedChild(0) fallback and
+  // class methods survived via extractField's by-type unwrap. This is the
+  // user-reported TrmGetPidSrvRef case.
+  it('free reference-return prototype is extracted, not dropped', () => {
+    const result = extractFromSource(
+      'trm_srv.h',
+      `#ifndef TRM_SRV_H
+#define TRM_SRV_H
+typedef unsigned int VOS_UINT32;
+class CTrmSrv { public: int x; };
+CTrmSrv* TrmGetPidSrv(VOS_UINT32 ulPid);
+CTrmSrv& TrmGetPidSrvRef(VOS_UINT32 ulPid);
+#endif`,
+    );
+    const fns = namesOf(result, 'function');
+    expect(fns).toContain('TrmGetPidSrv');
+    expect(fns).toContain('TrmGetPidSrvRef');
+    // No mangled name with the declarator text leaking through.
+    expect(fns.some((n) => n.startsWith('&'))).toBe(false);
+  });
+
+  it('rvalue-reference (&&) and ref-to-pointer (*&) prototypes are extracted', () => {
+    const result = extractFromSource(
+      'a.h',
+      `class Ostream {};
+Ostream& makeRef(int x);
+int&& rvalueProto(int x);
+int*& refPtrProto(int x);`,
+    );
+    const fns = namesOf(result, 'function');
+    expect(fns).toContain('makeRef');
+    expect(fns).toContain('rvalueProto');
+    expect(fns).toContain('refPtrProto');
+    expect(fns.some((n) => n.includes('&&'))).toBe(false);
+    expect(fns.some((n) => n.includes('*&') || n.includes('&*'))).toBe(false);
+  });
+
+  it('macro-prefixed reference-return prototype is extracted', () => {
+    const result = extractFromSource(
+      'a.h',
+      `#define RRE_ATTRIBUTE_VISIBILITY __attribute__((visibility("default")))
+class CTrmSrv {};
+RRE_ATTRIBUTE_VISIBILITY CTrmSrv& TrmGetPidSrvRef();
+CTrmSrv* TrmGetPidSrv();`,
+    );
+    const fns = namesOf(result, 'function');
+    // After macro replacement, both prototypes must survive; the reference one
+    // is the one that was previously dropped.
+    expect(fns).toContain('TrmGetPidSrvRef');
+    expect(fns).toContain('TrmGetPidSrv');
+  });
+
+  it('regression: pointer/value-return prototypes alongside reference prototypes', () => {
+    const result = extractFromSource(
+      'a.h',
+      `class C {};
+C* ptrProto(int x);
+C& refProto(int x);
+C  valProto(int x);
+int& intRefProto(int x);`,
+    );
+    const fns = namesOf(result, 'function');
+    expect(fns).toContain('ptrProto');
+    expect(fns).toContain('refProto');
+    expect(fns).toContain('valProto');
+    expect(fns).toContain('intRefProto');
+  });
 });

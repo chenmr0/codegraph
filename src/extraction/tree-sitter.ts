@@ -2766,6 +2766,25 @@ export class TreeSitterExtractor {
           if (!innerDecl) {
             innerDecl = child.namedChildren.find(c => c.type === 'field_identifier') ?? null;
           }
+          // C++ reference-return prototype: tree-sitter-cpp parses `T& foo();`
+          // as `declaration → reference_declarator → function_declarator → identifier`
+          // (structurally identical to the pointer-return `pointer_declarator`
+          // form). `reference_declarator` DOES expose its inner declarator via the
+          // `declarator` field (fieldNameForChild returns "declarator"), but
+          // `childForFieldName("declarator")` returns null on `reference_declarator`
+          // — a web-tree-sitter/grammar quirk that does NOT affect
+          // `pointer_declarator`. So `getChildByField` comes back empty here, and
+          // without this fallback the reference-return prototype (`T& foo();`,
+          // `T&& foo();`, `ostream& operator<<(...)`) at file/namespace scope is
+          // dropped entirely (the .cpp definition survives via extractName's
+          // namedChild(0) fallback; class methods survive via extractField's
+          // by-type unwrap — only this free-function prototype path lacked it).
+          // `unwrapDeclarator` already handles reference_declarator through its
+          // own `namedChild(0)` fallback, so passing the wrapper itself through
+          // resolves the inner function_declarator → identifier.
+          if (!innerDecl) {
+            innerDecl = child;
+          }
           if (innerDecl) {
             const idNode = unwrapDeclarator(innerDecl);
             if (idNode && (idNode.type === 'identifier' || idNode.type === 'field_identifier')) {
