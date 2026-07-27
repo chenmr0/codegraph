@@ -221,12 +221,22 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   const out: string[] = [];
   let i = 0;
   let parenDepth = 0;
-  // Brace context stack: true = initializer list / aggregate body (don't
-  // replace macros), false = function body / statement block (replace OK).
-  // Without this, macros like NULL inside `{ NULL, 0 }` initializer lists get
-  // wrongly replaced with `0;` because parenDepth is 0 and the next token is
-  // ',' (not ';' or '{'), producing illegal syntax that breaks tree-sitter.
-  const braceStack: boolean[] = [];
+  // Brace context stack — records the KIND of each `{` so macro-replacement
+  // decisions can distinguish contexts that share the same parenDepth:
+  //   'init'      initializer list / aggregate body  `{ NULL, 0 }`  → don't replace
+  //   'enum'      enum body (enumerator initializers)             → don't replace
+  //   'struct'    struct body (C field list OR C++ class-style)   → see below
+  //   'class'     class body                                      → see below
+  //   'stmt'      function body / statement block                 → replace OK
+  //   'namespace' namespace body                                  → replace OK
+  // In 'struct'/'class' bodies: function-like macros `MACRO(...)` are statement
+  // macros and ARE replaced (C++ debug macros like TO_STRING_KV(...) sit at
+  // class-body top level and must become `0;` or tree-sitter swallows the class).
+  // But an object-like macro `MACRO` on its own line is a FIELD macro member
+  // (C `typedef struct { VOS_MSG_HEADER ... }`) — replacing it with `0;` makes
+  // the field list illegal and the whole struct is lost. So object-like macros
+  // are kept verbatim here; the replace decision is in the identifier handler.
+  const braceStack: string[] = [];
 
   // Scan back over `out` to find the last non-whitespace character — used to
   // classify a `{` as function body (preceded by ')', ':', ';', '}') vs
@@ -415,18 +425,23 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     if (c === '(') { parenDepth++; out.push(c); i++; continue; }
     if (c === ')') { parenDepth--; out.push(c); i++; continue; }
 
-    // Track brace context — classify each `{` as function body (false) or
-    // initializer list / aggregate body (true).  This prevents macro
-    // replacement inside `{ NULL, 0 }` etc. where parenDepth is 0 but the
-    // context is NOT a statement context.
+    // Track brace context — classify each `{` by kind (see braceStack decl).
     if (c === '{') {
       const pc = prevNonSpaceChar();
       const pw = prevWord();
       const tk = findTypeKeyword();
-      const isFuncBody = (pc === ')' || pc === ':' || pc === ';' || pc === '}') ||
-                         (pw === 'do' || pw === 'else' || pw === 'try' || pw === 'finally') ||
-                         (tk === 'class' || tk === 'struct' || tk === 'namespace');
-      braceStack.push(!isFuncBody);
+      // Type keywords win over the `)`/`:`/`;` heuristics: `class Foo : Base {`
+      // has pc=':' but is a class body; `typedef struct {` has pc=identifier-char
+      // but is a struct body.
+      let kind: string;
+      if (tk === 'namespace') kind = 'namespace';
+      else if (tk === 'enum') kind = 'enum';
+      else if (tk === 'class') kind = 'class';
+      else if (tk === 'struct') kind = 'struct';
+      else if (pc === ')' || pc === ':' || pc === ';' || pc === '}' ||
+               pw === 'do' || pw === 'else' || pw === 'try' || pw === 'finally') kind = 'stmt';
+      else kind = 'init';
+      braceStack.push(kind);
       out.push(c);
       i++;
       continue;
@@ -439,7 +454,8 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     }
 
     // Identifier at depth 0 — candidate statement-level macro.
-    const inNoReplace = braceStack.length > 0 && braceStack[braceStack.length - 1] === true;
+    const braceTop = braceStack.length > 0 ? braceStack[braceStack.length - 1] : '';
+    const inNoReplace = braceTop === 'init' || braceTop === 'enum';
     if (isIdentStart(c) && parenDepth === 0 && !inNoReplace) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
@@ -628,6 +644,23 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
               continue;
             }
           }
+        }
+
+        // Object-like macro (`MACRO`, no parentheses) on its own line inside a
+        // struct/class body is a FIELD macro member, not a statement macro —
+        // e.g. C `typedef struct { VOS_MSG_HEADER; BBRF_MSG_HEADER; ... }`.
+        // Replacing it with `0;` makes the field_declaration_list illegal and
+        // tree-sitter loses the whole struct (the user-reported
+        // BBRF_SIMPLE_COMM_RESP_STRU regression). Keep it verbatim; tree-sitter
+        // parses it as a (possibly mistyped) field but the struct survives and
+        // the typedef name is queryable. Function-like macros `MACRO(...)` are
+        // NOT covered here (invEnd > j) — those stay statement macros and are
+        // replaced below, which C++ class-body debug macros like TO_STRING_KV
+        // require to avoid swallowing the class.
+        if ((braceTop === 'struct' || braceTop === 'class') && invEnd === j) {
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
         }
 
         // Statement-level macro → replace with `0;` + spaces.

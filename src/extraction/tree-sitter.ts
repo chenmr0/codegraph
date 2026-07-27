@@ -2010,6 +2010,22 @@ export class TreeSitterExtractor {
         if (current && current.type === 'field_identifier') {
           fieldEntries.push({ name: getNodeText(current, this.source), posNode: current });
         }
+        // C/C++ struct field macro member: a macro on its own line inside a
+        // struct/class body (e.g. `typedef struct { VOS_MSG_HEADER; BBRF_MSG_HEADER; ... }`)
+        // is parsed by tree-sitter as a field_declaration whose `type` is the
+        // macro name (a type_identifier) — the macro member was mistaken for
+        // the field's type, with the NEXT macro member becoming the
+        // field_identifier declarator. extractField only collects
+        // field_identifiers, so the type-position macro is silently dropped
+        // (VOS_MSG_HEADER lost while BBRF_MSG_HEADER is kept). Extract that
+        // type_identifier as a field too so every macro member is queryable.
+        // Restricted to names in globalMacroNames: a real type like `MyStruct`
+        // is NOT a macro and must stay a type (it lives in the signature, not
+        // as a field node).
+        else if (current && current.type === 'type_identifier'
+          && this.globalMacroNames && this.globalMacroNames.has(getNodeText(current, this.source))) {
+          fieldEntries.push({ name: getNodeText(current, this.source), posNode: current });
+        }
       }
       if (fieldEntries.length > 0) {
         // Build type text from the type-child for the signature
