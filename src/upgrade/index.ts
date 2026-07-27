@@ -73,9 +73,17 @@ export function detectInstallMethod(input: DetectInput): InstallMethod {
   }
 
   // npm install (global or local): lives under a node_modules tree.
+  // Local = a project install sitting in `<cwd>/node_modules/...` (the
+  // node_modules dir is a direct child of cwd). Anything else under a
+  // node_modules tree is a global install — even when the global prefix
+  // happens to live beneath cwd (e.g. cwd is the user's home and the npm
+  // prefix is `<home>\AppData\Roaming\npm`). The looser "anywhere under cwd"
+  // check mis-detected that case as local, dropping `-g` and installing into
+  // the wrong place.
   if (norm.includes('/node_modules/')) {
-    const underCwd = norm.startsWith(toPosix(P.resolve(input.cwd)) + '/');
-    return { kind: 'npm', scope: underCwd ? 'local' : 'global' };
+    const cwdPosix = toPosix(P.resolve(input.cwd));
+    const isLocal = norm.startsWith(cwdPosix + '/node_modules/');
+    return { kind: 'npm', scope: isLocal ? 'local' : 'global' };
   }
 
   // Source checkout: running <repo>/dist/bin/codegraph.js with a sibling .git.

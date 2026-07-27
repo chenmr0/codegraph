@@ -45,6 +45,15 @@ describe('detectInstallMethod', () => {
     expect(m).toEqual({ kind: 'npm', scope: 'local' });
   });
 
+  it('treats a global npm prefix nested under cwd (home dir) as global, not local', () => {
+    // cwd is the user's home; the npm global prefix lives under <home>/AppData/Roaming/npm.
+    // Must NOT be mis-detected as a project-local install (would drop `-g`).
+    const cwd = 'C:/Users/c00909920';
+    const filename = `${cwd}/AppData/Roaming/npm/node_modules/@sdd/codegraph-wx/dist/bin/codegraph.js`;
+    const m = detectInstallMethod({ filename, platform: 'win32', cwd, exists: () => false });
+    expect(m).toEqual({ kind: 'npm', scope: 'global' });
+  });
+
   it('detects an npx run from the _npx cache', () => {
     const filename = '/home/u/.npm/_npx/abc123/node_modules/@sdd/codegraph-wx/dist/bin/codegraph.js';
     const m = detectInstallMethod({ filename, platform: 'linux', cwd: '/home/u', exists: () => false });
