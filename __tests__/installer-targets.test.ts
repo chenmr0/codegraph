@@ -290,15 +290,17 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
   });
 
-  it('opencode: install does NOT write an AGENTS.md instructions file (#529)', () => {
+  it('opencode: install writes the AGENTS.md codegraph block (#704)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('global', { autoAllow: true });
     const agentsMd = path.join(tmpHome, '.config', 'opencode', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(false);
-    expect(result.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph_search');
+    expect(fs.readFileSync(agentsMd, 'utf-8')).not.toContain('codegraph_explore');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('created');
   });
 
-  it('opencode: install strips a legacy AGENTS.md codegraph block, preserving user content (#529)', () => {
+  it('opencode: install replaces a legacy AGENTS.md codegraph block, preserving user content', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
@@ -310,8 +312,10 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
-    expect(body).not.toContain('CODEGRAPH_START');
-    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('removed');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph_search');
+    expect(body).not.toContain('codegraph_explore');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('updated');
   });
 
   it('opencode: uninstall strips a leftover codegraph block from AGENTS.md, keeping user content', () => {
@@ -329,24 +333,26 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
-  it('opencode: local install writes ./opencode.jsonc and never an ./AGENTS.md (#529)', () => {
+  it('opencode: local install writes ./opencode.jsonc and the ./AGENTS.md block (#704)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(false);
-    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(false);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
   });
 
-  it('gemini: install writes settings.json (mcpServers.codegraph) and no GEMINI.md (#529)', () => {
+  it('gemini: install writes settings.json (mcpServers.codegraph) and the GEMINI.md block (#704)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('global', { autoAllow: true });
     const settings = path.join(tmpHome, '.gemini', 'settings.json');
     const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
     expect(result.files.some((f) => f.path === settings)).toBe(true);
-    expect(result.files.some((f) => f.path === geminiMd)).toBe(false);
-    expect(fs.existsSync(geminiMd)).toBe(false);
+    expect(result.files.some((f) => f.path === geminiMd)).toBe(true);
+    expect(fs.existsSync(geminiMd)).toBe(true);
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toContain('codegraph_search');
+    expect(fs.readFileSync(geminiMd, 'utf-8')).not.toContain('codegraph_explore');
 
     const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
     expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
@@ -383,13 +389,13 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after.mcpServers).toBeUndefined();
   });
 
-  it('gemini: local install writes ./.gemini/settings.json and never a ./GEMINI.md (#529)', () => {
+  it('gemini: local install writes ./.gemini/settings.json and the project-root ./GEMINI.md block (#704)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     expect(paths.some((p) => p.endsWith('/.gemini/settings.json'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(false);
-    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(false);
+    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(true);
   });
 
   it('gemini: uninstall strips a leftover GEMINI.md codegraph block, keeping user content', () => {
@@ -880,15 +886,19 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cfg.mcpServers.codegraph).toBeDefined();
   });
 
-  it('claude: install does NOT create a CLAUDE.md instructions file (#529)', () => {
+  it('claude: install creates the CLAUDE.md codegraph block (#704)', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
     const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
-    expect(fs.existsSync(claudeMd)).toBe(false);
-    expect(result.files.some((f) => f.path.endsWith('CLAUDE.md'))).toBe(false);
+    expect(fs.existsSync(claudeMd)).toBe(true);
+    const body = fs.readFileSync(claudeMd, 'utf-8');
+    expect(body).toContain('## CodeGraph');
+    expect(body).toContain('codegraph_search');
+    expect(body).not.toContain('codegraph_explore');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('created');
   });
 
-  it('claude: install strips a legacy CLAUDE.md codegraph block, keeping user content (#529)', () => {
+  it('claude: install replaces a legacy CLAUDE.md codegraph block, keeping user content', () => {
     const claude = getTarget('claude')!;
     const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
     fs.mkdirSync(path.dirname(claudeMd), { recursive: true });
@@ -899,8 +909,10 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(claudeMd, 'utf-8');
     expect(body).toContain('# My project rules');
     expect(body).toContain('Use tabs.');
-    expect(body).not.toContain('CODEGRAPH_START');
-    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('removed');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph_search');
+    expect(body).not.toContain('codegraph_explore');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('updated');
   });
 
   it('claude: global install targets ~/.claude.json (user scope)', () => {

@@ -41,6 +41,7 @@ import {
   jsonDeepEqual,
   readJsonFile,
   removeMarkedSection,
+  upsertInstructionsEntry,
   writeJsonFile,
 } from './shared';
 import {
@@ -106,12 +107,12 @@ class CodeAgentTarget implements AgentTarget {
       files.push(writePermissionsEntry(loc));
     }
 
-    // 3. AGENTS.md instructions — no longer written. The codegraph
-    // usage guidance ships solely in the MCP server's `initialize`
-    // response (issue #529). Strip any block a previous install left
-    // behind so an upgrade self-heals — same idiom as the other targets.
-    const instrCleanup = removeInstructionsEntry(loc);
-    if (instrCleanup.action === 'removed') files.push(instrCleanup);
+    // 3. AGENTS.md — the short marker-fenced CodeGraph block (#704).
+    // The MCP initialize instructions reach only the main agent;
+    // AGENTS.md is what Task-tool subagents (and non-MCP harnesses)
+    // actually see, so the block carries the codegraph pointers there.
+    // Upsert self-heals a stale pre-#529 long block.
+    files.push(upsertInstructionsEntry(instructionsPath(loc)));
 
     return { files };
   }
