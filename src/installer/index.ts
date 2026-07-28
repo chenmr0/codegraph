@@ -166,16 +166,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4: auto-allow permissions (only meaningful for Claude;
+  // Step 4: auto-allow permissions (only meaningful for agents with a
+  // permissions allowlist — Claude Code and its CodeAgent 3.0 fork;
   // skipped silently by other targets).
   let autoAllow: boolean;
   if (opts.autoAllow !== undefined) {
     autoAllow = opts.autoAllow;
   } else if (useDefaults) {
     autoAllow = true;
-  } else if (targets.some((t) => t.id === 'claude')) {
+  } else if (targets.some((t) => t.id === 'claude' || t.id === 'codeagent')) {
     const ans = await clack.confirm({
-      message: 'Auto-allow CodeGraph commands? (Skips permission prompts in Claude Code)',
+      message: 'Auto-allow CodeGraph commands? (Skips permission prompts in Claude Code / CodeAgent)',
       initialValue: true,
     });
     if (clack.isCancel(ans)) {

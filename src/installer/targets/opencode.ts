@@ -106,7 +106,11 @@ const FORMATTING = { tabSize: 2, insertSpaces: true, eol: '\n' };
 
 class OpencodeTarget implements AgentTarget {
   readonly id = 'opencode' as const;
-  readonly displayName = 'opencode';
+  // Displayed as "CodeAgent 2.0 (opencode)" — the user runs a
+  // CodeAgent-branded opencode (the 2.0 line, opencode-based) alongside
+  // the Claude-Code-forked CodeAgent 3.0. The `(opencode)` suffix keeps
+  // the underlying agent identifiable in the prompt.
+  readonly displayName = 'CodeAgent 2.0 (opencode)';
   readonly docsUrl = 'https://opencode.ai/docs/config';
 
   supportsLocation(_loc: Location): boolean {
