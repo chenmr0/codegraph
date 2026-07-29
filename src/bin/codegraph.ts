@@ -19,6 +19,7 @@
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
+ *   codegraph node [symbol]      Read a whole file or a symbol detail + its call trail
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
@@ -34,6 +35,7 @@ import { getGlyphs } from '../ui/glyphs';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR, needsWasmFallback } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
+import { buildNodeView } from '../cli/node-view';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -1471,6 +1473,77 @@ program
       cg.destroy();
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph node [symbol]
+ *
+ * CLI parity with the MCP `codegraph_node` tool. Two modes:
+ *   - FILE MODE: `codegraph node -f <file>` (no symbol) reads the whole file
+ *     like the Read tool — numbered source, `--offset`/`--limit` paging, a
+ *     one-line "who depends on it" header. `--symbols-only` returns the
+ *     structural outline instead. Config/data files are summarized by key
+ *     only (values withheld for safety).
+ *   - SYMBOL MODE: `codegraph node <symbol>` returns the symbol's location,
+ *     signature, and (with `--code`) its full source or container outline,
+ *     plus its call trail (callees/callers) and C/C++ declaration-definition
+ *     links. `--file`/`--line` pin a specific overload; same-name overloads
+ *     are all returned in one call.
+ */
+program
+  .command('node [symbol]')
+  .description('Read a whole file (like Read) or a symbol detail + its call trail — CLI twin of the codegraph_node MCP tool')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'File path: alone = read the whole file; with a symbol = disambiguation hint')
+  .option('--line <number>', 'Line number to pin a specific overload (symbol mode)')
+  .option('--offset <number>', 'File mode: 1-based start line (like Read)')
+  .option('--limit <number>', 'File mode: maximum line count (like Read)')
+  .option('-c, --code', 'Symbol mode: include the symbol\'s full source (like includeCode)')
+  .option('-o, --symbols-only', 'File mode: return the symbol outline instead of the source')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbolArg: string | undefined, options: {
+    path?: string;
+    file?: string;
+    line?: string;
+    offset?: string;
+    limit?: string;
+    code?: boolean;
+    symbolsOnly?: boolean;
+    json?: boolean;
+  }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        info('Run "codegraph init" first');
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+
+      const view = await buildNodeView(cg, {
+        symbol: symbolArg,
+        file: options.file,
+        line: options.line ? parseInt(options.line, 10) : undefined,
+        offset: options.offset ? parseInt(options.offset, 10) : undefined,
+        limit: options.limit ? parseInt(options.limit, 10) : undefined,
+        includeCode: options.code === true,
+        symbolsOnly: options.symbolsOnly === true,
+      });
+
+      if (options.json) {
+        console.log(JSON.stringify(view.json, null, 2));
+      } else {
+        console.log(view.text);
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`node failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

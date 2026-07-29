@@ -30,6 +30,13 @@ import {
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
+import {
+  CONTAINER_NODE_KINDS,
+  lastQualifierPart,
+  numberSourceLines,
+  matchesSymbol,
+  synthEdgeNote,
+} from './node-helpers';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -49,31 +56,6 @@ const MAX_INPUT_LENGTH = 10_000;
  * never legitimate and signal abuse or a bug upstream.
  */
 const MAX_PATH_LENGTH = 4_096;
-
-/**
- * Rust path roots that have no file-system equivalent — `crate` is the
- * current crate, `super` is the parent module, `self` is the current
- * module. Used by `matchesSymbol` to strip these before file-path
- * matching so `crate::configurator::stage_apply::run` resolves the
- * same as `configurator::stage_apply::run`.
- */
-const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
-
-/**
- * Node kinds that contain other symbols. For these, `codegraph_node` with
- * `includeCode=true` returns a structural outline (member names + signatures
- * + line numbers) instead of the full body, which for a large class is a
- * multi-thousand-character wall of source that bloats the agent's context.
- */
-const CONTAINER_NODE_KINDS = new Set<NodeKind>([
-  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
-]);
-
-/** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
-function lastQualifierPart(symbol: string): string {
-  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? symbol;
-}
 
 /**
  * Calculate the recommended number of codegraph_explore calls based on project size.
@@ -276,23 +258,6 @@ function adaptiveExploreEnabled(): boolean {
 function isExploreEnabled(): boolean {
   const v = process.env.CODEGRAPH_ENABLE_EXPLORE;
   return v === '1' || v === 'true';
-}
-
-/**
- * Prefix each line of a source slice with its 1-based line number, matching
- * the Read tool's `cat -n` convention (number + tab) so the agent treats it
- * the same way it treats Read output.
- *
- * @param slice  contiguous source text (already extracted from the file)
- * @param firstLineNumber  the 1-based line number of the slice's first line
- */
-function numberSourceLines(slice: string, firstLineNumber: number): string {
-  const out: string[] = [];
-  const split = slice.split('\n');
-  for (let i = 0; i < split.length; i++) {
-    out.push(`${firstLineNumber + i}\t${split[i]}`);
-  }
-  return out.join('\n');
 }
 
 /**
@@ -1267,89 +1232,6 @@ export class ToolHandler {
   }
 
   /**
-   * Describe a synthesized (dynamic-dispatch) edge for human output: how the
-   * callback was wired up — the bridge static parsing can't see. Returns null
-   * for ordinary static edges. Used by trace + the node trail so a synthesized
-   * hop reads as "registered via onUpdate at App.tsx:3148", not a bare arrow.
-   */
-  private synthEdgeNote(edge: Edge | null): { label: string; compact: string; registeredAt?: string } | null {
-    if (!edge || edge.provenance !== 'heuristic') return null;
-    const m = edge.metadata as Record<string, unknown> | undefined;
-    const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
-    const at = registeredAt ? ` @${registeredAt}` : '';
-    if (m?.synthesizedBy === 'callback') {
-      const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
-      const field = m.field ? ` on .${String(m.field)}` : '';
-      return {
-        label: `callback — registered via ${via}${field} (dynamic dispatch)`,
-        compact: `dynamic: callback via ${via}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'event-emitter') {
-      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
-      return {
-        label: `event ${ev} — emit → handler (dynamic dispatch)`,
-        compact: `dynamic: event ${ev}${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'react-render') {
-      return {
-        label: `React re-render — \`setState\` re-runs render() (dynamic dispatch)`,
-        compact: `dynamic: React re-render via setState${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'jsx-render') {
-      const child = m.via ? `<${String(m.via)}>` : 'a child component';
-      return {
-        label: `renders ${child} (JSX child — dynamic dispatch)`,
-        compact: `dynamic: renders ${child}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'vue-handler') {
-      const ev = m.event ? `@${String(m.event)}` : 'a template event';
-      return {
-        label: `Vue template handler — bound to ${ev} (dynamic dispatch)`,
-        compact: `dynamic: Vue ${ev} handler`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'interface-impl') {
-      return {
-        label: `interface/abstract dispatch — runs the implementation override (dynamic dispatch)`,
-        compact: `dynamic: interface → impl${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'closure-collection') {
-      const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
-      return {
-        label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
-        compact: `dynamic: runs ${field} handlers${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'cpp-decl-def') {
-      return {
-        label: `C++ declaration-definition pair (structural link, not a call)`,
-        compact: `decl-def pair${at}`,
-        registeredAt,
-      };
-    }
-    if (m?.synthesizedBy === 'c-decl-def') {
-      return {
-        label: `C declaration-definition pair (structural link, not a call)`,
-        compact: `decl-def pair${at}`,
-        registeredAt,
-      };
-    }
-    return null;
-  }
-
-  /**
    * Flow-from-named-symbols: an agent's codegraph_explore query is a bag of
    * symbol names that usually spans the flow it's investigating (e.g.
    * "PmsProductController getList PmsProductService list PmsProductServiceImpl").
@@ -1464,7 +1346,7 @@ export class ToolHandler {
           const key = `${src.name}>${tgt.name}`;
           if (synthSeen.has(key)) continue;
           synthSeen.add(key);
-          const note = this.synthEdgeNote(edge);
+          const note = synthEdgeNote(edge);
           synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
         }
       }
@@ -1475,7 +1357,7 @@ export class ToolHandler {
         out.push('## Flow (call path among the symbols you queried)', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
-          if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
+          if (step.edge) { const sy = synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
         out.push('');
@@ -2923,7 +2805,7 @@ export class ToolHandler {
     const TRAIL_CAP = 12;
     const fmt = (e: { node: Node; edge: Edge }) => {
       const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
-      const synth = this.synthEdgeNote(e.edge);
+      const synth = synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
@@ -2970,7 +2852,7 @@ export class ToolHandler {
     };
     const trailFmt = (e: { node: Node; edge: Edge }): string => {
       const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
-      const synth = this.synthEdgeNote(e.edge);
+      const synth = synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };
 
@@ -3313,61 +3195,6 @@ export class ToolHandler {
    * Returns the best match and a note about alternatives if any.
    */
   /**
-   * Check if a node matches a symbol query.
-   *
-   * Accepts simple names (`run`) and three flavors of qualifier:
-   *   - dotted     `Session.request`         (TS/JS/Python)
-   *   - colon-pair `stage_apply::run`        (Rust, C++, Ruby)
-   *   - slash      `configurator/stage_apply` (path-ish)
-   *
-   * Multi-level qualifiers compose: `crate::configurator::stage_apply::run`
-   * works. Rust path prefixes (`crate`, `super`, `self`) are stripped so
-   * the canonical `crate::module::symbol` form resolves.
-   *
-   * Resolution order, last part must always equal `node.name`:
-   *   1. Suffix-match against `qualifiedName` (handles class-scoped methods
-   *      where the extractor builds the qualified name from the AST stack)
-   *   2. File-path containment (handles file-derived modules in Rust/
-   *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
-   */
-  private matchesSymbol(node: Node, symbol: string): boolean {
-    // Simple name match
-    if (node.name === symbol) return true;
-    // File basename match (e.g., "product-card" matches "product-card.liquid")
-    if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
-
-    // Qualified-name lookups: split on any supported separator. `\w` keeps
-    // identifier chars (incl. `_`) intact; everything else is treated as
-    // a separator we tolerate.
-    if (!/[.\/]|::/.test(symbol)) return false;
-    const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-    if (parts.length < 2) return false;
-
-    const lastPart = parts[parts.length - 1]!;
-    if (node.name !== lastPart) return false;
-
-    // Stage 1: qualified-name suffix match. The extractor joins the
-    // semantic hierarchy with `::`, so `Session.request` and
-    // `Session::request` both become `Session::request` here.
-    const colonSuffix = parts.join('::');
-    if (node.qualifiedName.includes(colonSuffix)) return true;
-
-    // Stage 2: file-path containment. Rust modules and Python packages
-    // are not in `qualifiedName` — they're encoded in the file path. So
-    // `stage_apply::run` matches a `run` in any file whose path
-    // contains a `stage_apply` segment (with or without an extension).
-    //
-    // Filter out Rust path prefixes that have no file-system equivalent.
-    const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
-    if (containerHints.length === 0) return false;
-
-    const segments = node.filePath.split('/').filter((s) => s.length > 0);
-    return containerHints.every((hint) =>
-      segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
-    );
-  }
-
-  /**
    * Find ALL definitions matching a name, ranked, so codegraph_node can return
    * every overload instead of guessing one (the wrong guess → a Read). Keepers
    * rank before generated stubs (.pb.go etc.); stable within a group preserves
@@ -3408,7 +3235,7 @@ export class ToolHandler {
 
     if (results.length === 0) return [];
 
-    const exactMatches = results.filter((r) => this.matchesSymbol(r.node, symbol));
+    const exactMatches = results.filter((r) => matchesSymbol(r.node, symbol));
     if (exactMatches.length === 0) {
       // No exact match — a qualified lookup must not fall back to a fuzzy file
       // hit (#173); a bare name may use the single top fuzzy result.
@@ -3479,7 +3306,7 @@ export class ToolHandler {
 
     if (results.length === 0) return { nodes: [], note: '' };
 
-    const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
+    const exactMatches = results.filter(r => matchesSymbol(r.node, symbol));
 
     if (exactMatches.length === 0) {
       // No exact match — a qualified lookup must not fall back to a fuzzy file
