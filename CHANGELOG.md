@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- Fresh full indexes now parse files through an adaptive multi-core worker pool and stream deterministic, batched writes through a dedicated SQLite writer. Bulk loads temporarily defer FTS maintenance and secondary-index construction, then rebuild them before reference resolution; interrupted runs self-heal missing triggers and indexes on the next open. Small repositories stay on one parser to avoid startup regressions, and each optimization has an environment-variable rollback switch for constrained systems.
+
 ### Fixes
 
 - `codegraph upgrade` now self-updates from the Huawei internal npm registry instead of GitHub. It configures npm to point at the `@sdd` registry, looks up the latest published version of `@sdd/codegraph-wx` via `npm view`, and installs it with `npm install -g`. After upgrading it reminds you that a running CodeGraph MCP daemon still holds the old version in memory and needs a restart to pick up the new build. Use `codegraph upgrade --check` to see whether an update is available without installing.

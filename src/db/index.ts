@@ -104,7 +104,129 @@ export class DatabaseConnection {
       runMigrations(db, currentVersion);
     }
 
+    // Repair a process that died inside either fresh-index bulk window.
+    // FTS triggers and secondary indexes are schema objects, so a crash can
+    // leave the database queryable but permanently slow or with stale FTS.
+    conn.healBulkNodeLoad();
+    conn.healBulkParseIndexes();
+
     return conn;
+  }
+
+  private static readonly FTS_TRIGGER_NAMES = ['nodes_ai', 'nodes_ad', 'nodes_au'] as const;
+
+  /**
+   * Drop per-row FTS synchronization during a full node load. The caller must
+   * pair this with endBulkNodeLoad() in a finally block.
+   */
+  beginBulkNodeLoad(): void {
+    for (const trigger of DatabaseConnection.FTS_TRIGGER_NAMES) {
+      this.db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+  }
+
+  /** Rebuild FTS once and restore its synchronization triggers. */
+  endBulkNodeLoad(): void {
+    this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
+    this.recreateFtsTriggers();
+  }
+
+  private healBulkNodeLoad(): void {
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS c FROM sqlite_master
+         WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
+      )
+      .get() as { c: number } | undefined;
+    if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
+    this.endBulkNodeLoad();
+  }
+
+  private recreateFtsTriggers(): void {
+    const schema = this.readSchema();
+    const triggerDdls = schema.match(
+      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
+    );
+    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
+      throw new Error(
+        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} node FTS triggers, found ${triggerDdls?.length ?? 0}`
+      );
+    }
+    for (const ddl of triggerDdls) this.db.exec(ddl);
+  }
+
+  /**
+   * Non-unique indexes whose per-row B-tree maintenance is unnecessary while
+   * building a completely fresh graph. Primary keys and idx_edges_identity
+   * deliberately remain for upsert and edge-dedup correctness.
+   */
+  private static readonly BULK_PARSE_INDEX_NAMES = [
+    'idx_nodes_kind',
+    'idx_nodes_name',
+    'idx_nodes_qualified_name',
+    'idx_nodes_file_path',
+    'idx_nodes_language',
+    'idx_nodes_file_line',
+    'idx_nodes_lower_name',
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+    'idx_files_language',
+    'idx_files_modified_at',
+    'idx_edges_kind',
+    'idx_edges_source_kind',
+    'idx_edges_target_kind',
+    'idx_edges_provenance',
+  ] as const;
+
+  /** Enter the fresh-database parse bulk window. */
+  beginBulkParseLoad(): void {
+    for (const indexName of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+    }
+  }
+
+  /** Recreate deferred parse indexes one at a time, yielding between scans. */
+  async endBulkParseLoad(): Promise<void> {
+    const schema = this.readSchema();
+    for (const indexName of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      const ddl = schema.match(
+        new RegExp(`CREATE INDEX IF NOT EXISTS ${indexName}\\b[^;]*;`)
+      )?.[0];
+      if (!ddl) {
+        throw new Error(`schema.sql: parse index ${indexName} not found for bulk-load recreation`);
+      }
+      this.db.exec(ddl);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /** Restore only missing deferred indexes after an interrupted fresh index. */
+  private healBulkParseIndexes(): void {
+    const rows = this.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`)
+      .all() as Array<{ name: string }>;
+    const existing = new Set(rows.map((row) => row.name));
+    const missing = DatabaseConnection.BULK_PARSE_INDEX_NAMES.filter(
+      (name) => !existing.has(name)
+    );
+    if (missing.length === 0) return;
+
+    const schema = this.readSchema();
+    for (const indexName of missing) {
+      const ddl = schema.match(
+        new RegExp(`CREATE INDEX IF NOT EXISTS ${indexName}\\b[^;]*;`)
+      )?.[0];
+      if (!ddl) {
+        throw new Error(`schema.sql: parse index ${indexName} not found for recovery`);
+      }
+      this.db.exec(ddl);
+    }
+  }
+
+  private readSchema(): string {
+    return fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
   }
 
   /**

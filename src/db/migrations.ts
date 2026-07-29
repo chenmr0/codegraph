@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Migration definition
@@ -82,6 +82,25 @@ const migrations: Migration[] = [
     up: (db) => {
       db.exec(`
         ALTER TABLE nodes ADD COLUMN is_declaration INTEGER DEFAULT 0;
+      `);
+    },
+  },
+  {
+    version: 7,
+    description:
+      'Deduplicate identical edge rows and add a UNIQUE identity index so INSERT OR IGNORE prevents duplicates',
+    up: (db) => {
+      // Keep migration 6 above local to this fork: it owns is_declaration.
+      // The community edge-identity migration is therefore intentionally
+      // renumbered to 7 so existing fork databases do not skip it.
+      db.exec(`
+        DELETE FROM edges
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM edges
+          GROUP BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+          ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
       `);
     },
   },

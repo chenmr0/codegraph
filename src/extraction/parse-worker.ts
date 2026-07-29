@@ -5,6 +5,15 @@
  * stays unblocked and the UI animation renders smoothly.
  */
 
+try {
+  // Repeated pool-worker startup benefits from Node's compile cache. Older
+  // supported Node versions simply do not expose this API.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
+} catch {
+  // best-effort
+}
+
 import { parentPort } from 'worker_threads';
 import { performance } from 'node:perf_hooks';
 import { extractFromSource } from './tree-sitter';
@@ -65,7 +74,7 @@ let globalMacroNames: Set<string> | undefined = undefined;
 // preParse transform can blank them. See c-cpp.ts preprocessStatementMacros.
 let globalBodylessMacroNames: Set<string> | undefined = undefined;
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; bodylessMacroNames?: string[]; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; language?: Language; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; bodylessMacroNames?: string[]; grammarBuffers?: Record<string, Uint8Array> }) => {
   if (msg.type === 'load-grammars') {
     // grammarBuffers (when the orchestrator pre-read them) let a spawn/respawn
     // load grammars from memory instead of re-reading from disk — on slow
@@ -73,6 +82,10 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
     // contention that caused the respawn (#1231). Missing languages fall back
     // to the worker's own disk read inside loadGrammarsForLanguages.
     await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
+    // The fork's C/C++ macro pre-scan is part of parsing semantics. Initialize
+    // it on every pool worker before that worker is declared ready.
+    globalMacroNames = new Set(msg.macroNames ?? []);
+    globalBodylessMacroNames = new Set(msg.bodylessMacroNames ?? []);
     parentPort!.postMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'set-global-macros') {
     globalMacroNames = new Set(msg.macroNames);
@@ -87,7 +100,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
     // and accept the late result instead of false-rejecting (#1231).
     const t0 = performance.now();
     try {
-      const language = detectLanguage(filePath!, content);
+      const language = msg.language ?? detectLanguage(filePath!, content);
       const result: ExtractionResult = extractFromSource(filePath!, content!, language, frameworkNames, globalMacroNames, globalBodylessMacroNames);
 
       // Periodic parser reset to reclaim WASM heap memory

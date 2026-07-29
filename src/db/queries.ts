@@ -224,6 +224,46 @@ export class QueryBuilder {
     getRoutingManifest?: SqliteStatement;
   } = {};
 
+  // Multi-row INSERT statements cached by operation and row count. A maximum
+  // batch of 32 keeps even the 22-column node insert below sql.js's commonly
+  // compiled 999-variable limit while removing most JS-to-SQLite call overhead.
+  private batchStmts: Map<string, SqliteStatement> = new Map();
+  private static readonly BATCH_SIZES: readonly number[] = [32, 8, 1];
+
+  private runBatched(
+    kind: string,
+    head: string,
+    tuple: string,
+    rows: unknown[][]
+  ): void {
+    if (rows.length === 0) return;
+    let offset = 0;
+    const batchSizes =
+      process.env.CODEGRAPH_NO_BATCH_WRITES === '1'
+        ? ([1] as const)
+        : QueryBuilder.BATCH_SIZES;
+    for (const size of batchSizes) {
+      while (rows.length - offset >= size) {
+        const key = `${kind}:${size}`;
+        let stmt = this.batchStmts.get(key);
+        if (!stmt) {
+          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(','));
+          this.batchStmts.set(key, stmt);
+        }
+        if (size === 1) {
+          stmt.run(...rows[offset]!);
+        } else {
+          const params: unknown[] = [];
+          for (let rowIndex = 0; rowIndex < size; rowIndex++) {
+            params.push(...rows[offset + rowIndex]!);
+          }
+          stmt.run(...params);
+        }
+        offset += size;
+      }
+    }
+  }
+
   constructor(db: SqliteDatabase) {
     this.db = db;
   }
@@ -314,9 +354,74 @@ export class QueryBuilder {
    */
   insertNodes(nodes: Node[]): void {
     this.db.transaction(() => {
+      const rows: unknown[][] = [];
       for (const node of nodes) {
-        this.insertNode(node);
+        if (!node.id || !node.kind || !node.name || !node.filePath || !node.language) {
+          console.error('[CodeGraph] Skipping node with missing required fields:', {
+            id: node.id,
+            kind: node.kind,
+            name: node.name,
+            filePath: node.filePath,
+            language: node.language,
+          });
+          continue;
+        }
+        this.nodeCache.delete(node.id);
+        rows.push([
+          node.id,
+          node.kind,
+          node.name,
+          node.qualifiedName ?? node.name,
+          node.filePath,
+          node.language,
+          node.startLine ?? 0,
+          node.endLine ?? 0,
+          node.startColumn ?? 0,
+          node.endColumn ?? 0,
+          node.docstring ?? null,
+          node.signature ?? null,
+          node.visibility ?? null,
+          node.isExported ? 1 : 0,
+          node.isAsync ? 1 : 0,
+          node.isStatic ? 1 : 0,
+          node.isAbstract ? 1 : 0,
+          node.isDeclaration ? 1 : 0,
+          node.decorators ? JSON.stringify(node.decorators) : null,
+          node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+          node.returnType ?? null,
+          node.updatedAt ?? Date.now(),
+        ]);
       }
+      this.runBatched(
+        'insertNodes',
+        `INSERT OR REPLACE INTO nodes (
+          id, kind, name, qualified_name, file_path, language,
+          start_line, end_line, start_column, end_column,
+          docstring, signature, visibility,
+          is_exported, is_async, is_static, is_abstract, is_declaration,
+          decorators, type_parameters, return_type, updated_at
+        ) VALUES `,
+        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        rows
+      );
+    })();
+  }
+
+  /**
+   * Store one fresh-index file as one transaction. Callers must pre-filter
+   * edges and refs to the valid node ids in this bundle.
+   */
+  storeFileBundle(bundle: {
+    nodes: Node[];
+    edges: Edge[];
+    refs: UnresolvedReference[];
+    file: FileRecord;
+  }): void {
+    this.db.transaction(() => {
+      this.insertNodes(bundle.nodes);
+      this.insertEdgesUnchecked(bundle.edges);
+      this.insertUnresolvedRefsBatch(bundle.refs);
+      this.upsertFile(bundle.file);
     })();
   }
 
@@ -1359,13 +1464,30 @@ export class QueryBuilder {
       }
       const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
 
-      for (const edge of edges) {
-        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) {
-          continue;
-        }
-        this.insertEdge(edge);
-      }
+      this.insertEdgesUnchecked(
+        edges.filter(
+          (edge) => existingNodeIds.has(edge.source) && existingNodeIds.has(edge.target)
+        )
+      );
     })();
+  }
+
+  private insertEdgesUnchecked(edges: Edge[]): void {
+    const rows = edges.map((edge) => [
+      edge.source,
+      edge.target,
+      edge.kind,
+      edge.metadata ? JSON.stringify(edge.metadata) : null,
+      edge.line ?? null,
+      edge.column ?? null,
+      edge.provenance ?? null,
+    ]);
+    this.runBatched(
+      'insertEdges',
+      'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
+      '(?,?,?,?,?,?,?)',
+      rows
+    );
   }
 
   /**
@@ -1615,9 +1737,22 @@ export class QueryBuilder {
   insertUnresolvedRefsBatch(refs: UnresolvedReference[]): void {
     if (refs.length === 0) return;
     const insert = this.db.transaction(() => {
-      for (const ref of refs) {
-        this.insertUnresolvedRef(ref);
-      }
+      const rows = refs.map((ref) => [
+        ref.fromNodeId,
+        ref.referenceName,
+        ref.referenceKind,
+        ref.line,
+        ref.column,
+        ref.candidates ? JSON.stringify(ref.candidates) : null,
+        ref.filePath ?? '',
+        ref.language ?? 'unknown',
+      ]);
+      this.runBatched(
+        'insertUnresolvedRefs',
+        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
+        '(?,?,?,?,?,?,?,?)',
+        rows
+      );
     });
     insert();
   }

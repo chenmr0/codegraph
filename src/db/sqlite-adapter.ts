@@ -48,6 +48,7 @@ export type SqliteBackend = 'node-sqlite' | 'sql-js';
  */
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
+  private _txDepth = 0;
 
   constructor(dbPath: string) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -100,13 +101,27 @@ class NodeSqliteAdapter implements SqliteDatabase {
 
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
     return (...args: any[]) => {
+      // Helpers such as storeFileBundle compose existing transaction-wrapped
+      // insert methods. Flatten nested transactions into the outer one: the
+      // previous BEGIN-in-BEGIN behavior threw, so no caller could depend on
+      // nested rollback granularity.
+      if (this._txDepth > 0) {
+        this._txDepth++;
+        try {
+          return fn(...args);
+        } finally {
+          this._txDepth--;
+        }
+      }
       this._db.exec('BEGIN');
+      this._txDepth = 1;
       try {
         const result = fn(...args);
         this._db.exec('COMMIT');
+        this._txDepth = 0;
         return result;
       } catch (error) {
-        this._db.exec('ROLLBACK');
+        try { this._db.exec('ROLLBACK'); } finally { this._txDepth = 0; }
         throw error;
       }
     };
@@ -195,6 +210,7 @@ class SqlJsAdapter implements SqliteDatabase {
   private _dbPath: string;
   private _open = true;
   private _stmts: any[] = [];
+  private _txDepth = 0;
 
   constructor(dbPath: string) {
     if (!SqlJsDatabase) {
@@ -356,13 +372,23 @@ class SqlJsAdapter implements SqliteDatabase {
 
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
     return (...args: any[]) => {
+      if (this._txDepth > 0) {
+        this._txDepth++;
+        try {
+          return fn(...args);
+        } finally {
+          this._txDepth--;
+        }
+      }
       this._db.run('BEGIN');
+      this._txDepth = 1;
       try {
         const result = fn(...args);
         this._db.run('COMMIT');
+        this._txDepth = 0;
         return result;
       } catch (error) {
-        this._db.run('ROLLBACK');
+        try { this._db.run('ROLLBACK'); } finally { this._txDepth = 0; }
         throw error;
       }
     };

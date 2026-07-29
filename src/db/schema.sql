@@ -133,6 +133,11 @@ END;
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
+-- Exact graph-edge identity. INSERT OR IGNORE only deduplicates when a UNIQUE
+-- constraint exists; IFNULL makes coordinate-less synthesized edges conflict.
+-- Migration v7 deduplicates and adds this index to existing fork databases.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+  ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 
 -- File indexes
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);

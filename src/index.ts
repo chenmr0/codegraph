@@ -343,6 +343,23 @@ export class CodeGraph {
       }
       try {
         const before = this.queries.getNodeAndEdgeCount();
+        const freshDb = before.nodes === 0;
+
+        // A completely fresh node:sqlite database is disposable until this
+        // run finishes, so avoid rollback-journal fsync during construction.
+        // Existing databases and the sql.js fallback retain durable defaults.
+        let fastInit =
+          freshDb &&
+          this.db.getBackend() === 'node-sqlite' &&
+          process.env.CODEGRAPH_NO_FAST_INIT !== '1';
+        if (fastInit) {
+          try {
+            this.db.getDb().pragma('journal_mode = MEMORY');
+            this.db.getDb().pragma('synchronous = OFF');
+          } catch {
+            fastInit = false;
+          }
+        }
 
         // WAL checkpoint valve (#1231): defer auto-checkpointing during the bulk
         // index so the store is pure sequential WAL appends instead of re-writing
@@ -351,7 +368,10 @@ export class CodeGraph {
         // so deferral can't fill the disk. Only in WAL mode — on the WASM backend
         // (or any mount where WAL couldn't be enabled) getJournalMode() is 'delete'
         // and the whole mechanism is a no-op. CODEGRAPH_NO_WAL_DEFER=1 disables it.
-        const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+        const deferWal =
+          !fastInit &&
+          process.env.CODEGRAPH_NO_WAL_DEFER !== '1' &&
+          this.db.getJournalMode() === 'wal';
         let priorAutocheckpoint = 0;
         const walValve = deferWal
           ? new WalCheckpointValve(this.db, undefined, undefined, options.verbose ? (msg: string) => console.log(`[wal] ${msg}`) : undefined)
@@ -363,12 +383,47 @@ export class CodeGraph {
         }
 
         try {
-          const result = await this.orchestrator.indexAll(
-            options.onProgress,
-            options.signal,
-            options.verbose,
-            walValve ? () => walValve.backpressure() : undefined
-          );
+          const bulkFts =
+            process.env.CODEGRAPH_NO_BULK_FTS !== '1';
+          const deferParseIndexes =
+            freshDb &&
+            process.env.CODEGRAPH_NO_PARSE_INDEX_DEFER !== '1';
+          let bulkFtsStarted = false;
+          let parseIndexesDeferred = false;
+          let result: IndexResult;
+          try {
+            if (bulkFts) {
+              this.db.beginBulkNodeLoad();
+              bulkFtsStarted = true;
+            }
+            if (deferParseIndexes) {
+              this.db.beginBulkParseLoad();
+              parseIndexesDeferred = true;
+            }
+            result = await this.orchestrator.indexAll(
+              options.onProgress,
+              options.signal,
+              options.verbose,
+              walValve ? () => walValve.backpressure() : undefined,
+              freshDb
+                ? {
+                    dbPath: this.db.getPath(),
+                    fastInit,
+                    useWorker: this.db.getBackend() === 'node-sqlite',
+                  }
+                : null
+            );
+          } finally {
+            try {
+              if (parseIndexesDeferred) {
+                await this.db.endBulkParseLoad();
+              }
+            } finally {
+              if (bulkFtsStarted) {
+                this.db.endBulkNodeLoad();
+              }
+            }
+          }
 
           // Phase-boundary fold: backfill the ENTIRE WAL before resolution's first
           // read, so the next phase never pages a bulk-write-sized WAL on the main
@@ -453,6 +508,14 @@ export class CodeGraph {
           if (walValve) { walValve.stop(); await walValve.drain(); }
           if (deferWal) {
             try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* best-effort */ }
+          }
+          if (fastInit) {
+            try {
+              this.db.getDb().pragma('synchronous = NORMAL');
+              this.db.getDb().pragma('journal_mode = WAL');
+            } catch {
+              // connection may be closing after a failed index
+            }
           }
         }
       } finally {

@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import * as os from 'os';
 import { execFileSync } from 'child_process';
 import {
   Language,
@@ -25,6 +26,12 @@ import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
+import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
+import {
+  StoreWriter,
+  type StoreBundle,
+  finalizeStoreBundle,
+} from './store-writer';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -839,7 +846,16 @@ export class ExtractionOrchestrator {
      * while WAL growth is under the hard cap, or a promise the writer awaits
      * when the disk is saturated and the WAL needs a full backfill (#1231).
      */
-    walBackpressure?: () => Promise<void> | null
+    walBackpressure?: () => Promise<void> | null,
+    /**
+     * Fresh node:sqlite database store offload. Existing databases keep all
+     * reads, deletes and cross-file rewiring on the main connection.
+     */
+    storeWriterOpts?: {
+      dbPath: string;
+      fastInit: boolean;
+      useWorker: boolean;
+    } | null
   ): Promise<IndexResult> {
     await initGrammars();
     const startTime = Date.now();
@@ -945,6 +961,61 @@ export class ExtractionOrchestrator {
       // In-process fallback: load grammars locally
       await loadGrammarsForLanguages(neededLanguages);
     }
+
+    let parsePool: ParseWorkerPool | null = null;
+    if (useWorker) {
+      const cpuCount =
+        typeof os.availableParallelism === 'function'
+          ? os.availableParallelism()
+          : os.cpus().length;
+      const requestedPoolSize = resolveParsePoolSize(
+        process.env.CODEGRAPH_PARSE_WORKERS,
+        cpuCount
+      );
+      // Worker startup and grammar compilation dominate tiny repositories.
+      // Preserve explicit overrides, but keep the automatic path conservative
+      // until there is enough work to amortize a full pool.
+      const hasExplicitPoolSize =
+        process.env.CODEGRAPH_PARSE_WORKERS !== undefined &&
+        process.env.CODEGRAPH_PARSE_WORKERS !== '';
+      const poolSize = hasExplicitPoolSize
+        ? requestedPoolSize
+        : files.length < 32
+          ? 1
+          : files.length < 128
+            ? Math.min(4, requestedPoolSize)
+            : requestedPoolSize;
+      parsePool = new ParseWorkerPool({
+        languages: neededLanguages,
+        size: poolSize,
+        workerScriptPath: parseWorkerPath,
+        recycleInterval: WORKER_RECYCLE_INTERVAL,
+        parseTimeoutMs: PARSE_TIMEOUT_MS,
+        log,
+        grammarBuffers,
+        macroNames: [...globalMacroNames],
+        bodylessMacroNames: [...globalBodylessMacroNames],
+      });
+      parsePool.prewarm();
+      log(`Parse worker pool: ${poolSize} worker(s)`);
+    }
+
+    const storeWorkerPath = path.join(__dirname, 'store-worker.js');
+    let storeWriter: StoreWriter | null = null;
+    if (
+      storeWriterOpts &&
+      storeWriterOpts.useWorker &&
+      process.env.CODEGRAPH_NO_STORE_WORKER !== '1' &&
+      fs.existsSync(storeWorkerPath)
+    ) {
+      storeWriter = new StoreWriter(
+        storeWorkerPath,
+        storeWriterOpts.dbPath,
+        storeWriterOpts.fastInit
+      );
+      log('Store writer thread active');
+    }
+    const STORE_WRITER_WINDOW = 64;
 
     // --- Worker lifecycle management ---
     // The worker can crash (OOM in WASM) or hang on pathological files.
@@ -1059,7 +1130,7 @@ export class ExtractionOrchestrator {
       return parseWorker;
     }
 
-    if (WorkerClass) {
+    if (WorkerClass && !parsePool) {
       await ensureWorker();
     }
 
@@ -1069,6 +1140,10 @@ export class ExtractionOrchestrator {
      * ensureWorker() will spawn a fresh one on the next call.
      */
     function recycleWorker(): void {
+      if (parsePool) {
+        parsePool.recycleAll();
+        return;
+      }
       if (!parseWorker) return;
       log(`Recycling worker after ${workerParseCount} parses (heap: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB RSS)`);
       const w = parseWorker;
@@ -1079,6 +1154,14 @@ export class ExtractionOrchestrator {
     }
 
     async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
+      if (parsePool) {
+        return parsePool.requestParse({
+          filePath,
+          content,
+          language: detectLanguage(filePath, content),
+          frameworkNames,
+        });
+      }
       if (!WorkerClass) {
         // In-process fallback
         return extractFromSource(
@@ -1143,9 +1226,14 @@ export class ExtractionOrchestrator {
       });
     }
 
+    try {
     for (let i = 0; i < files.length; i += FILE_IO_BATCH_SIZE) {
       if (signal?.aborted) {
-        if (parseWorker) (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
+        if (storeWriter) await storeWriter.close();
+        if (parsePool) await parsePool.destroy();
+        if (parseWorker) {
+          (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
+        }
         return {
           success: false,
           filesIndexed,
@@ -1178,10 +1266,36 @@ export class ExtractionOrchestrator {
         })
       );
 
-      // Send to worker for parsing, store results on main thread
-      for (const { filePath, content, stats, error } of fileContents) {
+      // Parse the whole I/O batch concurrently across the pool. Promise.all
+      // preserves array order, and the following loop stores in that same
+      // order, so graph insertion/disambiguation stays deterministic.
+      const parsedBatch = await Promise.all(
+        fileContents.map(async (item) => {
+          if (item.error || item.content === null || item.stats === null) {
+            return { ...item, result: null as ExtractionResult | null, parseError: null as unknown };
+          }
+          if (item.stats.size > FILE_SIZE_WARN_THRESHOLD) {
+            logWarn(
+              `Large file may take longer to parse: ${item.filePath} (${(item.stats.size / 1024 / 1024).toFixed(1)}MB)`
+            );
+          }
+          try {
+            const result = await requestParse(item.filePath, item.content);
+            return { ...item, result, parseError: null as unknown };
+          } catch (parseError) {
+            return { ...item, result: null as ExtractionResult | null, parseError };
+          }
+        })
+      );
+
+      // Admit and store results strictly in file order.
+      for (const { filePath, content, stats, error, result, parseError } of parsedBatch) {
         if (signal?.aborted) {
-          if (parseWorker) (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
+          if (storeWriter) await storeWriter.close();
+          if (parsePool) await parsePool.destroy();
+          if (parseWorker) {
+            (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
+          }
           return {
             success: false,
             filesIndexed,
@@ -1214,20 +1328,11 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        if (stats.size > FILE_SIZE_WARN_THRESHOLD) {
-          logWarn(`Large file may take longer to parse: ${filePath} (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
-        }
-
-        // Parse in worker thread (main thread stays unblocked).
-        // Wrapped in try/catch to handle worker timeouts and crashes gracefully.
-        let result: ExtractionResult;
-        try {
-          result = await requestParse(filePath, content);
-        } catch (parseErr) {
+        if (parseError || !result) {
           processed++;
           filesErrored++;
           errors.push({
-            message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+            message: parseError instanceof Error ? parseError.message : String(parseError),
             filePath,
             severity: 'error',
             code: 'parse_error',
@@ -1243,10 +1348,34 @@ export class ExtractionOrchestrator {
         const bp = walBackpressure?.();
         if (bp) await bp;
 
-        // Store in database on main thread (SQLite is not thread-safe)
+        // Fresh node:sqlite builds post a pre-filtered bundle to the dedicated
+        // writer. Other paths retain the existing main-connection store.
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content);
-          this.storeExtractionResult(filePath, content, language, stats, result);
+          if (storeWriter) {
+            storeWriter.send(
+              this.buildFreshStoreBundle(
+                filePath,
+                content,
+                language,
+                stats,
+                result
+              )
+            );
+            await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+          } else if (storeWriterOpts) {
+            this.queries.storeFileBundle(
+              this.buildFreshStoreBundle(
+                filePath,
+                content,
+                language,
+                stats,
+                result
+              )
+            );
+          } else {
+            this.storeExtractionResult(filePath, content, language, stats, result);
+          }
         }
 
         if (result.errors.length > 0) {
@@ -1276,6 +1405,17 @@ export class ExtractionOrchestrator {
       }
     }
 
+    // The worker applies queued bundles in message order. Close its connection
+    // before retries and resolution return to the main database connection.
+    if (storeWriter) {
+      try {
+        await storeWriter.drain();
+      } finally {
+        await storeWriter.close();
+        storeWriter = null;
+      }
+    }
+
     // Report 100% so the progress bar doesn't hang at 99%
     onProgress?.({
       phase: 'parsing',
@@ -1293,10 +1433,12 @@ export class ExtractionOrchestrator {
     // every file gets the absolute cleanest WASM state possible.
     const retryableErrors = errors.filter(
       (e) => e.code === 'parse_error' && e.filePath &&
-        (e.message.includes('Worker exited') || e.message.includes('memory access out of bounds'))
+        (e.message.includes('Worker exited') ||
+         e.message.includes('memory access out of bounds') ||
+         e.message.includes('timed out'))
     );
 
-    if (retryableErrors.length > 0 && WorkerClass) {
+    if (retryableErrors.length > 0 && (parsePool || WorkerClass)) {
       log(`Retrying ${retryableErrors.length} files that failed due to WASM memory errors...`);
 
       const stillFailing: typeof retryableErrors = [];
@@ -1330,7 +1472,13 @@ export class ExtractionOrchestrator {
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           const bp = walBackpressure?.();
           if (bp) await bp;
-          this.storeExtractionResult(filePath, content, language, stats, result);
+          if (storeWriterOpts) {
+            this.queries.storeFileBundle(
+              this.buildFreshStoreBundle(filePath, content, language, stats, result)
+            );
+          } else {
+            this.storeExtractionResult(filePath, content, language, stats, result);
+          }
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -1383,7 +1531,13 @@ export class ExtractionOrchestrator {
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             const bp = walBackpressure?.();
             if (bp) await bp;
-            this.storeExtractionResult(filePath, fullContent, language, stats, result);
+            if (storeWriterOpts) {
+              this.queries.storeFileBundle(
+                this.buildFreshStoreBundle(filePath, fullContent, language, stats, result)
+              );
+            } else {
+              this.storeExtractionResult(filePath, fullContent, language, stats, result);
+            }
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);
@@ -1397,12 +1551,6 @@ export class ExtractionOrchestrator {
       }
     }
 
-    // Shut down parse worker and clear any pending timers
-    rejectAllPending('Indexing complete');
-    if (parseWorker) {
-      (parseWorker as import('worker_threads').Worker).terminate().catch(() => {});
-    }
-
     return {
       success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
       filesIndexed,
@@ -1413,6 +1561,18 @@ export class ExtractionOrchestrator {
       errors,
       durationMs: Date.now() - startTime,
     };
+    } finally {
+      // Covers success, abort and any unexpected store/parse exception. Worker
+      // lifetimes must never outlive the indexing call or hold the DB open.
+      rejectAllPending('Indexing complete');
+      if (storeWriter) await storeWriter.close();
+      if (parsePool) await parsePool.destroy();
+      if (parseWorker) {
+        (parseWorker as import('worker_threads').Worker)
+          .terminate()
+          .catch(() => {});
+      }
+    }
   }
 
   /**
@@ -1556,6 +1716,31 @@ export class ExtractionOrchestrator {
     }
 
     return result;
+  }
+
+  /**
+   * Build the fresh-database payload shared by the main-thread and worker
+   * stores. The validation/filtering is centralized so both paths preserve
+   * the fork's node fields and reference context identically.
+   */
+  private buildFreshStoreBundle(
+    filePath: string,
+    content: string,
+    language: Language,
+    stats: fs.Stats,
+    result: ExtractionResult
+  ): StoreBundle {
+    const file: FileRecord = {
+      path: filePath,
+      contentHash: hashContent(content),
+      language,
+      size: stats.size,
+      modifiedAt: stats.mtimeMs,
+      indexedAt: Date.now(),
+      nodeCount: result.nodes.length,
+      errors: result.errors.length > 0 ? result.errors : undefined,
+    };
+    return finalizeStoreBundle(result, filePath, language, file);
   }
 
   /**
