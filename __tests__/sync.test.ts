@@ -423,5 +423,48 @@ describe('Sync Module', () => {
       const callers2 = await cg.getCallers(fooNode2!.node.id);
       expect(callers2.map(c => c.node.name)).toContain('caller');
     });
+
+    it('orders equal-score definitions before declarations deterministically after sync', async () => {
+      fs.writeFileSync(path.join(testDir, 'a.h'), 'void stable_target(void);');
+      fs.writeFileSync(path.join(testDir, 'a.c'),
+        '#include "a.h"\nvoid stable_target(void) {}');
+
+      cg = await CodeGraph.init(testDir);
+      await cg.indexAll();
+
+      const searchTarget = (exact: boolean) =>
+        cg.searchNodes('stable_target', { exact, limit: 10 })
+          .filter(r => r.node.kind === 'function' && r.node.name === 'stable_target');
+
+      const expectDefinitionFirstAndStable = (exact: boolean) => {
+        const first = searchTarget(exact);
+        expect(first).toHaveLength(2);
+        expect(first.map(r => ({
+          filePath: r.node.filePath,
+          isDeclaration: r.node.isDeclaration,
+        }))).toEqual([
+          { filePath: 'a.c', isDeclaration: false },
+          { filePath: 'a.h', isDeclaration: true },
+        ]);
+
+        const expectedIds = first.map(r => r.node.id);
+        for (let i = 0; i < 3; i++) {
+          expect(searchTarget(exact).map(r => r.node.id)).toEqual(expectedIds);
+        }
+      };
+
+      expectDefinitionFirstAndStable(false);
+      expectDefinitionFirstAndStable(true);
+
+      const acPath = path.join(testDir, 'a.c');
+      fs.writeFileSync(acPath,
+        '#include "a.h"\nvoid stable_target(void) { /* updated */ }');
+      const now = new Date();
+      fs.utimesSync(acPath, now, now);
+      await cg.sync();
+
+      expectDefinitionFirstAndStable(false);
+      expectDefinitionFirstAndStable(true);
+    });
   });
 });

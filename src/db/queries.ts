@@ -174,6 +174,58 @@ function rowToFileRecord(row: FileRow): FileRecord {
 }
 
 /**
+ * Preserve relevance as the primary search order while making equal-score
+ * results stable. Definitions precede declarations so callers that select the
+ * first exact-name hit do not accidentally inspect a prototype with no edges.
+ */
+function compareSearchResultsDeterministically(a: SearchResult, b: SearchResult): number {
+  if (a.score !== b.score) return b.score - a.score;
+
+  const declarationOrder =
+    Number(a.node.isDeclaration === true) - Number(b.node.isDeclaration === true);
+  if (declarationOrder !== 0) return declarationOrder;
+
+  const lengthOrder = a.node.name.length - b.node.name.length;
+  if (lengthOrder !== 0) return lengthOrder;
+
+  const textFields: Array<[string, string]> = [
+    [a.node.name, b.node.name],
+    [a.node.qualifiedName ?? a.node.name, b.node.qualifiedName ?? b.node.name],
+    [a.node.kind, b.node.kind],
+    [a.node.filePath, b.node.filePath],
+  ];
+  for (const [left, right] of textFields) {
+    if (left < right) return -1;
+    if (left > right) return 1;
+  }
+
+  const lineOrder = (a.node.startLine ?? 0) - (b.node.startLine ?? 0);
+  if (lineOrder !== 0) return lineOrder;
+
+  const columnOrder = (a.node.startColumn ?? 0) - (b.node.startColumn ?? 0);
+  if (columnOrder !== 0) return columnOrder;
+
+  if (a.node.id < b.node.id) return -1;
+  if (a.node.id > b.node.id) return 1;
+  return 0;
+}
+
+function deterministicNodeOrderSql(tableAlias = ''): string {
+  const column = (name: string) => `${tableAlias}${name}`;
+  return [
+    `${column('is_declaration')} ASC`,
+    `length(${column('name')}) ASC`,
+    `${column('name')} ASC`,
+    `${column('qualified_name')} ASC`,
+    `${column('kind')} ASC`,
+    `${column('file_path')} ASC`,
+    `${column('start_line')} ASC`,
+    `${column('start_column')} ASC`,
+    `${column('id')} ASC`,
+  ].join(', ');
+}
+
+/**
  * Query builder for the knowledge graph database
  */
 export class QueryBuilder {
@@ -964,7 +1016,7 @@ export class QueryBuilder {
           sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
-        sql += ' LIMIT 20';
+        sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT 20`;
         const rows = this.db.prepare(sql).all(...params) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
@@ -985,7 +1037,7 @@ export class QueryBuilder {
           + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
           + nameMatchBonus(r.node.name, scoringQuery),
       }));
-      results.sort((a, b) => b.score - a.score);
+      results.sort(compareSearchResultsDeterministically);
       // Trim to requested limit after rescoring
       if (results.length > limit) {
         results = results.slice(0, limit);
@@ -1062,7 +1114,7 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ' ORDER BY file_path, start_line LIMIT ? OFFSET ?';
+    sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as NodeRow[];
@@ -1091,7 +1143,7 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ' ORDER BY name LIMIT ?';
+    sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT ?`;
     params.push(limit);
     const rows = this.db.prepare(sql).all(...params) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
@@ -1123,7 +1175,13 @@ export class QueryBuilder {
       const dist = boundedEditDistance(name.toLowerCase(), lowered, maxDist);
       if (dist <= maxDist) candidates.push({ name, dist });
     }
-    candidates.sort((a, b) => a.dist - b.dist);
+    candidates.sort((a, b) => {
+      const distanceOrder = a.dist - b.dist;
+      if (distanceOrder !== 0) return distanceOrder;
+      if (a.name < b.name) return -1;
+      if (a.name > b.name) return 1;
+      return 0;
+    });
 
     // Cap the per-name follow-up queries. Each survivor triggers a
     // separate `SELECT * FROM nodes WHERE name = ?`; without this cap
@@ -1147,7 +1205,7 @@ export class QueryBuilder {
         sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
         params.push(...languages);
       }
-      sql += ' LIMIT 5';
+      sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT 5`;
       const rows = this.db.prepare(sql).all(...params) as NodeRow[];
       for (const row of rows) {
         if (seen.has(row.id)) continue;
@@ -1214,7 +1272,7 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score LIMIT ? OFFSET ?';
+    sql += ` ORDER BY score, ${deterministicNodeOrderSql('nodes.')} LIMIT ? OFFSET ?`;
     params.push(ftsLimit, offset);
 
     try {
@@ -1278,7 +1336,7 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?';
+    sql += ` ORDER BY score DESC, ${deterministicNodeOrderSql()} LIMIT ? OFFSET ?`;
     params.push(limit, offset);
 
     const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
