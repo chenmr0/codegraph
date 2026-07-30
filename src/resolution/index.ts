@@ -26,6 +26,11 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import {
+  ResolverPool,
+  minRefsForResolverPool,
+  type ResolverAdmissionResult,
+} from './resolver-pool';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -221,6 +226,13 @@ export class ReferenceResolver {
   private nameCache: LRUCache<string, Node[]>; // name → nodes cache
   private lowerNameCache: LRUCache<string, Node[]>; // lower(name) → nodes cache
   private qualifiedNameCache: LRUCache<string, Node[]>; // qualified_name → nodes cache
+  private methodMatchCache: LRUCache<string, Node[]>;
+  private methodOwnerIndexCache: LRUCache<string, Map<string, Node[]>>;
+  private nodesByKindCache = new Map<Node['kind'], Node[]>();
+  private supertypeGeneration = 0;
+  private supertypeMemo = new Map<string, { generation: number; values: string[] }>();
+  private readonly equivalenceCachesEnabled =
+    process.env.CODEGRAPH_NO_RESOLVE_EQUIVALENCE_CACHE !== '1';
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -248,6 +260,8 @@ export class ReferenceResolver {
     this.nameCache = new LRUCache(limit);
     this.lowerNameCache = new LRUCache(limit);
     this.qualifiedNameCache = new LRUCache(limit);
+    this.methodMatchCache = new LRUCache(limit);
+    this.methodOwnerIndexCache = new LRUCache(limit);
 
     this.context = this.createContext();
   }
@@ -318,6 +332,11 @@ export class ReferenceResolver {
     this.nameCache.clear();
     this.lowerNameCache.clear();
     this.qualifiedNameCache.clear();
+    this.methodMatchCache.clear();
+    this.methodOwnerIndexCache.clear();
+    this.nodesByKindCache.clear();
+    this.supertypeMemo.clear();
+    this.supertypeGeneration++;
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -343,6 +362,75 @@ export class ReferenceResolver {
         return result;
       },
 
+      getMethodMatches: (typeName: string, methodName: string, language) => {
+        if (!this.equivalenceCachesEnabled) {
+          const want = `${typeName}::${methodName}`;
+          return this.queries
+            .getNodesByName(methodName)
+            .filter(
+              (candidate) =>
+                candidate.kind === 'method' &&
+                candidate.language === language &&
+                (
+                  candidate.qualifiedName === want ||
+                  candidate.qualifiedName.endsWith(`::${want}`)
+                )
+            );
+        }
+        const cacheKey = `${language}\0${typeName}::${methodName}`;
+        const cached = this.methodMatchCache.get(cacheKey);
+        if (cached !== undefined) return cached;
+
+        let candidates = this.nameCache.get(methodName);
+        if (candidates === undefined) {
+          candidates = this.queries.getNodesByName(methodName);
+          this.nameCache.set(methodName, candidates);
+        }
+
+        const want = `${typeName}::${methodName}`;
+        let matches: Node[];
+        if (typeName.includes('::') || methodName.includes(':')) {
+          // Preserve the exact legacy predicate for shapes that cannot use the
+          // two-segment owner index.
+          matches = [];
+          for (const candidate of candidates) {
+            if (candidate.kind !== 'method' || candidate.language !== language) continue;
+            const qualifiedName = candidate.qualifiedName;
+            if (
+              qualifiedName === want ||
+              qualifiedName.endsWith(`::${want}`)
+            ) {
+              matches.push(candidate);
+            }
+          }
+        } else {
+          const ownerIndexKey = `${language}\0${methodName}`;
+          let ownerIndex = this.methodOwnerIndexCache.get(ownerIndexKey);
+          if (!ownerIndex) {
+            ownerIndex = new Map<string, Node[]>();
+            for (const candidate of candidates) {
+              if (candidate.kind !== 'method' || candidate.language !== language) continue;
+              const qualifiedName = candidate.qualifiedName;
+              const lastSeparator = qualifiedName.lastIndexOf('::');
+              if (lastSeparator < 0) continue;
+              const ownerSeparator = qualifiedName.lastIndexOf('::', lastSeparator - 1);
+              const key =
+                ownerSeparator < 0
+                  ? qualifiedName
+                  : qualifiedName.slice(ownerSeparator + 2);
+              const bucket = ownerIndex.get(key);
+              if (bucket) bucket.push(candidate);
+              else ownerIndex.set(key, [candidate]);
+            }
+            this.methodOwnerIndexCache.set(ownerIndexKey, ownerIndex);
+          }
+          matches = ownerIndex.get(want) ?? [];
+        }
+
+        this.methodMatchCache.set(cacheKey, matches);
+        return matches;
+      },
+
       getNodesByQualifiedName: (qualifiedName: string) => {
         const cached = this.qualifiedNameCache.get(qualifiedName);
         if (cached !== undefined) return cached;
@@ -352,7 +440,14 @@ export class ReferenceResolver {
       },
 
       getNodesByKind: (kind: Node['kind']) => {
-        return this.queries.getNodesByKind(kind);
+        if (!this.equivalenceCachesEnabled) {
+          return this.queries.getNodesByKind(kind);
+        }
+        const cached = this.nodesByKindCache.get(kind);
+        if (cached !== undefined) return cached;
+        const result = this.queries.getNodesByKind(kind);
+        this.nodesByKindCache.set(kind, result);
+        return result;
       },
 
       fileExists: (filePath: string) => {
@@ -423,6 +518,13 @@ export class ReferenceResolver {
       },
 
       getSupertypes: (typeName: string, language) => {
+        const memoKey = `${language}\0${typeName}`;
+        if (this.equivalenceCachesEnabled) {
+          const memoized = this.supertypeMemo.get(memoKey);
+          if (memoized?.generation === this.supertypeGeneration) {
+            return memoized.values;
+          }
+        }
         // Union the `implements`/`extends` targets of every same-named type node.
         // Matching by simple name (not id) reconciles a type declared in one node
         // (`KF::Builder`) with conformance declared in a separate extension node
@@ -430,7 +532,14 @@ export class ReferenceResolver {
         const typeNodes = this.context
           .getNodesByName(typeName)
           .filter((n) => SUPERTYPE_BEARING_KINDS.has(n.kind) && n.language === language);
-        if (typeNodes.length === 0) return [];
+        if (typeNodes.length === 0) {
+          if (!this.equivalenceCachesEnabled) return [];
+          this.supertypeMemo.set(memoKey, {
+            generation: this.supertypeGeneration,
+            values: [],
+          });
+          return [];
+        }
         const supertypes = new Set<string>();
         for (const tn of typeNodes) {
           for (const edge of this.queries.getOutgoingEdges(tn.id, ['implements', 'extends'])) {
@@ -438,7 +547,21 @@ export class ReferenceResolver {
             if (target?.name && target.name !== typeName) supertypes.add(target.name);
           }
         }
-        return [...supertypes];
+        const values = [...supertypes];
+        if (this.equivalenceCachesEnabled) {
+          this.supertypeMemo.set(memoKey, {
+            generation: this.supertypeGeneration,
+            values,
+          });
+          if (this.supertypeMemo.size > 50_000) {
+            this.supertypeMemo.clear();
+            this.supertypeMemo.set(memoKey, {
+              generation: this.supertypeGeneration,
+              values,
+            });
+          }
+        }
+        return values;
       },
 
       getImportMappings: (filePath: string, language) => {
@@ -514,6 +637,10 @@ export class ReferenceResolver {
   ): ResolutionResult {
     // Pre-load all nodes into memory for fast lookups
     this.warmCaches();
+    // Implements/extends edges may have advanced since the previous batch.
+    // Reuse supertype answers only within this fixed-edge-state call.
+    this.supertypeGeneration++;
+    if (this.supertypeMemo.size > 50_000) this.supertypeMemo.clear();
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
@@ -521,6 +648,7 @@ export class ReferenceResolver {
 
     // Convert to our internal format, using denormalized fields when available
     const refs: UnresolvedRef[] = unresolvedRefs.map((ref) => ({
+      rowId: ref.rowId,
       fromNodeId: ref.fromNodeId,
       referenceName: ref.referenceName,
       referenceKind: ref.referenceKind,
@@ -569,6 +697,25 @@ export class ReferenceResolver {
         byMethod,
       },
     };
+  }
+
+  /**
+   * Resolve a worker-owned list without database side effects and drain the
+   * deferred conformance queue produced by exactly this list.
+   */
+  resolveListForAdmission(refs: UnresolvedReference[]): ResolverAdmissionResult {
+    const result = this.resolveAll(refs);
+    return {
+      resolved: result.resolved,
+      unresolved: result.unresolved,
+      deferredChain: this.deferredChainRefs.splice(0),
+      byMethod: result.stats.byMethod,
+    };
+  }
+
+  /** Re-admit worker-produced deferred refs in original input order. */
+  appendDeferredFromWorkers(refs: UnresolvedRef[]): void {
+    this.deferredChainRefs.push(...refs);
   }
 
   /**
@@ -789,6 +936,34 @@ export class ReferenceResolver {
     });
   }
 
+  private static partitionCleanup(refs: UnresolvedRef[]): {
+    rowIds: number[];
+    legacyKeys: Array<{
+      fromNodeId: string;
+      referenceName: string;
+      referenceKind: string;
+    }>;
+  } {
+    const rowIds: number[] = [];
+    const legacyKeys: Array<{
+      fromNodeId: string;
+      referenceName: string;
+      referenceKind: string;
+    }> = [];
+    for (const ref of refs) {
+      if (ref.rowId !== undefined) {
+        rowIds.push(ref.rowId);
+      } else {
+        legacyKeys.push({
+          fromNodeId: ref.fromNodeId,
+          referenceName: ref.referenceName,
+          referenceKind: ref.referenceKind,
+        });
+      }
+    }
+    return { rowIds, legacyKeys };
+  }
+
   /**
    * Resolve and persist edges to database
    */
@@ -808,13 +983,11 @@ export class ReferenceResolver {
 
     // Clean up resolved refs from unresolved_refs table so metrics are accurate
     if (result.resolved.length > 0) {
-      this.queries.deleteSpecificResolvedReferences(
-        result.resolved.map((r) => ({
-          fromNodeId: r.original.fromNodeId,
-          referenceName: r.original.referenceName,
-          referenceKind: r.original.referenceKind,
-        }))
+      const cleanup = ReferenceResolver.partitionCleanup(
+        result.resolved.map((ref) => ref.original)
       );
+      this.queries.deleteReferencesByRowIds(cleanup.rowIds);
+      this.queries.deleteSpecificResolvedReferences(cleanup.legacyKeys);
     }
 
     return result;
@@ -869,7 +1042,12 @@ export class ReferenceResolver {
    */
   async resolveAndPersistBatched(
     onProgress?: (current: number, total: number) => void,
-    batchSize: number = 5000
+    batchSize: number = 5000,
+    options?: {
+      dbPath?: string;
+      bulkEdgeLoad?: { begin: () => void; end: () => void | Promise<void> };
+      bulkRefLoad?: { begin: () => void; end: () => void | Promise<void> };
+    }
   ): Promise<ResolutionResult> {
     this.warmCaches();
 
@@ -881,86 +1059,164 @@ export class ReferenceResolver {
       unresolved: 0,
       byMethod: {} as Record<string, number>,
     };
+    const resolutionStartedAt = Date.now();
+    let sequentialBatches = 0;
+    let parallelBatches = 0;
 
-    // Process in batches. We always read from offset 0 because resolved refs
-    // are deleted after each batch, shifting the remaining rows forward.
-    let prevRemaining = Number.POSITIVE_INFINITY;
-    while (true) {
-      const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
-      if (batch.length === 0) break;
-
-      const result = this.resolveAll(batch);
-
-      // Persist edges immediately
-      const edges = this.createEdges(result.resolved);
-      if (edges.length > 0) {
-        this.queries.insertEdges(edges);
-      }
-
-      // Clean up resolved refs so they don't appear in the next batch
-      if (result.resolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.resolved.map((r) => ({
-            fromNodeId: r.original.fromNodeId,
-            referenceName: r.original.referenceName,
-            referenceKind: r.original.referenceKind,
-          }))
+    // Large runs may resolve a fixed database batch on read-only workers. The
+    // main thread remains the sole writer and admits worker results in row order.
+    let pool: ResolverPool | null = null;
+    let poolReady = false;
+    if (options?.dbPath && total >= minRefsForResolverPool()) {
+      pool = ResolverPool.tryCreate(options.dbPath, this.projectRoot);
+      const startingPool = pool;
+      if (startingPool) {
+        void startingPool.ready().then(
+          () => {
+            if (pool === startingPool) poolReady = true;
+          },
+          () => {
+            if (pool === startingPool) pool = null;
+            void startingPool.destroy().catch(() => undefined);
+          }
         );
       }
+    }
 
-      // Delete unresolvable refs from this batch to avoid re-processing them
-      if (result.unresolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
-            fromNodeId: r.fromNodeId,
-            referenceName: r.referenceName,
-            referenceKind: r.referenceKind,
-          }))
+    let bulkEdgesActive = false;
+    let bulkRefsActive = false;
+    if (total >= minRefsForResolverPool() && options?.bulkEdgeLoad) {
+      // Mark active before begin(): a partially successful sequence of DDL
+      // drops must still be repaired in finally if a later DROP throws.
+      bulkEdgesActive = true;
+      try {
+        options.bulkEdgeLoad.begin();
+      } catch {
+        // end() in finally recreates any indexes that were partially dropped.
+      }
+    }
+    if (total >= minRefsForResolverPool() && options?.bulkRefLoad) {
+      bulkRefsActive = true;
+      try {
+        options.bulkRefLoad.begin();
+      } catch {
+        // end() in finally recreates any indexes that were partially dropped.
+      }
+    }
+
+    let afterRowId = 0;
+    try {
+      while (true) {
+        const batch = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize);
+        if (batch.length === 0) break;
+
+        let result: ResolutionResult;
+        if (pool && poolReady && ResolverPool.worthParallel(batch.length)) {
+          try {
+            const parallel = await pool.resolveBatch(batch);
+            parallelBatches++;
+            this.appendDeferredFromWorkers(parallel.deferredChain);
+            result = {
+              resolved: parallel.resolved,
+              unresolved: parallel.unresolved,
+              stats: {
+                total: batch.length,
+                resolved: parallel.resolved.length,
+                unresolved: parallel.unresolved.length,
+                byMethod: parallel.byMethod,
+              },
+            };
+          } catch (error) {
+            logDebug('Parallel resolution failed; retrying the batch sequentially', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            const failedPool = pool;
+            pool = null;
+            poolReady = false;
+            if (failedPool) await failedPool.destroy().catch(() => undefined);
+            sequentialBatches++;
+            result = this.resolveAll(batch);
+          }
+        } else {
+          sequentialBatches++;
+          result = this.resolveAll(batch);
+        }
+
+        // Persist edges immediately
+        const edges = this.createEdges(result.resolved);
+        if (edges.length > 0) {
+          this.queries.insertEdges(edges);
+        }
+
+        // Delete exactly the rows attempted by this batch. Tuple cleanup is kept
+        // only for hand-built references that did not originate in SQLite.
+        let removedThisBatch = 0;
+        const resolvedCleanup = ReferenceResolver.partitionCleanup(
+          result.resolved.map((ref) => ref.original)
         );
+        removedThisBatch += this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds);
+        this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys);
+
+        const unresolvedCleanup = ReferenceResolver.partitionCleanup(result.unresolved);
+        removedThisBatch += this.queries.deleteReferencesByRowIds(unresolvedCleanup.rowIds);
+        this.queries.deleteSpecificResolvedReferences(unresolvedCleanup.legacyKeys);
+
+        // Aggregate stats
+        aggregateStats.total += result.stats.total;
+        aggregateStats.resolved += result.stats.resolved;
+        aggregateStats.unresolved += result.stats.unresolved;
+        for (const [method, count] of Object.entries(result.stats.byMethod)) {
+          aggregateStats.byMethod[method] = (aggregateStats.byMethod[method] || 0) + count;
+        }
+
+        processed += batch.length;
+        onProgress?.(processed, total);
+
+        // Yield so progress UI can render between batches
+        await new Promise(resolve => setImmediate(resolve));
+
+        // Non-progress guard (defense-in-depth). Every SQLite-backed row in the
+        // batch must be removed by its exact row id. If none is removed, stop
+        // instead of repeatedly admitting edges while walking newly appended rows.
+        // An entirely unresolvable batch is still progress because those exact
+        // source rows are deleted and keyset pagination advances to the next ids.
+        if (removedThisBatch === 0 && batch.some((ref) => ref.rowId !== undefined)) {
+          break;
+        }
+        afterRowId = batch[batch.length - 1]?.rowId ?? afterRowId;
       }
-
-      // Aggregate stats
-      aggregateStats.total += result.stats.total;
-      aggregateStats.resolved += result.stats.resolved;
-      aggregateStats.unresolved += result.stats.unresolved;
-      for (const [method, count] of Object.entries(result.stats.byMethod)) {
-        aggregateStats.byMethod[method] = (aggregateStats.byMethod[method] || 0) + count;
+    } finally {
+      const activePool = pool;
+      pool = null;
+      if (activePool) await activePool.destroy().catch(() => undefined);
+      try {
+        if (bulkRefsActive) await options!.bulkRefLoad!.end();
+      } finally {
+        if (bulkEdgesActive) await options!.bulkEdgeLoad!.end();
       }
+    }
 
-      processed += batch.length;
-      onProgress?.(processed, total);
-
-      // Yield so progress UI can render between batches
-      await new Promise(resolve => setImmediate(resolve));
-
-      // Non-progress guard (defense-in-depth). Because we re-read from offset 0
-      // each pass, the unresolved_refs table MUST shrink every iteration — both
-      // resolved and unresolved refs are deleted above. If it didn't shrink, a
-      // resolver returned a match whose `original.referenceName` differs from the
-      // stored row, so the keyed delete no-ops, and we'd re-read + re-resolve +
-      // re-insert the same rows forever (the runaway that grew a 99-file repo to
-      // 5M edges / 1.4 GB before the Go-fallback fix). Stop rather than grow the
-      // graph without bound.
-      //
-      // NOTE: We do NOT break when the entire batch is unresolvable — those refs
-      // are already deleted above, so the next read from offset 0 slides in a
-      // fresh set of refs. Breaking on an all-unresolvable batch would leave
-      // millions of later (resolvable) refs unprocessed (regression on C/C++
-      // codebases where ~2.5M references-kind refs match node names but appear
-      // after a "cold" region of unresolvable calls).
-      const remaining = this.queries.getUnresolvedReferencesCount();
-      if (remaining >= prevRemaining) break;
-      prevRemaining = remaining;
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+      console.error(
+        `[phase-timing] reference-batches=${Date.now() - resolutionStartedAt}ms ` +
+          `(parallel=${parallelBatches}, sequential=${sequentialBatches})`
+      );
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,
     // synthesize observer/callback dispatch edges (dispatcher → registered
     // callbacks) that static parsing leaves out. Best-effort — never fail the
     // index on it. See docs/design/callback-edge-synthesis.md.
+    const synthesisStartedAt = Date.now();
     try {
       aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
     } catch {
       // synthesis is additive and optional; ignore failures
+    }
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+      console.error(
+        `[phase-timing] callback-synthesis=${Date.now() - synthesisStartedAt}ms`
+      );
     }
 
     return {

@@ -10,6 +10,11 @@ import { EdgeKind, Language, Node } from '../types';
  * An unresolved reference from extraction
  */
 export interface UnresolvedRef {
+  /**
+   * `unresolved_refs.id` when loaded from SQLite. Database-backed resolution
+   * deletes this exact row instead of every same-key sibling call site.
+   */
+  rowId?: number;
   /** ID of the source node containing the reference */
   fromNodeId: string;
   /** The name being referenced */
@@ -67,6 +72,12 @@ export interface ResolutionContext {
   getNodesInFile(filePath: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
+  /**
+   * Get the method nodes whose qualified owner matches `typeName`.
+   * Optional for external/test contexts; production memoizes the exact
+   * ref-independent filter without changing candidate order.
+   */
+  getMethodMatches?(typeName: string, methodName: string, language: Language): Node[];
   /** Get all nodes by qualified name */
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */

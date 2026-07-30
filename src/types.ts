@@ -319,6 +319,14 @@ export interface SavedCrossFileEdge {
  * A reference that couldn't be resolved during extraction
  */
 export interface UnresolvedReference {
+  /**
+   * `unresolved_refs.id` when the reference was loaded from SQLite.
+   *
+   * Resolution cleanup uses this exact row id so two same-named call sites
+   * owned by the same node cannot delete each other across a batch boundary.
+   */
+  rowId?: number;
+
   /** ID of the node containing the reference */
   fromNodeId: string;
 

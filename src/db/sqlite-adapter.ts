@@ -50,10 +50,12 @@ class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
   private _txDepth = 0;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, options?: { readOnly?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
-    this._db = new DatabaseSync(dbPath);
+    this._db = options?.readOnly
+      ? new DatabaseSync(dbPath, { readOnly: true })
+      : new DatabaseSync(dbPath);
   }
 
   get open(): boolean {
@@ -431,13 +433,25 @@ class SqlJsAdapter implements SqliteDatabase {
  *
  * For the WASM path, call `ensureSqlJsReady()` before this function.
  */
-export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+export function createDatabase(
+  dbPath: string,
+  options?: { readOnly?: boolean }
+): { db: SqliteDatabase; backend: SqliteBackend } {
   // Try node:sqlite first (full performance, WAL, native).
   // CODEGRAPH_FORCE_WASM=1 skips node:sqlite to test the WASM fallback.
   if (!process.env.CODEGRAPH_FORCE_WASM) {
     try {
-      return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
-    } catch { /* unavailable, try fallback */ }
+      return { db: new NodeSqliteAdapter(dbPath, options), backend: 'node-sqlite' };
+    } catch (error) {
+      // Resolver workers must never open a writable or copied sql.js database:
+      // their contract is read-only access to the writer's live WAL snapshot.
+      if (options?.readOnly) throw error;
+      // unavailable, try fallback
+    }
+  }
+
+  if (options?.readOnly) {
+    throw new Error('Read-only SQLite connections require the node:sqlite backend');
   }
 
   // Fallback: sql.js WASM backend (no native deps, no WAL)

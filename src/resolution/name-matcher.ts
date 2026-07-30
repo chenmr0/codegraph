@@ -275,15 +275,20 @@ function resolveMethodOnType(
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
   // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
   // The previous same-file approach missed the latter — the typical C++ layout.
-  const methodCandidates = context.getNodesByName(methodName);
-  const want = `${typeName}::${methodName}`;
-  const matches: Node[] = [];
-  for (const m of methodCandidates) {
-    if (m.kind !== 'method') continue;
-    if (m.language !== ref.language) continue;
-    const qn = m.qualifiedName;
-    if (qn === want || qn.endsWith(`::${want}`)) {
-      matches.push(m);
+  let matches: Node[];
+  if (context.getMethodMatches) {
+    matches = context.getMethodMatches(typeName, methodName, ref.language);
+  } else {
+    const methodCandidates = context.getNodesByName(methodName);
+    const want = `${typeName}::${methodName}`;
+    matches = [];
+    for (const m of methodCandidates) {
+      if (m.kind !== 'method') continue;
+      if (m.language !== ref.language) continue;
+      const qn = m.qualifiedName;
+      if (qn === want || qn.endsWith(`::${want}`)) {
+        matches.push(m);
+      }
     }
   }
   if (matches.length === 0) {

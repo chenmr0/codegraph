@@ -217,6 +217,8 @@ export class QueryBuilder {
     getNodesByLowerName?: SqliteStatement;
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
+    getUnresolvedBatchAfter?: SqliteStatement;
+    deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -1780,6 +1782,7 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getUnresolvedByName.all(name) as UnresolvedRefRow[];
     return rows.map((row) => ({
+      rowId: row.id,
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
       referenceKind: row.reference_kind as EdgeKind,
@@ -1797,6 +1800,7 @@ export class QueryBuilder {
   getUnresolvedReferences(): UnresolvedReference[] {
     const rows = this.db.prepare('SELECT * FROM unresolved_refs').all() as UnresolvedRefRow[];
     return rows.map((row) => ({
+      rowId: row.id,
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
       referenceKind: row.reference_kind as EdgeKind,
@@ -1828,11 +1832,39 @@ export class QueryBuilder {
   getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatch) {
       this.stmts.getUnresolvedBatch = this.db.prepare(
-        'SELECT * FROM unresolved_refs LIMIT ? OFFSET ?'
+        'SELECT * FROM unresolved_refs ORDER BY id LIMIT ? OFFSET ?'
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
     return rows.map((row) => ({
+      rowId: row.id,
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  /**
+   * Get the next unresolved-reference batch by primary-key seek.
+   *
+   * This preserves the row order used by the legacy OFFSET reader while
+   * avoiding repeated scans from the beginning of the table. The row id also
+   * gives the resolver an exact cleanup key for duplicate same-name call sites.
+   */
+  getUnresolvedReferencesBatchAfter(afterRowId: number, limit: number): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedBatchAfter) {
+      this.stmts.getUnresolvedBatchAfter = this.db.prepare(
+        'SELECT * FROM unresolved_refs WHERE id > ? ORDER BY id LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getUnresolvedBatchAfter.all(afterRowId, limit) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      rowId: row.id,
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
       referenceKind: row.reference_kind as EdgeKind,
@@ -1888,6 +1920,7 @@ export class QueryBuilder {
     }
 
     return rows.map((row) => ({
+      rowId: row.id,
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,
       referenceKind: row.reference_kind as EdgeKind,
@@ -2008,6 +2041,40 @@ WHERE e.kind = 'imports'
       }
     });
     deleteMany(refs);
+  }
+
+  /**
+   * Delete exactly the unresolved-reference rows that were processed.
+   *
+   * The legacy tuple delete intentionally remains for references constructed
+   * outside SQLite, but database batches always carry row ids. A tuple omits
+   * line/column and can therefore remove a same-key sibling that belongs to a
+   * later batch, silently losing that sibling's edge.
+   */
+  deleteReferencesByRowIds(rowIds: number[]): number {
+    if (rowIds.length === 0) return 0;
+
+    let changed = 0;
+    this.db.transaction(() => {
+      for (let i = 0; i < rowIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = rowIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        if (chunk.length === SQLITE_PARAM_CHUNK_SIZE) {
+          if (!this.stmts.deleteRefsByRowIdsFull) {
+            const placeholders = new Array(SQLITE_PARAM_CHUNK_SIZE).fill('?').join(',');
+            this.stmts.deleteRefsByRowIdsFull = this.db.prepare(
+              `DELETE FROM unresolved_refs WHERE id IN (${placeholders})`
+            );
+          }
+          changed += this.stmts.deleteRefsByRowIdsFull.run(...chunk).changes;
+        } else {
+          const placeholders = chunk.map(() => '?').join(',');
+          changed += this.db
+            .prepare(`DELETE FROM unresolved_refs WHERE id IN (${placeholders})`)
+            .run(...chunk).changes;
+        }
+      }
+    })();
+    return changed;
   }
 
   // ===========================================================================

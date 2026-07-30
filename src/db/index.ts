@@ -202,6 +202,54 @@ export class DatabaseConnection {
     }
   }
 
+  /**
+   * Non-unique edge indexes that are not required for correctness while the
+   * main resolution batches insert edges. The unique identity index remains:
+   * it preserves INSERT OR IGNORE deduplication and its `source` prefix keeps
+   * the supertype walk queryable between batches.
+   */
+  private static readonly BULK_RESOLUTION_EDGE_INDEX_NAMES = [
+    'idx_edges_kind',
+    'idx_edges_source_kind',
+    'idx_edges_target_kind',
+    'idx_edges_provenance',
+  ] as const;
+
+  /** Enter the large-resolution edge-write window. */
+  beginBulkResolutionEdgeLoad(): void {
+    for (const indexName of DatabaseConnection.BULK_RESOLUTION_EDGE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+    }
+  }
+
+  /** Restore edge lookup indexes before conformance and callback synthesis. */
+  async endBulkResolutionEdgeLoad(): Promise<void> {
+    await this.recreateIndexes(DatabaseConnection.BULK_RESOLUTION_EDGE_INDEX_NAMES);
+  }
+
+  /**
+   * Sync-oriented unresolved-reference indexes are write-only overhead during
+   * the full batched drain: the loop reads by primary key and deletes by id.
+   */
+  private static readonly BULK_RESOLUTION_REF_INDEX_NAMES = [
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+  ] as const;
+
+  /** Enter the large-resolution unresolved-reference cleanup window. */
+  beginBulkResolutionRefLoad(): void {
+    for (const indexName of DatabaseConnection.BULK_RESOLUTION_REF_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${indexName}`);
+    }
+  }
+
+  /** Restore unresolved-reference lookup indexes after the batched drain. */
+  async endBulkResolutionRefLoad(): Promise<void> {
+    await this.recreateIndexes(DatabaseConnection.BULK_RESOLUTION_REF_INDEX_NAMES);
+  }
+
   /** Restore only missing deferred indexes after an interrupted fresh index. */
   private healBulkParseIndexes(): void {
     const rows = this.db
@@ -222,6 +270,21 @@ export class DatabaseConnection {
         throw new Error(`schema.sql: parse index ${indexName} not found for recovery`);
       }
       this.db.exec(ddl);
+    }
+  }
+
+  /** Recreate named schema indexes one at a time, yielding between scans. */
+  private async recreateIndexes(indexNames: readonly string[]): Promise<void> {
+    const schema = this.readSchema();
+    for (const indexName of indexNames) {
+      const ddl = schema.match(
+        new RegExp(`CREATE (?:UNIQUE )?INDEX IF NOT EXISTS ${indexName}\\b[^;]*;`)
+      )?.[0];
+      if (!ddl) {
+        throw new Error(`schema.sql: index ${indexName} not found for recreation`);
+      }
+      this.db.exec(ddl);
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
 

@@ -809,7 +809,26 @@ export class CodeGraph {
    * Processes chunks of unresolved refs, persisting results after each batch.
    */
   async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
-    return this.resolver.resolveAndPersistBatched(onProgress);
+    const deferResolutionIndexes =
+      process.env.CODEGRAPH_NO_RESOLVE_INDEX_DEFER !== '1';
+    return this.resolver.resolveAndPersistBatched(onProgress, undefined, {
+      dbPath:
+        this.db.getBackend() === 'node-sqlite'
+          ? this.db.getPath()
+          : undefined,
+      bulkEdgeLoad: deferResolutionIndexes
+        ? {
+            begin: () => this.db.beginBulkResolutionEdgeLoad(),
+            end: () => this.db.endBulkResolutionEdgeLoad(),
+          }
+        : undefined,
+      bulkRefLoad: deferResolutionIndexes
+        ? {
+            begin: () => this.db.beginBulkResolutionRefLoad(),
+            end: () => this.db.endBulkResolutionRefLoad(),
+          }
+        : undefined,
+    });
   }
 
   /**
