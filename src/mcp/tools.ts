@@ -364,7 +364,7 @@ export const tools: ToolDefinition[] = [
   {
     name: 'codegraph_search',
     description:
-      '按符号名精确/模糊搜索。返回符号位置信息。' +
+      '按符号名搜索：精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
       '只接受符号名或符号名片段。' +
       '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
       '"RepAlloc.Rsp"（点号分隔的 proto 引用）、"how does auth work?"（自然语言问题）。' +
@@ -1088,32 +1088,60 @@ export class ToolHandler {
     const kind = args.kind as string | undefined;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
+    const kinds = kind ? [kind as NodeKind] : undefined;
 
-    const results = cg.searchNodes(query, {
-      limit,
-      kinds: kind ? [kind as NodeKind] : undefined,
-    });
+    // Exact-first, fuzzy-fallback — mirrors findSymbolMatches / findAllSymbols
+    // so the agent tool surface is internally consistent. A bare name is
+    // resolved through the direct exact-name index (idx_nodes_name), NOT FTS:
+    // FTS caps + BM25-ranks, so a heavily-overloaded name (tokio's `poll`,
+    // 50+ defs) buries the wanted def below the fetch limit and the agent
+    // Reads to find it. The direct index returns EVERY exact-name definition,
+    // ranked (generated files down, definitions before declarations). Only
+    // when no exact match exists do we fall back to the FTS→LIKE→edit-distance
+    // chain, flagged with a warning so the agent knows the candidates are
+    // closest matches, not the queried name (no silent wrong-symbol surfacing).
+    const isQualified = /[.\/]|::/.test(query);
 
+    if (!isQualified) {
+      const exactAll = cg.getNodesByName(query);
+      const exact = kinds ? exactAll.filter((n) => kinds.includes(n.kind)) : exactAll;
+      if (exact.length > 0) {
+        const ranked = [...exact].sort((a, b) => {
+          const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
+          const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
+          if (aGen !== bGen) return aGen - bGen;
+          const aDecl = a.isDeclaration === true ? 1 : 0;
+          const bDecl = b.isDeclaration === true ? 1 : 0;
+          return aDecl - bDecl;
+        });
+        const total = ranked.length;
+        const capped = ranked.slice(0, limit);
+        const note = total > limit
+          ? `\n\n> Showing ${capped.length} of ${total} exact matches named "${query}". Raise \`limit\` to see the rest.`
+          : '';
+        const formatted = this.formatSearchResults(capped.map((n) => ({ node: n, score: 1.0 })));
+        return this.textResult(this.truncateOutput(formatted + note));
+      }
+      // No exact match — fuzzy fallback, flagged so the agent doesn't treat
+      // closest matches as the queried name (no silent wrong-feature surfacing).
+      const fuzzy = cg.searchNodes(query, { limit, kinds });
+      if (fuzzy.length === 0) {
+        return this.textResult(`No results found for "${query}"`);
+      }
+      const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:`;
+      const formatted = this.formatSearchResults(this.rankSearchResults(fuzzy));
+      return this.textResult(this.truncateOutput(note + '\n' + formatted));
+    }
+
+    // Qualified input (`Session.request`, `stage_apply::run`): the tool
+    // description discourages点号/:: 分隔的引用 (use codegraph_node to
+    // resolve a qualified symbol), but don't crash — run the existing FTS
+    // fuzzy path so a partial qualified fragment still surfaces candidates.
+    const results = cg.searchNodes(query, { limit, kinds });
     if (results.length === 0) {
       return this.textResult(`No results found for "${query}"`);
     }
-
-    // Down-rank generated files within the FTS-returned set so a search
-    // for "Send" surfaces the hand-written keeper before .pb.go stubs
-    // that share the name. Stable: only reorders generated vs. not.
-    // Also rank definitions ahead of declarations (prototypes) so the
-    // agent sees the implementation before the header signature — a
-    // prototype gives no body to read and a dead-end callees trail.
-    const ranked = [...results].sort((a, b) => {
-      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
-      if (aGen !== bGen) return aGen - bGen;
-      const aDecl = a.node.isDeclaration === true ? 1 : 0;
-      const bDecl = b.node.isDeclaration === true ? 1 : 0;
-      return aDecl - bDecl;
-    });
-
-    const formatted = this.formatSearchResults(ranked);
+    const formatted = this.formatSearchResults(this.rankSearchResults(results));
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -3349,6 +3377,23 @@ export class ToolHandler {
   // =========================================================================
   // Formatting helpers (compact by default to reduce context usage)
   // =========================================================================
+
+  /**
+   * Stable re-order of FTS-returned candidates: generated files (.pb.go,
+   * _grpc.pb.go, …) sink; within each group definitions rank before
+   * declarations (prototypes) so the agent sees the implementation body
+   * before the header signature. Preserves FTS/BM25 order within a group.
+   */
+  private rankSearchResults(results: SearchResult[]): SearchResult[] {
+    return [...results].sort((a, b) => {
+      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+      if (aGen !== bGen) return aGen - bGen;
+      const aDecl = a.node.isDeclaration === true ? 1 : 0;
+      const bDecl = b.node.isDeclaration === true ? 1 : 0;
+      return aDecl - bDecl;
+    });
+  }
 
   private formatSearchResults(results: SearchResult[]): string {
     const lines: string[] = [`## Search Results (${results.length} found)`, ''];

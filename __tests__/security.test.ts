@@ -368,6 +368,7 @@ describe('MCP Input Validation', () => {
     }));
     const fakeCg = {
       searchNodes: () => many,
+      getNodesByName: () => [],
     };
     const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
 
