@@ -6,6 +6,7 @@
 
 import { Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { canonicalFilePath } from '../utils';
 
 /**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
@@ -23,8 +24,16 @@ export function matchByFilePath(
     return null;
   }
 
+  // Canonicalize so a reference reaching a file through a symlink (same-basename
+  // or otherwise) matches the file's canonical (realpath-relative) path/name.
+  // When realpath resolves, fileName becomes the canonical basename so
+  // getNodesByName finds the (canonical-named) file; when it doesn't (a bare
+  // name not root-relative), this degrades to the normalized logical name —
+  // identical to the prior behavior.
+  const refPath = canonicalFilePath(context.getProjectRoot(), ref.referenceName);
+
   // Extract the filename from the path
-  const fileName = ref.referenceName.split('/').pop();
+  const fileName = refPath.split('/').pop();
   if (!fileName) return null;
 
   // Search for file nodes with this name
@@ -34,7 +43,7 @@ export function matchByFilePath(
   if (fileNodes.length === 0) return null;
 
   // Prefer exact path match on qualified_name
-  const exactMatch = fileNodes.find(n => n.qualifiedName === ref.referenceName || n.filePath === ref.referenceName);
+  const exactMatch = fileNodes.find(n => n.qualifiedName === refPath || n.filePath === refPath);
   if (exactMatch) {
     return {
       original: ref,
@@ -52,7 +61,7 @@ export function matchByFilePath(
   // bare-filename import) resolves relative to the including file, not to an
   // arbitrary same-named header elsewhere in the tree.
   const suffixMatches = fileNodes.filter(
-    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+    n => n.qualifiedName.endsWith(refPath) || n.filePath.endsWith(refPath)
   );
   if (suffixMatches.length > 0) {
     return {

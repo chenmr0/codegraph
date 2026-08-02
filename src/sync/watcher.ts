@@ -36,7 +36,7 @@ import * as path from 'path';
 import type { Ignore } from 'ignore';
 import { isSourceFile, buildDefaultIgnore } from '../extraction';
 import { logDebug, logWarn } from '../errors';
-import { normalizePath } from '../utils';
+import { normalizePath, canonicalFilePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
@@ -399,11 +399,16 @@ export class FileWatcher {
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     if (!isSourceFile(rel)) return;
 
-    logDebug('File change detected', { file: rel });
+    // Canonicalize for STORAGE so the staleness banner — which compares tool
+    // responses (canonical, from the DB) against these keys — matches a change
+    // made through a symlink. The filter checks above stay on the logical `rel`
+    // so an ignore rule targeting the symlink name the user sees still applies.
+    const canon = canonicalFilePath(this.projectRoot, rel);
+    logDebug('File change detected', { file: canon });
     if (this.ready) {
       const now = Date.now();
-      const existing = this.pendingFiles.get(rel);
-      this.pendingFiles.set(rel, {
+      const existing = this.pendingFiles.get(canon);
+      this.pendingFiles.set(canon, {
         firstSeenMs: existing?.firstSeenMs ?? now,
         lastSeenMs: now,
       });

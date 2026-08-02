@@ -46,7 +46,7 @@ import {
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
-import { Mutex, FileLock } from './utils';
+import { Mutex, FileLock, canonicalFilePath } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
@@ -892,7 +892,9 @@ export class CodeGraph {
    * Get all nodes in a file
    */
   getNodesInFile(filePath: string): Node[] {
-    return this.queries.getNodesByFile(filePath);
+    // Canonicalize so a caller passing a symlink path resolves to the file's
+    // canonical (realpath-relative) path as stored in the DB.
+    return this.queries.getNodesByFile(canonicalFilePath(this.projectRoot, filePath));
   }
 
   /**
@@ -1152,7 +1154,9 @@ export class CodeGraph {
    * @returns Array of file paths that depend on this file
    */
   getFileDependents(filePath: string): string[] {
-    return this.graphManager.getFileDependents(filePath);
+    // Canonicalize so a caller passing a symlink path resolves to the canonical
+    // path the dependency graph is keyed on.
+    return this.graphManager.getFileDependents(canonicalFilePath(this.projectRoot, filePath));
   }
 
   /**

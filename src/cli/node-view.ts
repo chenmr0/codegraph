@@ -23,7 +23,7 @@
 
 import type CodeGraph from '../index';
 import type { Node, Edge } from '../types';
-import { validatePathWithinRoot, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { validatePathWithinRoot, CONFIG_LEAF_LANGUAGES, canonicalFilePath } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { readFileSync } from 'fs';
 import {
@@ -117,7 +117,10 @@ async function buildFileView(cg: CodeGraph, fileArg: string, opts: FileViewOpts)
     return result({ mode: 'no-index' }, 'No files indexed. Run `codegraph index` first.');
   }
 
-  const wantLower = normalizePath(fileArg).toLowerCase();
+  // Canonicalize so a symlink path resolves to the file's canonical
+  // (realpath-relative) path as stored; a bare basename degrades to the
+  // normalized basename (realpath ENOENT), so suffix/include matching still works.
+  const wantLower = canonicalFilePath(cg.getProjectRoot(), normalizePath(fileArg)).toLowerCase();
   let resolved = allFiles.find((f) => f.path.toLowerCase() === wantLower);
   let candidates: typeof allFiles = [];
   if (!resolved) {

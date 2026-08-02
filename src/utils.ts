@@ -192,6 +192,107 @@ export function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
 }
 
+// ============================================================
+// SYMLINK IDENTITY — canonical path dedup
+// ============================================================
+
+/**
+ * Whether symlink-identity dedup is on. Reads the `CODEGRAPH_DEDUP_SYMLINKS`
+ * env var live (default ON) — same pattern as {@link codeGraphDirName}.
+ *
+ * ON (default): {@link canonicalFilePath} resolves the real path so the same
+ * physical file reached via the real path or any in-repo symlink collapses to
+ * ONE canonical path → one `files` row, one set of nodes (no duplicate "two
+ * sets of code" for one symlinked tree).
+ *
+ * OFF (`0`/`false`/`off`): {@link canonicalFilePath} skips realpath and degrades
+ * to plain path normalization — the old behavior (a symlinked file indexed as a
+ * separate file from its target) plus a path-normalization side benefit. This
+ * is the safety valve: if dedup ever regresses accuracy or perf in a particular
+ * environment, set `CODEGRAPH_DEDUP_SYMLINKS=0` to fall back without waiting for
+ * a fix.
+ */
+function symlinkDedupEnabled(): boolean {
+  const v = process.env.CODEGRAPH_DEDUP_SYMLINKS;
+  if (v === undefined || v === '') return true; // default ON
+  const lv = v.toLowerCase();
+  return v !== '0' && lv !== 'false' && lv !== 'off' && lv !== 'no';
+}
+
+/** Case-fold a path-string cache key on Windows (NTFS is case-insensitive),
+ *  matching the win32 behavior of {@link isWithinDir}. POSIX is case-sensitive. */
+function caseKey(s: string): string {
+  return process.platform === 'win32' ? s.toLowerCase() : s;
+}
+
+/** Per-process realpath cache for {@link canonicalFilePath}, cleared by
+ *  {@link clearCanonicalCache} at the start of each index/sync pass and on
+ *  resolver cache clears — so a repointed symlink is picked up next run. */
+let canonicalCache: Map<string, string> | null = null;
+
+/**
+ * Canonicalize a project-relative file path for symlink-identity dedup.
+ *
+ * - Real path lands INSIDE the project root → returns the real path relative to
+ *   the root. The same physical file reached via the real path or any in-repo
+ *   symlink thus maps to one canonical path (one file row, one set of nodes).
+ * - Real path lands OUTSIDE the root (an in-repo symlink to an external target)
+ *   → returns the logical path, normalized. {@link validatePathWithinRoot}
+ *   (#527) still rejects these at index time, so external-symlink behavior is
+ *   unchanged: not indexed, no new regression.
+ * - realpath fails (ENOENT/ELOOP/EACCES) → returns the logical path normalized.
+ *   A broken/forbidden symlink that can't be resolved isn't indexed today
+ *   either; no new regression.
+ *
+ * When {@link symlinkDedupEnabled} is OFF, skips realpath entirely and returns
+ * the normalized logical path — old behavior + path normalization.
+ *
+ * The fallback uses `normalizePath(path.normalize(p))` (not bare `normalize`)
+ * so it strips leading `./`, duplicate separators, and trailing slashes —
+ * keeping string equality with resolver producers that return
+ * `path.relative(...).replace(/\\/g,'/')`.
+ */
+export function canonicalFilePath(rootDir: string, p: string): string {
+  const normalizedLogical = normalizePath(path.normalize(p));
+  // The project root itself (`''`, `.`, `./`, `/` after normalization) canonicalizes
+  // to `.` — collapse that to `''` so callers that test the result's truthiness
+  // (e.g. codegraph_files "all files vs prefix-filtered") treat root as "no
+  // prefix" rather than a literal `.` that matches nothing.
+  if (normalizedLogical === '.') return '';
+  if (!symlinkDedupEnabled()) return normalizedLogical;
+
+  const cache = canonicalCache ?? (canonicalCache = new Map());
+  const abs = path.resolve(rootDir, p);
+  const key = caseKey(abs);
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+
+  let result = normalizedLogical;
+  try {
+    const real = fs.realpathSync(abs);
+    const rel = normalizePath(path.relative(rootDir, real));
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      result = rel; // real path inside root → canonical realpath-relative
+    }
+    // else: real path outside root → keep normalizedLogical (external symlink;
+    // #527 blocks indexing it)
+  } catch {
+    // ENOENT / ELOOP / EACCES → keep normalizedLogical
+  }
+  if (result === '.') result = ''; // realpath of the root dir → '' (no prefix)
+  cache.set(key, result);
+  return result;
+}
+
+/**
+ * Clear the {@link canonicalFilePath} realpath cache. Call at the start of
+ * each `indexAll`/sync pass and on resolver cache clears, so a repointed
+ * symlink is reflected on the next run rather than serving a stale canonical.
+ */
+export function clearCanonicalCache(): void {
+  if (canonicalCache) canonicalCache.clear();
+}
+
 /**
  * Cross-process file lock using a lock file with PID tracking.
  *

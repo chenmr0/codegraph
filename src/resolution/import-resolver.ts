@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { canonicalFilePath } from '../utils';
 
 /**
  * Extension resolution order by language
@@ -58,18 +59,20 @@ export function resolveImportPath(
 
   // Handle relative imports
   if (importPath.startsWith('.')) {
-    return resolveRelativeImport(importPath, fromDir, language, context);
+    const r = resolveRelativeImport(importPath, fromDir, language, context);
+    return r ? canonicalFilePath(projectRoot, r) : null;
   }
 
   // Handle absolute/aliased imports (like @/ or src/)
   const aliased = resolveAliasedImport(importPath, projectRoot, language, context);
-  if (aliased) return aliased;
+  if (aliased) return canonicalFilePath(projectRoot, aliased);
 
   // C/C++ include directory search: when neither relative nor aliased
   // resolution found a match, search -I directories from
   // compile_commands.json or heuristic probing.
   if (language === 'c' || language === 'cpp') {
-    return resolveCppIncludePath(importPath, language, context);
+    const r = resolveCppIncludePath(importPath, language, context);
+    return r ? canonicalFilePath(projectRoot, r) : null;
   }
 
   return null;
@@ -562,10 +565,10 @@ function resolvePhpIncludePath(
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
   const basePath = path.resolve(fromDir, includePath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
-  if (context.fileExists(relativePath)) return relativePath;
+  if (context.fileExists(relativePath)) return canonicalFilePath(projectRoot, relativePath);
   // The literal may omit the .php extension (e.g. include "config").
   for (const ext of EXTENSION_RESOLUTION.php ?? []) {
-    if (context.fileExists(relativePath + ext)) return relativePath + ext;
+    if (context.fileExists(relativePath + ext)) return canonicalFilePath(projectRoot, relativePath + ext);
   }
   return null;
 }
@@ -1140,10 +1143,13 @@ export function resolveViaImport(
     const slash = ref.filePath.lastIndexOf('/');
     const fromDir = slash >= 0 ? ref.filePath.slice(0, slash) : '';
     const siblingPath = path.posix.normalize(fromDir ? `${fromDir}/${ref.referenceName}` : ref.referenceName);
+    // Canonicalize so a quoted include reaching a sibling through a symlink
+    // matches the file's canonical (realpath-relative) filePath.
+    const canonSibling = canonicalFilePath(context.getProjectRoot(), siblingPath);
     const siblingBase = siblingPath.split('/').pop()!;
     const sibling = context
       .getNodesByName(siblingBase)
-      .find((n) => n.kind === 'file' && n.filePath === siblingPath);
+      .find((n) => n.kind === 'file' && n.filePath === canonSibling);
     if (sibling) {
       return { original: ref, targetNodeId: sibling.id, confidence: 0.92, resolvedBy: 'import' };
     }
@@ -1634,27 +1640,30 @@ function resolveRustModuleFile(
 
   const first = segments[0]!;
   if (first === 'crate') {
-    return resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
+    const r = resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
+    return r ? canonicalFilePath(projectRoot, r) : null;
   }
   if (first === 'self') {
-    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+    const r = resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+    return r ? canonicalFilePath(projectRoot, r) : null;
   }
   if (first === 'super') {
     let supers = 0;
     while (segments[supers] === 'super') supers++;
     let dir: string | null = rustSelfModuleDir(fromAbs);
     for (let s = 0; s < supers && dir; s++) dir = path.dirname(dir);
-    return resolveUnder(dir, segments.slice(supers));
+    const r = resolveUnder(dir, segments.slice(supers));
+    return r ? canonicalFilePath(projectRoot, r) : null;
   }
   // Bare path. In expression position (`submodule::item()` — the router-assembly
   // and general cross-module-call pattern) the prefix is a SUBMODULE of the
   // current module, i.e. 2018 `self::`-relative — so try self-relative FIRST.
   // Fall back to crate-relative for 2015-edition / crate-root items. External
   // crate paths (`serde::de::Error`) miss both and fall through to name-matching.
-  return (
+  const r =
     resolveUnder(rustSelfModuleDir(fromAbs), segments) ??
-    resolveUnder(rustCrateRootDir(fromAbs, context), segments)
-  );
+    resolveUnder(rustCrateRootDir(fromAbs, context), segments);
+  return r ? canonicalFilePath(projectRoot, r) : null;
 }
 
 /**

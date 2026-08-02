@@ -26,6 +26,7 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { canonicalFilePath, clearCanonicalCache } from '../utils';
 import {
   ResolverPool,
   minRefsForResolverPool,
@@ -340,6 +341,9 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
+    // Drop the canonical-path (realpath) cache so a repointed symlink is
+    // reflected on the next resolve pass rather than serving a stale canonical.
+    clearCanonicalCache();
   }
 
   /**
@@ -348,10 +352,15 @@ export class ReferenceResolver {
   private createContext(): ResolutionContext {
     return {
       getNodesInFile: (filePath: string) => {
-        if (!this.nodeCache.has(filePath)) {
-          this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
+        // Canonicalize so a path reaching the file via a symlink resolves to
+        // the same canonical (realpath-relative) key the file was indexed under.
+        // Main defense: framework resolvers and every file-level lookup funnel
+        // through here, so they get canonical consistency for free.
+        const c = canonicalFilePath(this.projectRoot, filePath);
+        if (!this.nodeCache.has(c)) {
+          this.nodeCache.set(c, this.queries.getNodesByFile(c));
         }
-        return this.nodeCache.get(filePath)!;
+        return this.nodeCache.get(c)!;
       },
 
       getNodesByName: (name: string) => {
@@ -451,15 +460,18 @@ export class ReferenceResolver {
       },
 
       fileExists: (filePath: string) => {
+        // Canonicalize so a symlink path hits the canonical (realpath-relative)
+        // entry in knownFiles; otherwise the disk fallback could say "true"
+        // while no stored node matches that logical path (silent resolution miss).
+        const c = canonicalFilePath(this.projectRoot, filePath);
         // Check pre-built known files set first (O(1))
         if (this.knownFiles) {
-          const normalized = filePath.replace(/\\/g, '/');
-          if (this.knownFiles.has(filePath) || this.knownFiles.has(normalized)) {
+          if (this.knownFiles.has(c)) {
             return true;
           }
         }
         // Fall back to filesystem for files not yet indexed
-        const fullPath = path.join(this.projectRoot, filePath);
+        const fullPath = path.join(this.projectRoot, c);
         try {
           return fs.existsSync(fullPath);
         } catch (error) {
@@ -469,18 +481,19 @@ export class ReferenceResolver {
       },
 
       readFile: (filePath: string) => {
-        if (this.fileCache.has(filePath)) {
-          return this.fileCache.get(filePath)!;
+        const c = canonicalFilePath(this.projectRoot, filePath);
+        if (this.fileCache.has(c)) {
+          return this.fileCache.get(c)!;
         }
 
-        const fullPath = path.join(this.projectRoot, filePath);
+        const fullPath = path.join(this.projectRoot, c);
         try {
           const content = fs.readFileSync(fullPath, 'utf-8');
-          this.fileCache.set(filePath, content);
+          this.fileCache.set(c, content);
           return content;
         } catch (error) {
           logDebug('Failed to read file for resolution', { filePath, error: String(error) });
-          this.fileCache.set(filePath, null);
+          this.fileCache.set(c, null);
           return null;
         }
       },
@@ -602,11 +615,12 @@ export class ReferenceResolver {
       },
 
       getReExports: (filePath: string, language) => {
-        const cached = this.reExportCache.get(filePath);
+        const c = canonicalFilePath(this.projectRoot, filePath);
+        const cached = this.reExportCache.get(c);
         if (cached) return cached;
-        const content = this.context.readFile(filePath);
+        const content = this.context.readFile(c);
         if (!content) {
-          this.reExportCache.set(filePath, []);
+          this.reExportCache.set(c, []);
           return [];
         }
         // Re-exports are a JS/TS-only construct, and what matters is the
@@ -616,9 +630,9 @@ export class ReferenceResolver {
         // `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
         // what kind of file imports through it.
-        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(filePath);
+        const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?)$/i.test(c);
         const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
-        this.reExportCache.set(filePath, reExports);
+        this.reExportCache.set(c, reExports);
         return reExports;
       },
 

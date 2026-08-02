@@ -27,7 +27,7 @@ import {
   existsSync,
   readFileSync,
 } from 'fs';
-import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES, canonicalFilePath } from '../utils';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
 import {
@@ -2678,7 +2678,11 @@ export class ToolHandler {
     opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
   ): Promise<ToolResult> {
     const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
-    const wantLower = normalize(fileArg).toLowerCase();
+    // Canonicalize so an agent passing a symlink path resolves to the file's
+    // canonical (realpath-relative) path as stored. A bare basename (not
+    // root-relative) degrades to the normalized basename via realpath ENOENT,
+    // so suffix/include matching still works unchanged.
+    const wantLower = canonicalFilePath(cg.getProjectRoot(), normalize(fileArg)).toLowerCase();
     const allFiles = cg.getFiles();
     if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
 
@@ -3040,11 +3044,14 @@ export class ToolHandler {
     // "/", "./" or "\". Normalize all of those before matching so the agent
     // gets results instead of falling back to Read/Glob (see #426).
     const normalizedFilter = pathFilter
-      ? pathFilter
-          .replace(/\\/g, '/')
-          .replace(/^(?:\.?\/+)+/, '')
-          .replace(/^\.$/, '')
-          .replace(/\/+$/, '')
+      ? canonicalFilePath(
+          cg.getProjectRoot(),
+          pathFilter
+            .replace(/\\/g, '/')
+            .replace(/^(?:\.?\/+)+/, '')
+            .replace(/^\.$/, '')
+            .replace(/\/+$/, ''),
+        )
       : '';
     let files = normalizedFilter
       ? allFiles.filter(f => f.path === normalizedFilter || f.path.startsWith(normalizedFilter + '/'))

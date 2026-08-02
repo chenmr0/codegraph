@@ -22,7 +22,7 @@ import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, EXTENSION_MAP } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
-import { validatePathWithinRoot, normalizePath } from '../utils';
+import { validatePathWithinRoot, normalizePath, canonicalFilePath, clearCanonicalCache } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
@@ -411,8 +411,16 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
+    // Filter on the LOGICAL path first (a user's .codegraphignore rule targets
+    // the symlink name they see), THEN canonicalize+dedup so the same physical
+    // file reached via its real path or a symlink collapses to one entry.
     const ig = buildDefaultIgnore(rootDir);
-    return new Set([...files].filter((f) => !ig.ignores(f)));
+    const canonical = new Set<string>();
+    for (const f of files) {
+      if (ig.ignores(f)) continue;
+      canonical.add(canonicalFilePath(rootDir, f));
+    }
+    return canonical;
   } catch {
     return null;
   }
@@ -539,6 +547,18 @@ function scanDirectoryWalk(
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
+  // File-level canonical dedup (visitedDirs dedups directories by realpath; this
+  // dedups files so a file reachable via its real path and a symlink, or via
+  // several symlinks, is emitted once under its canonical realpath-relative path).
+  const seenCanonical = new Set<string>();
+  const pushCanonical = (logicalRel: string) => {
+    const c = canonicalFilePath(rootDir, logicalRel);
+    if (seenCanonical.has(c)) return;
+    seenCanonical.add(c);
+    files.push(c);
+    count++;
+    onProgress?.(count, c);
+  };
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -616,9 +636,7 @@ function scanDirectoryWalk(
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
-              files.push(relativePath);
-              count++;
-              onProgress?.(count, relativePath);
+              pushCanonical(relativePath);
             }
           }
         } catch {
@@ -633,9 +651,7 @@ function scanDirectoryWalk(
         }
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
-          files.push(relativePath);
-          count++;
-          onProgress?.(count, relativePath);
+          pushCanonical(relativePath);
         }
       }
     }
@@ -858,6 +874,9 @@ export class ExtractionOrchestrator {
     } | null
   ): Promise<IndexResult> {
     await initGrammars();
+    // A fresh full index must not reuse a stale canonical-path cache from a
+    // prior run (a repointed symlink would otherwise serve the old canonical).
+    clearCanonicalCache();
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
@@ -1626,6 +1645,10 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string, options?: { force?: boolean }): Promise<ExtractionResult> {
+    // Canonicalize at the public entry: CLI/watcher/sync callers may pass a
+    // logical symlink path. The file is stored under its canonical
+    // (realpath-relative) path so the same physical file is indexed once.
+    relativePath = canonicalFilePath(this.rootDir, relativePath);
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
 
     if (!fullPath) {
@@ -1759,6 +1782,10 @@ export class ExtractionOrchestrator {
     result: ExtractionResult,
     options?: { force?: boolean }
   ): void {
+    // Defensive: callers (scan, indexFile, batch reader) already pass canonical
+    // paths, but canonicalize once more so getFileByPath/deleteFile/upsertFile key
+    // on the canonical path even if a future caller passes a logical symlink path.
+    filePath = canonicalFilePath(this.rootDir, filePath);
     const contentHash = hashContent(content);
 
     // Check if file already exists and hasn't changed
@@ -1911,6 +1938,8 @@ export class ExtractionOrchestrator {
    */
   async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
+    // Sync rescans; clear the canonical-path cache so repointed symlinks are seen.
+    clearCanonicalCache();
     const startTime = Date.now();
     let filesChecked = 0;
     let filesAdded = 0;
@@ -2054,42 +2083,47 @@ export class ExtractionOrchestrator {
       const modified: string[] = [];
       const removed: string[] = [];
 
-      // Apply built-in + .gitignore + .codegraphignore filters uniformly so
-      // sync and init agree on which files are in scope. (Git status only
-      // respects .gitignore, so the supplement layers must be applied here.)
+      // Apply built-in + .gitignore + .codegraphignore filters on the LOGICAL path
+      // (a user's rule targets the symlink name they see), then canonicalize so a
+      // symlink path and its real path collapse to one canonical change. Git status
+      // only respects .gitignore, so the supplement layers are applied here.
       const ig = buildDefaultIgnore(this.rootDir);
-      gitChanges.modified = gitChanges.modified.filter(f => !ig.ignores(f));
-      gitChanges.added = gitChanges.added.filter(f => !ig.ignores(f));
+      const canonOf = (f: string) => canonicalFilePath(this.rootDir, f);
+      const dedup = (arr: string[]) => [...new Set(arr)];
+      const modifiedCanons = dedup(gitChanges.modified.filter((f) => !ig.ignores(f)).map(canonOf));
+      const addedCanons = dedup(gitChanges.added.filter((f) => !ig.ignores(f)).map(canonOf));
+      const deletedCanons = dedup(gitChanges.deleted.map(canonOf));
 
-      // Deleted files — only report if tracked in DB
-      for (const filePath of gitChanges.deleted) {
-        const tracked = this.queries.getFileByPath(filePath);
-        if (tracked) {
-          removed.push(filePath);
-        }
+      // Deleted — only report if tracked in DB AND the canonical file is really
+      // gone from disk. A symlink deletion with the real file still present must
+      // NOT remove the canonical row (the file still exists at its real path).
+      for (const canon of deletedCanons) {
+        if (!this.queries.getFileByPath(canon)) continue;
+        if (fs.existsSync(path.join(this.rootDir, canon))) continue;
+        removed.push(canon);
       }
 
       // Modified + added files — read + hash, compare with DB. Untracked (`??`)
       // files stay untracked in git even after indexing, so they must be
       // hash-compared like modified files instead of always counting as added —
       // otherwise status reports them as pending forever. (See issue #206.)
-      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
-        const fullPath = path.join(this.rootDir, filePath);
+      for (const canon of [...modifiedCanons, ...addedCanons]) {
+        const fullPath = path.join(this.rootDir, canon);
         let content: string;
         try {
           content = fs.readFileSync(fullPath, 'utf-8');
         } catch (error) {
-          logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
+          logDebug('Skipping unreadable file while detecting changes', { filePath: canon, error: String(error) });
           continue;
         }
 
         const contentHash = hashContent(content);
-        const tracked = this.queries.getFileByPath(filePath);
+        const tracked = this.queries.getFileByPath(canon);
 
         if (!tracked) {
-          added.push(filePath);
+          added.push(canon);
         } else if (tracked.contentHash !== contentHash) {
-          modified.push(filePath);
+          modified.push(canon);
         }
       }
 

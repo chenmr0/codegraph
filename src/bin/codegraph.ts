@@ -28,6 +28,7 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized } from '../directory';
+import { canonicalFilePath } from '../utils';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1584,6 +1585,13 @@ program
         const stdinFiles = stdinData.split('\n').map(f => f.trim()).filter(Boolean);
         changedFiles.push(...stdinFiles);
       }
+
+      // Canonicalize so a changed file given via a symlink path seeds the
+      // dependency BFS from its canonical (realpath-relative) path — the form
+      // the dependency graph is keyed on.
+      changedFiles = changedFiles
+        .map((f) => canonicalFilePath(projectPath, f))
+        .filter((f) => f);
 
       if (changedFiles.length === 0) {
         if (!options.quiet) info('No files provided. Use file arguments or --stdin.');
