@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { readFileSync } from 'fs';
 import {
   CONTAINER_NODE_KINDS,
+  displaySymbol,
   lastQualifierPart,
   numberSourceLines,
   matchesSymbol,
@@ -277,7 +278,7 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
   // Multiple definitions share this name — return them ALL.
   const header = `**${matches.length} definitions named "${symbol}"**`;
   if (!opts.includeCode) {
-    const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
+    const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
     return result(
       { mode: 'symbol-multi', symbol, count: matches.length, listed: matches.map(nodeJson), rendered: [] },
       [header, '', 'Re-query with --code to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
@@ -306,7 +307,7 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
   ];
   if (listed.length) {
     const shownList = listed.slice(0, MULTI_LIST_CAP);
-    out.push('', '### Other definitions', ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`));
+    out.push('', '### Other definitions', ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`));
     if (listed.length > MULTI_LIST_CAP) out.push(`- … +${listed.length - MULTI_LIST_CAP} more`);
   }
 

@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
-import type { LanguageExtractor } from '../tree-sitter-types';
+import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 /**
  * Find the function NAME's `qualified_identifier` (`Foo::bar`) inside a
@@ -812,6 +812,57 @@ export const cExtractor: LanguageExtractor = {
   },
 };
 
+/**
+ * Visit a C++ `namespace_definition`: create a `namespace` node for named
+ * namespaces and push it onto the scope stack so every declaration inside the
+ * block carries the namespace prefix in its `qualifiedName` — e.g.
+ *   namespace pre_process_buff { struct UbuffOffset {} }
+ * yields the struct `UbuffOffset` with qn `pre_process_buff::UbuffOffset`, so
+ * `codegraph node pre_process_buff::UbuffOffset` resolves and same-named types
+ * in different namespaces are distinguishable.
+ *
+ * Anonymous namespaces (`namespace { ... }`) create no node and do not push the
+ * scope — their declarations stay at file scope (file-internal linkage,
+ * simple-name queryable), matching prior behaviour. Nested blocks
+ * (`namespace A { namespace B { ... } }`) recurse naturally; the `A::B`
+ * specifier form keeps the full `"A::B"` text as the node name so
+ * `buildQualifiedName` joins it as a single segment (`A::B::X`). `inline
+ * namespace` is handled the same way (the `inline` keyword is irrelevant to
+ * extraction). `namespace_alias_definition` (`namespace B = A;`) is a distinct
+ * node type and is NOT matched here.
+ *
+ * Returns true when the node was a `namespace_definition` (handled — skip the
+ * generic dispatcher); false otherwise (let the default visit dispatch).
+ */
+function cppVisitNamespace(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  if (node.type !== 'namespace_definition') return false;
+
+  const nameNode = getChildByField(node, 'name');
+  const body = getChildByField(node, 'body');
+  const nsName = nameNode ? getNodeText(nameNode, ctx.source).trim() : '';
+
+  // Anonymous namespace (no name) — no node, no scope push; just walk the body
+  // so its declarations are still extracted at file scope (simple-name queryable).
+  if (!nsName) {
+    visitNsChildren(ctx, body ?? node);
+    return true;
+  }
+
+  const ns = ctx.createNode('namespace', nsName, node);
+  if (ns) ctx.pushScope(ns.id);
+  visitNsChildren(ctx, body ?? node);
+  if (ns) ctx.popScope();
+  return true;
+}
+
+/** Visit the named children of a namespace body (fall back to the node itself). */
+function visitNsChildren(ctx: ExtractorContext, parent: SyntaxNode): void {
+  for (let i = 0; i < parent.namedChildCount; i++) {
+    const child = parent.namedChild(i);
+    if (child) ctx.visitNode(child);
+  }
+}
+
 export const cppExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: ['class_specifier'],
@@ -830,6 +881,11 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   preParse: preprocessStatementMacros,
+  // Create a `namespace` node for each `namespace_definition` and scope its
+  // declarations so their qualifiedName carries the namespace prefix (see
+  // cppVisitNamespace above). Enables `codegraph node ns::symbol` lookups and
+  // distinguishes same-named types across namespaces.
+  visitNode: cppVisitNamespace,
   isConst: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);

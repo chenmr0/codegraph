@@ -37,6 +37,18 @@ export function lastQualifierPart(symbol: string): string {
 }
 
 /**
+ * Display name for a node in a disambiguation list: the qualifiedName when it
+ * carries a scope prefix the simple name doesn't (e.g. `ns::UbuffOffset` for a
+ * struct inside a C++ namespace, so two same-named structs in different
+ * namespaces are visually distinguishable — and the caller can copy the
+ * qualified name back for a precise re-query), otherwise the simple name.
+ * Shared by `codegraph_node` and the CLI `codegraph node` command.
+ */
+export function displaySymbol(n: Node): string {
+  return n.qualifiedName && n.qualifiedName !== n.name ? n.qualifiedName : n.name;
+}
+
+/**
  * Number a chunk of source lines `cat -n` style (`<n>\t<line>`), starting at
  * `firstLineNumber`. Matches the shape the Read tool and `codegraph_explore`
  * produce, so output is Edit-safe.

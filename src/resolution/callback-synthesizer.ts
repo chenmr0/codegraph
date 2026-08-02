@@ -482,6 +482,18 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
  * definition links to every same-qualifiedName declaration. Over-pairs but
  * never mis-pairs — every edge points at a real declaration of that name.
  */
+/**
+ * Last two `::`-separated segments of a C++ method qualifiedName
+ * (`Class::method`). Used by `cppDeclDefEdges` to pair a class's in-class
+ * method declaration with its out-of-line definition across files regardless
+ * of namespace nesting — see the grouping comment below.
+ */
+function cppLastTwoSegments(qn: string): string {
+  const parts = qn.split('::').filter(Boolean);
+  if (parts.length < 2) return '';
+  return parts.slice(-2).join('::');
+}
+
 function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -495,17 +507,31 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
     if (cls.language === 'cpp') classNames.add(cls.name);
   }
 
-  // Group cpp method nodes by qualifiedName (must contain '::').
+  // Group cpp method nodes by the last two qualifiedName segments
+  // (`Class::method`). An in-class declaration builds qn `ns::Class::method`
+  // (buildQualifiedName joins the whole scope stack — including a namespace
+  // node now that C++ extracts `namespace_definition`), but an out-of-line
+  // definition `Class::method` — or a fully-qualified `ns::Class::method` —
+  // sets qn via the method receiver-type override, which carries at most the
+  // namespace path the definition site spelled. The two forms therefore
+  // legitimately differ; grouping by the last two segments brings them
+  // together regardless of namespace nesting, matching how getMethodMatches
+  // (src/index.ts) keys its ownerIndex. The receiver check below then matches
+  // the class segment (everything before the last `::`) against the
+  // simple-name class set.
   const methodsByQn = new Map<string, Node[]>();
   for (const m of queries.iterateNodesByKind('method')) {
     if (m.language !== 'cpp' || !m.qualifiedName || !m.qualifiedName.includes('::')) continue;
-    const arr = methodsByQn.get(m.qualifiedName);
+    const key = cppLastTwoSegments(m.qualifiedName);
+    if (!key) continue;
+    const arr = methodsByQn.get(key);
     if (arr) arr.push(m);
-    else methodsByQn.set(m.qualifiedName, [m]);
+    else methodsByQn.set(key, [m]);
   }
 
   for (const [qn, nodes] of methodsByQn) {
-    // Verify receiver class is indexed (strict mode).
+    // Verify receiver class is indexed (strict mode). qn is `Class::method`;
+    // the receiver is the class segment (everything before the last `::`).
     const sep = qn.lastIndexOf('::');
     const receiver = qn.slice(0, sep);
     if (!classNames.has(receiver)) continue;

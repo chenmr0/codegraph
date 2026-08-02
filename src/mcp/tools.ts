@@ -32,6 +32,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { resolve as resolvePath } from 'path';
 import {
   CONTAINER_NODE_KINDS,
+  displaySymbol,
   lastQualifierPart,
   numberSourceLines,
   matchesSymbol,
@@ -2608,7 +2609,7 @@ export class ToolHandler {
     // file:line so a large overload set can't overflow the per-tool cap.
     const header = `**${matches.length} definitions named "${symbol}"**`;
     if (!includeCode) {
-      const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
+      const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
       return this.textResult(this.truncateOutput(
         [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
       ));
@@ -2647,7 +2648,7 @@ export class ToolHandler {
       out.push(
         '',
         '### Other definitions',
-        ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
+        ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
       );
       if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
       out.push(
