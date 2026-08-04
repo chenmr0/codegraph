@@ -19,11 +19,20 @@ export function generateNodeId(
   filePath: string,
   kind: NodeKind,
   name: string,
-  line: number
+  line: number,
+  salt?: string
 ): string {
+  // `salt` is an optional identity discriminator (e.g. the enclosing enum node
+  // id for X-macro-synthesized enum members). When present it is folded into
+  // the hash so two distinct owners reusing the same call line/name produce
+  // distinct node ids, WITHOUT changing the node's display `name`.
   const hash = crypto
     .createHash('sha256')
-    .update(`${filePath}:${kind}:${name}:${line}`)
+    .update(
+      salt
+        ? `${filePath}:${kind}:${name}:${line}:${salt}`
+        : `${filePath}:${kind}:${name}:${line}`
+    )
     .digest('hex')
     .substring(0, 32);
   return `${kind}:${hash}`;

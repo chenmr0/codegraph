@@ -26,6 +26,11 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import {
+  detectXMacroConstructs,
+  xmacroSupported,
+  type XMacroConstruct,
+} from './xmacro';
+import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
 } from '../resolution/frameworks';
@@ -315,9 +320,14 @@ export class TreeSitterExtractor {
   // turning `typedef SAFE VOS_BOOL (*FnPtr)(...)` into the clean shape
   // tree-sitter parses correctly. See c-cpp.ts preprocessStatementMacros.
   private globalBodylessMacroNames: Set<string> | null = null;
+  /** Original source bytes, retained for X-macro analysis before pre-parse transforms. */
+  private originalSource: string;
+  /** Proven self-including X-macro enum constructs found before parsing. */
+  private xMacroConstructs: XMacroConstruct[] = [];
 
   constructor(filePath: string, source: string, language?: Language, globalMacroNames?: Set<string>, bodylessMacroNames?: Set<string>) {
     this.filePath = filePath;
+    this.originalSource = source;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
@@ -404,6 +414,18 @@ export class TreeSitterExtractor {
       // Reset per-file state
       this.currentLocalNames.clear();
       this.fileMacroNames.clear();
+      this.source = this.originalSource;
+      this.xMacroConstructs = [];
+
+      // A self-including X-macro enum is recoverable without a filesystem or a
+      // full preprocessor because both the macro data list and the enum live in
+      // this source string. Analyze the original bytes first; only complete,
+      // provable constructs have their three directive lines blanked.
+      if (xmacroSupported(this.language)) {
+        const xmacro = detectXMacroConstructs(this.originalSource, this.filePath);
+        this.source = xmacro.blankedSource;
+        this.xMacroConstructs = xmacro.constructs;
+      }
 
       // Optional pre-parse source transform (offset-preserving) to work around
       // grammar gaps — e.g. C# blanks conditional-compilation directive lines
@@ -1020,6 +1042,40 @@ export class TreeSitterExtractor {
       }
     }
 
+    return newNode;
+  }
+
+  /** Create a source-anchored node that has no tree-sitter SyntaxNode. */
+  private createSyntheticNode(
+    kind: NodeKind,
+    name: string,
+    startLine: number,
+    startColumn: number,
+    endColumn: number,
+    extra?: Partial<Node>,
+    salt?: string,
+  ): Node | null {
+    if (!name) return null;
+    const id = generateNodeId(this.filePath, kind, name, startLine, salt);
+    const newNode: Node = {
+      id,
+      kind,
+      name,
+      qualifiedName: this.buildQualifiedName(name),
+      filePath: this.filePath,
+      language: this.language,
+      startLine,
+      endLine: startLine,
+      startColumn,
+      endColumn,
+      updatedAt: Date.now(),
+      ...extra,
+    };
+    this.nodes.push(newNode);
+    const parentId = this.nodeStack[this.nodeStack.length - 1];
+    if (parentId) {
+      this.edges.push({ source: parentId, target: id, kind: 'contains' });
+    }
     return newNode;
   }
 
@@ -1785,6 +1841,43 @@ export class TreeSitterExtractor {
         this.extractEnumMembers(child);
       } else {
         this.visitNode(child);
+      }
+    }
+
+    if (enumNode && this.xMacroConstructs.length > 0) {
+      const constructs = this.xMacroConstructs.filter((construct) =>
+        construct.enumBodyStart === body.startIndex && construct.enumBodyEnd === body.endIndex);
+      if (constructs.length > 0) {
+        const existingMemberNames = new Set<string>();
+        const childIds = new Set(
+          this.edges
+            .filter((edge) => edge.kind === 'contains' && edge.source === enumNode.id)
+            .map((edge) => edge.target),
+        );
+        for (const extractedNode of this.nodes) {
+          if (extractedNode.kind === 'enum_member' && childIds.has(extractedNode.id)) {
+            existingMemberNames.add(extractedNode.name);
+          }
+        }
+
+        for (const construct of constructs) {
+          for (const call of construct.calls) {
+            if (existingMemberNames.has(call.name)) continue;
+            this.createSyntheticNode(
+              'enum_member',
+              call.name,
+              call.line,
+              call.column,
+              call.column + construct.macroName.length,
+              {
+                signature: call.invocation,
+                docstring: `Recovered from self-including X-macro ${construct.macroName}`,
+              },
+              enumNode.id,
+            );
+            existingMemberNames.add(call.name);
+          }
+        }
       }
     }
     if (enumNode) this.nodeStack.pop();
