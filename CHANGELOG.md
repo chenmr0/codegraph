@@ -23,6 +23,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - C/C++ enums generated with the self-including X-macro idiom now retain both hand-written and generated members with their real ownership and source locations, while ambiguous macro replacements and external `.inc`/`.def` lists remain untouched; re-index existing projects with `codegraph index -f` to pick up the added members. (C, C++)
 - Explicit construction references no longer resolve to same-named methods, fields, variables, functions, imports, or other non-constructible symbols, while C/C++ aliases, C-to-C++ and Objective-C++ interoperability, anonymous interface implementations, and dynamic-language `Foo()` construction continue to resolve normally; re-index with `codegraph index -f` to rebuild affected edges.
+- C++ class, struct, function, method, and alias templates now expose ordered parameter names in `typeParameters`, including non-type parameters, packs, defaults, template-template parameters, constraints, and out-of-line member templates without leaking class parameters onto ordinary members; re-index with `codegraph index -f` to populate existing projects. (C++)
 
 ### New Features
 

@@ -95,6 +95,262 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
   return normalizeCppReturnType(getNodeText(typeNode, source));
 }
 
+// ---------------------------------------------------------------------------
+// C++ template type-parameter extraction (getTypeParameters hook)
+//
+// tree-sitter-cpp wraps a templated declaration in a `template_declaration`
+// node:
+//   template_declaration
+//     parameters: template_parameter_list
+//       type_parameter / non_type_parameter / ...
+//     declaration: <class_specifier | function_definition | alias_declaration | …>
+//
+// The hook returns the bare parameter names of the `template_declaration`(s)
+// that DIRECTLY wrap a declaration, so each symbol stores only its OWN
+// template parameters — a class template's `T` never leaks onto its ordinary
+// member methods. The mechanism is a body-boundary rule (see
+// CPP_TEMPLATE_SCOPE_BOUNDARY): walking up from a declaration to its
+// template_declaration must not cross a class/struct/enum body
+// (`field_declaration_list`) or a function body (`compound_statement`).
+// An ordinary member reaches the class's template_declaration only by crossing
+// the class body, so it's excluded; a member TEMPLATE reaches its own
+// template_declaration without crossing a body, so it keeps its own params.
+// Consecutively nested `template_declaration`s (out-of-line member-template
+// definition: `template<T> template<U> void C<T>::m(U) {}`) are all collected.
+// ---------------------------------------------------------------------------
+
+/**
+ * Body node types of a class/struct/enum (its member list) and a function
+ * (its compound statement). Crossing one while walking up from a declaration
+ * means we've left the declaration's own scope and entered an enclosing
+ * class/function — so any `template_declaration` above it belongs to that
+ * enclosing entity, NOT to this declaration. This is the guard that stops a
+ * class template's `T` from leaking onto its ordinary member methods.
+ */
+const CPP_TEMPLATE_SCOPE_BOUNDARY = new Set([
+  'field_declaration_list', // class/struct/enum body
+  'compound_statement',     // function body
+]);
+
+/**
+ * Node types that carry a template parameter's name. Keyword tokens and
+ * `primitive_type` are deliberately excluded so a default value
+ * (`typename U = int`) or a non-type parameter's type (`int N`) isn't mistaken
+ * for the parameter name.
+ */
+const CPP_TEMPLATE_NAME_TYPES = new Set([
+  'type_identifier',
+  'identifier',
+  'field_identifier',
+]);
+
+/**
+ * Field names whose subtrees hold a default value, the parameter's type, the
+ * nested template-parameter list of a template-template parameter, or a
+ * requires-constraint — none of which is the parameter's own name. Skipped by
+ * the controlled-recursion fallback so it can't surface a default type
+ * (`typename T = Default`) or an inner template-template param as the name.
+ */
+const CPP_TEMPLATE_SKIP_FIELDS = new Set([
+  'type',
+  'default_type',
+  'default',
+  'value',
+  'parameters',
+  'constraint',
+  'constraint_clause',
+  'requirement',
+]);
+
+/**
+ * Node types whose subtree is a nested parameter/template-parameter list or
+ * call argument list — never the outer parameter's own name. Skipped by type
+ * during the controlled-recursion fallback (independent of field names, so it
+ * also covers anonymous/unnamed-field positions).
+ */
+const CPP_TEMPLATE_SKIP_TYPES = new Set([
+  'template_parameter_list',
+  'parameter_list',
+  'argument_list',
+]);
+
+/**
+ * Controlled recursion: find the first name-carrying identifier within `node`.
+ *
+ * - Unwraps declarator wrappers (`pointer_declarator` / `array_declarator` /
+ *   `reference_declarator` / `parenthesized_declarator` / `init_declarator` /
+ *   `function_declarator` / `qualified_identifier`) through their `declarator`
+ *   field — this resolves a non-type parameter's name (`int N`, `int* P`,
+ *   `auto&& R`) without entering its parameter/default sub-trees.
+ * - When `allowDescend` is true, scans the node's named children, skipping any
+ *   whose field name is in {@link CPP_TEMPLATE_SKIP_FIELDS} (default/type/
+ *   nested-params/constraint) or whose type is in {@link CPP_TEMPLATE_SKIP_TYPES}
+ *   (nested template_parameter_list / parameter_list / argument_list), so a
+ *   template-template parameter's inner `<typename>` names and a default
+ *   value's type can't leak out as the outer parameter's name.
+ */
+function cppFindNameIdentifier(
+  node: SyntaxNode,
+  source: string,
+  allowDescend: boolean,
+): string | undefined {
+  if (CPP_TEMPLATE_NAME_TYPES.has(node.type)) {
+    return getNodeText(node, source);
+  }
+  if (
+    node.type === 'pointer_declarator' ||
+    node.type === 'array_declarator' ||
+    node.type === 'reference_declarator' ||
+    node.type === 'parenthesized_declarator' ||
+    node.type === 'init_declarator' ||
+    node.type === 'function_declarator' ||
+    node.type === 'qualified_identifier'
+  ) {
+    const inner = node.childForFieldName('declarator') || node.namedChild(0);
+    if (inner) return cppFindNameIdentifier(inner, source, allowDescend);
+    return undefined;
+  }
+  if (!allowDescend) return undefined;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (CPP_TEMPLATE_SKIP_TYPES.has(child.type)) continue;
+    const fname = node.fieldNameForNamedChild(i);
+    if (fname && CPP_TEMPLATE_SKIP_FIELDS.has(fname)) continue;
+    const found = cppFindNameIdentifier(child, source, true);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Extract the bare name of a single template parameter node
+ * (`type_parameter` / `non_type_parameter` / their variadic forms), or
+ * undefined when the parameter is anonymous. Never guesses a name for an
+ * anonymous parameter.
+ *
+ * - `type_parameter` (`typename T`, `class C`, `typename... Args`,
+ *   `typename U = int`, template-template `template <…> class C`): the name is
+ *   the `name` field (a type_identifier).
+ * - `non_type_parameter` (`int N`, `int N = 5`, `auto... Vs`): the name lives in
+ *   the `declarator` field; declarator wrappers are unwrapped to the identifier.
+ * - Fallback: a bounded scan that skips default/type/constraint/nested-list
+ *   subtrees (see {@link cppFindNameIdentifier}).
+ */
+function cppTemplateNameOf(param: SyntaxNode, source: string): string | undefined {
+  // 1. `name` field — covers type_parameter variants (packs, defaults,
+  //    template-template). The `...` of a pack is an anonymous token sibling,
+  //    not the name, so the field still yields the bare identifier.
+  const nameNode = param.childForFieldName('name');
+  if (nameNode && nameNode.isNamed && CPP_TEMPLATE_NAME_TYPES.has(nameNode.type)) {
+    return getNodeText(nameNode, source);
+  }
+  // 2. `declarator` field — covers non_type_parameter (`int N`).
+  const declNode = param.childForFieldName('declarator');
+  if (declNode) {
+    const id = cppFindNameIdentifier(declNode, source, false);
+    if (id) return id;
+  }
+  // 3. Bounded fallback scan over the parameter's own subtree.
+  return cppFindNameIdentifier(param, source, true);
+}
+
+/**
+ * Collect the parameter names of one `template_parameter_list` in source order,
+ * skipping anonymous parameters. A nested `template_parameter_list` (the inner
+ * list of a template-template `type_parameter`) may surface as a direct child
+ * and is skipped here — its names belong to the inner template-template param,
+ * not this list.
+ */
+function cppTemplateParamListNames(listNode: SyntaxNode, source: string): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < listNode.namedChildCount; i++) {
+    const child = listNode.namedChild(i);
+    if (!child) continue;
+    if (CPP_TEMPLATE_SKIP_TYPES.has(child.type)) continue;
+    const name = cppTemplateNameOf(child, source);
+    if (name) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Resolve a `template_declaration`'s `template_parameter_list`, tolerating
+ * field-name differences across grammar versions: prefer the `parameters`
+ * field, else fall back to the first named child of type
+ * `template_parameter_list`.
+ */
+function cppTemplateListOf(td: SyntaxNode): SyntaxNode | null {
+  const paramsField = td.childForFieldName('parameters');
+  if (paramsField && paramsField.type === 'template_parameter_list') {
+    return paramsField;
+  }
+  for (let i = 0; i < td.namedChildCount; i++) {
+    const child = td.namedChild(i);
+    if (child && child.type === 'template_parameter_list') return child;
+  }
+  return null;
+}
+
+/**
+ * Find the nearest ancestor `template_declaration` of `node` that is reached
+ * WITHOUT crossing a class/function body boundary. Returns null if none. This
+ * encodes "the template_declaration that wraps THIS declaration": crossing a
+ * body means the node is a member of (or a statement inside) an enclosing
+ * templated entity, so the template_declaration above the body belongs to that
+ * entity, not to this declaration.
+ */
+function cppFindOwningTemplateDeclaration(node: SyntaxNode): SyntaxNode | null {
+  let current: SyntaxNode | null = node.parent;
+  let depth = 0;
+  while (current && depth++ < 64) {
+    if (CPP_TEMPLATE_SCOPE_BOUNDARY.has(current.type)) {
+      return null; // crossed into an enclosing class/function body
+    }
+    if (current.type === 'template_declaration') {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+/**
+ * C++ `getTypeParameters` hook. Walks up from a declaration node to the
+ * `template_declaration`(s) that directly wrap it — without crossing a class/
+ * function body boundary — and returns their parameter names in source order,
+ * deduped. Returns undefined when the declaration isn't a template (so
+ * non-templated nodes, and C in particular, are unaffected).
+ *
+ * The chain is collected innermost-first then reversed, so an outer
+ * (source-earlier) `template_declaration`'s params precede an inner one's —
+ * matching `template <typename T> template <typename U>` source order.
+ */
+export function cppGetTypeParameters(node: SyntaxNode, source: string): string[] | undefined {
+  const chain: string[][] = [];
+  let current: SyntaxNode | null = node;
+  let depth = 0;
+  while (current && depth++ < 32) {
+    const td = cppFindOwningTemplateDeclaration(current);
+    if (!td) break;
+    const list = cppTemplateListOf(td);
+    chain.push(list ? cppTemplateParamListNames(list, source) : []);
+    current = td; // continue upward for a consecutively nested template_declaration
+  }
+  if (chain.length === 0) return undefined;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = chain.length - 1; i >= 0; i--) {
+    for (const n of chain[i]!) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 /**
  * Build a compact function signature for a C/C++ `function_definition` so
  * `codegraph_search` can return parameters (every other language already
@@ -912,6 +1168,7 @@ export const cppExtractor: LanguageExtractor = {
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
   getSignature: extractCppSignature,
+  getTypeParameters: cppGetTypeParameters,
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;

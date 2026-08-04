@@ -217,6 +217,24 @@ export interface LanguageExtractor {
   getReturnType?: (node: SyntaxNode, source: string) => string | undefined;
 
   /**
+   * Extract the type-parameter names of a templated declaration, stored on the
+   * node as `typeParameters`. Returns the bare parameter names in source order,
+   * deduped (e.g. `["T", "N", "Args"]`), or undefined when the declaration is
+   * not a template.
+   *
+   * Only the `template_declaration`(s) that DIRECTLY wrap this declaration
+   * contribute — a class template's `T` must NOT leak onto its ordinary member
+   * methods' own parameter lists. Consecutively nested `template_declaration`s
+   * (e.g. an out-of-line member-template definition of a class template:
+   * `template<T> template<U> void C<T>::m(U) {}`) are collected in source order.
+   * Only names are stored; `class`/`typename` keywords, default values, and
+   * constraint expressions are dropped, and anonymous parameters are skipped
+   * (no guessing). AST-driven via field lookups + controlled recursion — never
+   * a whole-signature regex.
+   */
+  getTypeParameters?: (node: SyntaxNode, source: string) => string[] | undefined;
+
+  /**
    * Resolve the actual node kind for a type alias declaration.
    * Used by Go where `type_spec` is the named declaration wrapper for structs/interfaces:
    *   `type Foo struct { ... }` → type_spec (name: "Foo") → struct_type

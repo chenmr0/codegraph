@@ -283,6 +283,17 @@ const C_CPP_KEYWORD_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Node kinds that may carry generic type parameters. `createNode` invokes the
+ * language's optional `getTypeParameters` hook only for these declaration
+ * kinds, so fields/variables/enum-members/imports are never asked (and
+ * languages without the hook — i.e. everything but C++ — are untouched).
+ * Includes interface/trait for completeness even though C++ has neither.
+ */
+const TYPE_PARAMETER_KINDS: ReadonlySet<NodeKind> = new Set([
+  'function', 'method', 'class', 'struct', 'interface', 'trait', 'enum', 'type_alias',
+]);
+
+/**
  * TreeSitterExtractor - Main extraction class
  */
 export class TreeSitterExtractor {
@@ -1026,6 +1037,18 @@ export class TreeSitterExtractor {
     const mods = this.extractor?.extractModifiers?.(node);
     if (mods && mods.length > 0) {
       newNode.decorators = [...(newNode.decorators ?? []), ...mods];
+    }
+
+    // Generic type parameters (e.g. C++ `template <typename T>`). Only the
+    // declaration kinds in TYPE_PARAMETER_KINDS are asked, and only when the
+    // language provides a getTypeParameters hook — so languages without it
+    // (i.e. everything but C++) are completely unaffected. `extra` is honored
+    // if a caller already supplied typeParameters.
+    if (TYPE_PARAMETER_KINDS.has(kind) && newNode.typeParameters === undefined) {
+      const tparams = this.extractor?.getTypeParameters?.(node, this.source);
+      if (tparams && tparams.length > 0) {
+        newNode.typeParameters = tparams;
+      }
     }
 
     this.nodes.push(newNode);
