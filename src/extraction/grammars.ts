@@ -308,28 +308,114 @@ export function detectLanguage(filePath: string, source?: string): Language {
 
   // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
-    if (looksLikeCpp(source)) return 'cpp';
-    if (looksLikeObjc(source)) return 'objc';
+    // Mask once: a C header that matches neither heuristic should not pay for
+    // two complete lexical scans now that detection covers the whole file.
+    const code = maskCStyleCommentsAndLiterals(source);
+    if (looksLikeCpp(code)) return 'cpp';
+    if (looksLikeObjc(code)) return 'objc';
   }
 
   return lang;
 }
 
 /**
- * Heuristic: does a .h file contain C++ constructs?
- * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ * Mask comments and literals before applying content-based language heuristics.
+ *
+ * `.h` files can be very large generated/macro tables, so looking only at a
+ * prefix misses real C++ declarations later in the file. Scanning the complete
+ * source is still linear and cheap compared with parsing it, but only if words
+ * such as `namespace` in a license comment, diagnostic string, or raw string do
+ * not promote an otherwise-C header to C++. Newlines are retained for future
+ * line-oriented heuristics and diagnostics.
  */
-function looksLikeCpp(source: string): boolean {
-  const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=|\w+::)|\bconstexpr\b|\benum\s+(?:class|struct)\s+\w+|\b(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<|\bstd::/.test(sample);
+function maskCStyleCommentsAndLiterals(source: string): string {
+  let out = '';
+  let codeStart = 0;
+  let i = 0;
+
+  const appendMasked = (start: number, end: number): void => {
+    out += source.slice(codeStart, start);
+    out += source.slice(start, end).replace(/[^\r\n]/g, ' ');
+    codeStart = end;
+  };
+
+  while (i < source.length) {
+    const c = source[i]!;
+    const next = source[i + 1] ?? '';
+
+    if (c === '/' && next === '/') {
+      const newline = source.indexOf('\n', i + 2);
+      const end = newline === -1 ? source.length : newline;
+      appendMasked(i, end);
+      i = end;
+      continue;
+    }
+
+    if (c === '/' && next === '*') {
+      const close = source.indexOf('*/', i + 2);
+      const end = close === -1 ? source.length : close + 2;
+      appendMasked(i, end);
+      i = end;
+      continue;
+    }
+
+    // C++ raw string: R"delimiter(contents)delimiter". Prefixes such as u8R
+    // are harmless because the scanner reaches R after copying `u8` as code.
+    if (c === 'R' && next === '"') {
+      const openParen = source.indexOf('(', i + 2);
+      if (openParen !== -1 && openParen - (i + 2) <= 16) {
+        const delimiter = source.slice(i + 2, openParen);
+        if (!/[\s\\()]/.test(delimiter)) {
+          const terminator = `)${delimiter}"`;
+          const close = source.indexOf(terminator, openParen + 1);
+          if (close !== -1) {
+            const end = close + terminator.length;
+            appendMasked(i, end);
+            i = end;
+            continue;
+          }
+        }
+      }
+    }
+
+    if (c === '"' || c === "'") {
+      const quote = c;
+      let end = i + 1;
+      while (end < source.length) {
+        const q = source[end]!;
+        if (q === '\\') {
+          end = Math.min(source.length, end + 2);
+          continue;
+        }
+        end++;
+        if (q === quote) break;
+      }
+      appendMasked(i, end);
+      i = end;
+      continue;
+    }
+
+    i++;
+  }
+
+  out += source.slice(codeStart);
+  return out;
+}
+
+/**
+ * Heuristic: does a .h file contain C++ constructs?
+ * Scans the complete file after masking comments and literals. A large macro
+ * data table before the first namespace/class must not select the C grammar.
+ */
+function looksLikeCpp(code: string): boolean {
+  return /\bnamespace\b|\bclass\s+\w+(?:\s+final)?\s*[:{;]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=|\w+::)|\b(?:constexpr|consteval|constinit|noexcept|decltype|nullptr)\b|\benum\s+(?:class|struct)\s+\w+|\b(?:static_cast|reinterpret_cast|const_cast|dynamic_cast)\s*<|\bstd::/.test(code);
 }
 
 /**
  * Heuristic: does a .h file contain Objective-C constructs?
  */
-function looksLikeObjc(source: string): boolean {
-  const sample = source.substring(0, 8192);
-  return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+function looksLikeObjc(code: string): boolean {
+  return /@(?:interface|implementation|protocol|synthesize)\b/.test(code);
 }
 
 /**

@@ -147,6 +147,28 @@ describe('Language Detection', () => {
       expect(detectLanguage('foo.h', src)).toBe('cpp');
     });
 
+    it('detects C++ constructs after a large macro-data prefix', () => {
+      const prefix = '#define ROW(x) x\n'.repeat(600);
+      const src = `${prefix}namespace late { class Widget {}; }\n`;
+      expect(src.indexOf('namespace')).toBeGreaterThan(8192);
+      expect(detectLanguage('generated_table.h', src)).toBe('cpp');
+    });
+
+    it('detects a C++ forward class declaration', () => {
+      expect(detectLanguage('forward.h', 'class Widget;\nWidget *make_widget();\n')).toBe('cpp');
+    });
+
+    it('ignores C++ marker words in comments and literals across the whole file', () => {
+      const src = [
+        '/* namespace fake { class CommentOnly {}; } */',
+        'const char *message = "template <class StringOnly>";',
+        'const char *raw = R"tag(namespace raw { class RawOnly {}; })tag";',
+        '#define C_DATA_ROW(x) x',
+        'typedef struct c_record { int value; } c_record;',
+      ].join('\n');
+      expect(detectLanguage('c_data.h', src)).toBe('c');
+    });
+
     it('preserves C for typedef struct + prototypes', () => {
       const src = '#ifndef FOO_H\ntypedef struct foo_s {\n  int x;\n} foo_t;\nfoo_t *foo_new(void);\nvoid foo_free(foo_t *p);\n#endif\n';
       expect(detectLanguage('foo.h', src)).toBe('c');

@@ -1,27 +1,34 @@
-import type { EvalResult } from './types.js';
+import type { NodeKind } from '../../src/types.js';
+import type { EvalResult, ExpectedSearchSymbol } from './types.js';
 
 export const PASS_THRESHOLD = 0.5;
 
 export function scoreSearchNodes(
   caseId: string,
-  expectedSymbols: string[],
-  results: Array<{ node: { name: string }; score: number }>,
+  expectedSymbols: ExpectedSearchSymbol[],
+  results: Array<{
+    node: {
+      name: string;
+      kind: NodeKind;
+      filePath: string;
+      qualifiedName: string;
+    };
+    score: number;
+  }>,
   latencyMs: number
 ): EvalResult {
-  const expectedLower = expectedSymbols.map((s) => s.toLowerCase());
-  const resultNames = results.map((r) => r.node.name.toLowerCase());
-
   const found: string[] = [];
   const missed: string[] = [];
   let firstRank = 0;
 
-  for (let i = 0; i < expectedLower.length; i++) {
-    const idx = resultNames.indexOf(expectedLower[i]);
+  for (const expected of expectedSymbols) {
+    const idx = results.findIndex(({ node }) => matchesExpectedSymbol(node, expected));
+    const label = formatExpectedSymbol(expected);
     if (idx !== -1) {
-      found.push(expectedSymbols[i]);
+      found.push(label);
       if (firstRank === 0) firstRank = idx + 1;
     } else {
-      missed.push(expectedSymbols[i]);
+      missed.push(label);
     }
   }
 
@@ -30,13 +37,33 @@ export function scoreSearchNodes(
 
   return {
     caseId,
-    pass: recall >= PASS_THRESHOLD,
+    // Search identity is a quality gate, not a best-effort exploration score:
+    // every exact expected symbol must be present.
+    pass: expectedSymbols.length > 0 && missed.length === 0,
     recall,
     mrr,
     foundSymbols: found,
     missedSymbols: missed,
     latencyMs,
   };
+}
+
+function normalizeProjectPath(filePath: string): string {
+  return filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function matchesExpectedSymbol(
+  node: { name: string; kind: NodeKind; filePath: string; qualifiedName: string },
+  expected: ExpectedSearchSymbol,
+): boolean {
+  return node.name === expected.name &&
+    node.kind === expected.kind &&
+    normalizeProjectPath(node.filePath) === normalizeProjectPath(expected.filePath) &&
+    (expected.qualifiedName === undefined || node.qualifiedName === expected.qualifiedName);
+}
+
+function formatExpectedSymbol(expected: ExpectedSearchSymbol): string {
+  return `${expected.name} (${expected.kind}) @ ${normalizeProjectPath(expected.filePath)}`;
 }
 
 export function scoreFindRelevantContext(
