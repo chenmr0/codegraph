@@ -16,7 +16,15 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import {
+  matchReference,
+  matchDottedCallChain,
+  matchScopedCallChain,
+  sameLanguageFamily,
+  sameInstantiationLanguageFamily,
+  crossesKnownFamily,
+  isValidInstantiationTarget,
+} from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -1430,9 +1438,17 @@ export class ReferenceResolver {
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
-    const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    const target = this.queries.getNodeById(result.targetNodeId);
+    if (ref.referenceKind === 'instantiates' && target && !isValidInstantiationTarget(target, ref)) {
+      return null;
+    }
+    const tgt = target?.language ?? this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
     if (ref.referenceKind === 'references' && !sameLanguageFamily(tgt, ref.language)) return null;
+    if (
+      ref.referenceKind === 'instantiates' &&
+      !sameInstantiationLanguageFamily(tgt, ref.language, ref.filePath)
+    ) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }
@@ -1452,6 +1468,7 @@ export class ReferenceResolver {
    */
   private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+    if (ref.referenceKind === 'instantiates') return this.gateLanguage(result, ref);
     if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;

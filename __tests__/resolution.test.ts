@@ -1207,7 +1207,7 @@ func main() {
       getImportMappings: () => [],
     });
 
-    it('prefers a class candidate over a function for `instantiates` refs', () => {
+    it('hard-filters non-type candidates for `instantiates` refs', () => {
       // A class and a function share a name across the codebase.
       // Without the kind bias, the function (which gets the +25 `calls`
       // bonus historically applied to all candidates of that kind) would
@@ -1232,6 +1232,144 @@ func main() {
 
       const result = matchReference(ref, baseContext([fn, cls]));
       expect(result?.targetNodeId).toBe('class:logger.ts:Logger:10');
+
+      for (const kind of ['function', 'method', 'field', 'variable', 'import', 'enum_member'] as const) {
+        const invalid: Node = { ...fn, id: `${kind}:logger`, kind };
+        expect(matchReference(ref, baseContext([invalid]))).toBeNull();
+      }
+    });
+
+    it('allows constructible type aliases but rejects cross-family classes', () => {
+      const alias: Node = {
+        id: 'type_alias:widget.hpp:Widget:3', kind: 'type_alias', name: 'Widget',
+        qualifiedName: 'types::Widget', filePath: 'widget.hpp', language: 'cpp',
+        startLine: 3, endLine: 3, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const pythonClass: Node = {
+        ...alias, id: 'class:widget.py:Widget:3', kind: 'class',
+        filePath: 'widget.py', language: 'python',
+      };
+      const ref = {
+        fromNodeId: 'func:main.cpp:make:1', referenceName: 'Widget',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.cpp', language: 'cpp' as const,
+      };
+
+      expect(matchReference(ref, baseContext([alias]))?.targetNodeId).toBe(alias.id);
+      expect(matchReference(ref, baseContext([pythonClass]))).toBeNull();
+    });
+
+    it('keeps legitimate language-family, interop, and anonymous-construction targets', () => {
+      const cases = [
+        { kind: 'struct', targetLanguage: 'c', refLanguage: 'cpp', filePath: 'main.cpp' },
+        { kind: 'interface', targetLanguage: 'java', refLanguage: 'java', filePath: 'Main.java' },
+        { kind: 'trait', targetLanguage: 'scala', refLanguage: 'scala', filePath: 'Main.scala' },
+        { kind: 'enum_member', targetLanguage: 'rust', refLanguage: 'rust', filePath: 'main.rs' },
+        { kind: 'class', targetLanguage: 'cpp', refLanguage: 'objc', filePath: 'main.mm' },
+      ] as const;
+
+      for (const item of cases) {
+        const candidate: Node = {
+          id: `${item.kind}:constructible`, kind: item.kind, name: 'Constructible',
+          qualifiedName: 'types::Constructible', filePath: 'types.def',
+          language: item.targetLanguage, startLine: 3, endLine: 3,
+          startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+        };
+        const ref = {
+          fromNodeId: 'function:make', referenceName: 'Constructible',
+          referenceKind: 'instantiates' as const, line: 5, column: 0,
+          filePath: item.filePath, language: item.refLanguage,
+        };
+        expect(matchReference(ref, baseContext([candidate]))?.targetNodeId).toBe(candidate.id);
+      }
+    });
+
+    it('rejects same-family non-constructible kinds per language (Swift protocol, Rust trait, TS interface/type_alias)', () => {
+      // Same language family, so the family gate passes — only the language-aware
+      // kind allow-list rejects these. type_alias/interface/trait are not
+      // constructible in these source languages, and protocol is rejected everywhere.
+      const cases = [
+        { kind: 'protocol', targetLanguage: 'swift', refLanguage: 'swift', filePath: 'main.swift' },
+        { kind: 'trait', targetLanguage: 'rust', refLanguage: 'rust', filePath: 'main.rs' },
+        { kind: 'interface', targetLanguage: 'typescript', refLanguage: 'typescript', filePath: 'main.ts' },
+        { kind: 'type_alias', targetLanguage: 'typescript', refLanguage: 'typescript', filePath: 'main.ts' },
+      ] as const;
+
+      for (const item of cases) {
+        const candidate: Node = {
+          id: `${item.kind}:bad`, kind: item.kind, name: 'Bad',
+          qualifiedName: 'types::Bad', filePath: 'types.def',
+          language: item.targetLanguage, startLine: 3, endLine: 3,
+          startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+        };
+        const ref = {
+          fromNodeId: 'function:make', referenceName: 'Bad',
+          referenceKind: 'instantiates' as const, line: 5, column: 0,
+          filePath: item.filePath, language: item.refLanguage,
+        };
+        expect(matchReference(ref, baseContext([candidate]))).toBeNull();
+      }
+    });
+
+    it('rejects Objective-C (.m) construction of a C++ class — only .mm keeps the interop exception', () => {
+      // Plain Objective-C (.m) is tagged `objc` like ObjC++ (.mm) but cannot
+      // construct C++ types, so the objc→c/cpp exception must be gated on .mm.
+      const cls: Node = {
+        id: 'class:thing.hpp:Thing:3', kind: 'class', name: 'Thing',
+        qualifiedName: 'Thing', filePath: 'thing.hpp', language: 'cpp',
+        startLine: 3, endLine: 10, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const ref = {
+        fromNodeId: 'func:main.m:make:1', referenceName: 'Thing',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.m', language: 'objc' as const,
+      };
+      expect(matchReference(ref, baseContext([cls]))).toBeNull();
+    });
+
+    it('does not resolve a qualified construction ref through a method target', () => {
+      const method: Node = {
+        id: 'method:factory.cpp:Builder:3', kind: 'method', name: 'Builder',
+        qualifiedName: 'Factory::Builder', filePath: 'factory.cpp', language: 'cpp',
+        startLine: 3, endLine: 5, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const context: ResolutionContext = {
+        ...baseContext([method]),
+        getNodesByQualifiedName: (name) => name === method.qualifiedName ? [method] : [],
+      };
+      const ref = {
+        fromNodeId: 'func:main.cpp:make:1', referenceName: 'Factory::Builder',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.cpp', language: 'cpp' as const,
+      };
+
+      expect(matchReference(ref, context)).toBeNull();
+    });
+
+    it('allows a Rust struct-style enum variant but rejects a non-rust enum_member', () => {
+      // Rust struct-style enum variants (`Shape::Circle { x: 0, y: 0 }`) use the
+      // same construction syntax as a struct, so the enum_member target kind is
+      // allowed — but only in Rust. The same kind in a language that doesn't
+      // construct via enum members (a TypeScript enum case) is still rejected.
+      const rustVariant: Node = {
+        id: 'enum_member:shape.rs:Circle:5', kind: 'enum_member', name: 'Circle',
+        qualifiedName: 'Shape::Circle', filePath: 'shape.rs', language: 'rust',
+        startLine: 5, endLine: 5, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const tsEnumMember: Node = {
+        ...rustVariant, id: 'enum_member:shape.ts:Circle:5',
+        filePath: 'shape.ts', language: 'typescript',
+      };
+      const ref = {
+        fromNodeId: 'func:main.rs:make:1', referenceName: 'Circle',
+        referenceKind: 'instantiates' as const,
+        line: 8, column: 0, filePath: 'main.rs', language: 'rust' as const,
+      };
+
+      expect(matchReference(ref, baseContext([rustVariant]))?.targetNodeId).toBe(rustVariant.id);
+
+      const tsRef = { ...ref, filePath: 'main.ts', language: 'typescript' as const };
+      expect(matchReference(tsRef, baseContext([tsEnumMember]))).toBeNull();
     });
 
     it('prefers a function candidate over a non-function for `decorates` refs', () => {

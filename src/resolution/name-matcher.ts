@@ -16,6 +16,8 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (ref.referenceKind === 'instantiates') return null;
+
   // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
   // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
   // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
@@ -133,6 +135,28 @@ export function sameLanguageFamily(a: string, b: string): boolean {
   const fa = LANGUAGE_FAMILY[a];
   return fa !== undefined && fa === LANGUAGE_FAMILY[b];
 }
+
+/**
+ * Construction compatibility is normally the same as the shared language
+ * family, with one directional exception: an Objective-C++ (`.mm`) source is
+ * tagged `objc` by the grammar but can directly construct C and C++ types.
+ * Plain Objective-C (`.m`) cannot, and both share the `objc` tag, so the
+ * exception is gated on the source file path ending in `.mm`. A missing path
+ * is treated conservatively (no exception). This preserves real ObjC++ interop
+ * without broadly merging the Apple and C/C++ language families.
+ */
+export function sameInstantiationLanguageFamily(
+  targetLanguage: string,
+  sourceLanguage: string,
+  sourceFilePath?: string,
+): boolean {
+  return sameLanguageFamily(targetLanguage, sourceLanguage) || (
+    sourceLanguage === 'objc' &&
+    (targetLanguage === 'c' || targetLanguage === 'cpp') &&
+    !!sourceFilePath &&
+    sourceFilePath.toLowerCase().endsWith('.mm')
+  );
+}
 /**
  * True when `lang` belongs to a known multi-language family (jvm/apple/web/c).
  * Languages not listed (php, python, go, ruby, rust, dart, …) and config
@@ -158,10 +182,12 @@ export function crossesKnownFamily(a: string, b: string): boolean {
 }
 /**
  * Drop cross-language candidates from a name lookup. Two regimes:
- *  - `references` (type-usage): a type named in language X resolves to a
- *    SAME-family type, never a coincidentally same-named symbol in another
- *    language (the Android `BatteryManager` system class vs a JS one). Strict
- *    same-family filter — cross-language communication is `calls`, not refs.
+ *  - `references` / `instantiates` (type-usage/construction): a type named in
+ *    language X resolves to a SAME-family type, never a coincidentally
+ *    same-named symbol in another language (the Android `BatteryManager`
+ *    system class vs a JS one). Strict compatible-family filter — including
+ *    the Objective-C++-to-C/C++ construction exception — prevents unrelated
+ *    cross-language collisions while retaining direct language interop.
  *  - `imports` (import binding): an `import`/`#include` never crosses two
  *    KNOWN families (TS `import React` ↮ Swift `import React`). Weaker
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
@@ -170,10 +196,63 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
   if (ref.referenceKind === 'references') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
+  if (ref.referenceKind === 'instantiates') {
+    return candidates.filter((c) =>
+      sameInstantiationLanguageFamily(c.language, ref.language, ref.filePath));
+  }
   if (ref.referenceKind === 'imports') {
     return candidates.filter((c) => !crossesKnownFamily(c.language, ref.language));
   }
   return candidates;
+}
+
+/**
+ * Whether a symbol can be the target of an explicit construction expression.
+ *
+ * Keep this a semantic allow-list rather than a score bonus: `new Widget()`
+ * must never resolve to a same-named method, field, variable, or import merely
+ * because that symbol happens to be closer to the call site. The allowed kinds
+ * are language-aware (see the switch below): class/struct are universally
+ * constructible; type_alias only in C/C++ (alias-chain resolution to an
+ * underlying constructible type is a follow-up); interface only in Java
+ * (anonymous implementations like `new Runnable() { ... }`); trait only in
+ * Scala; enum_member only in Rust (struct-style variants share struct
+ * construction syntax); protocol is rejected by default.
+ */
+export function isValidInstantiationTarget(candidate: Node, ref: UnresolvedRef): boolean {
+  // Language-aware allow-list: a construction expression may only target a type
+  // whose kind is constructible in the *source* language. class/struct are
+  // universally constructible; the rest are gated to the language(s) with a
+  // real construction syntax for that kind, so a same-named Swift `protocol`,
+  // Rust `trait`, or TS `interface`/`type_alias` no longer swallows a call that
+  // should resolve to a class. C/C++ `type_alias` is kept for now (resolving an
+  // alias chain to an underlying constructible type is a follow-up).
+  switch (candidate.kind) {
+    case 'class':
+    case 'struct':
+      return true;
+    case 'type_alias':
+      return ref.language === 'c' || ref.language === 'cpp';
+    case 'interface':
+      return ref.language === 'java';
+    case 'trait':
+      return ref.language === 'scala';
+    case 'enum_member':
+      return ref.language === 'rust';
+    // `protocol` has no standalone construction syntax worth keeping without
+    // explicit evidence per language; reject by default.
+    default:
+      return false;
+  }
+}
+
+function applyTargetKindGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind !== 'instantiates') return candidates;
+  return candidates.filter((candidate) => isValidInstantiationTarget(candidate, ref));
+}
+
+function applyReferenceGates(candidates: Node[], ref: UnresolvedRef): Node[] {
+  return applyTargetKindGate(applyLanguageGate(candidates, ref), ref);
 }
 
 /**
@@ -183,7 +262,7 @@ export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref);
+  const candidates = applyReferenceGates(context.getNodesByName(ref.referenceName), ref);
 
   if (candidates.length === 0) {
     return null;
@@ -229,7 +308,10 @@ export function matchByQualifiedName(
     return null;
   }
 
-  const candidates = context.getNodesByQualifiedName(ref.referenceName);
+  const qualifiedCandidates = context.getNodesByQualifiedName(ref.referenceName);
+  const candidates = ref.referenceKind === 'instantiates'
+    ? applyReferenceGates(qualifiedCandidates, ref)
+    : qualifiedCandidates;
 
   if (candidates.length === 1) {
     return {
@@ -244,7 +326,10 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context.getNodesByName(lastName);
+    const namedCandidates = context.getNodesByName(lastName);
+    const partialCandidates = ref.referenceKind === 'instantiates'
+      ? applyReferenceGates(namedCandidates, ref)
+      : namedCandidates;
     for (const candidate of partialCandidates) {
       if (candidate.qualifiedName.endsWith(ref.referenceName)) {
         return {
@@ -772,6 +857,8 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (ref.referenceKind === 'instantiates') return null;
+
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -1027,14 +1114,8 @@ function findBestMatch(
     // For instantiation references (`new Foo()`), prefer class-like
     // targets — without this, a function named `Foo` in another module
     // could outscore the actual class.
-    if (ref.referenceKind === 'instantiates') {
-      if (
-        candidate.kind === 'class' ||
-        candidate.kind === 'struct' ||
-        candidate.kind === 'interface'
-      ) {
-        score += 25;
-      }
+    if (ref.referenceKind === 'instantiates' && isValidInstantiationTarget(candidate, ref)) {
+      score += 25;
     }
 
     // For decorator references (`@Foo`), prefer functions. Class
@@ -1080,9 +1161,14 @@ export function matchFuzzy(
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
 
-  // Filter to callable kinds only (function, method, class)
+  // Calls fuzzily match callable symbols. Explicit construction instead uses
+  // the same hard semantic target gate as exact/qualified matching, including
+  // structs and type aliases that the historical callable list omitted.
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const kindCandidates = ref.referenceKind === 'instantiates'
+    ? applyTargetKindGate(candidates, ref)
+    : candidates.filter((n) => callableKinds.has(n.kind));
+  const callableCandidates = applyLanguageGate(kindCandidates, ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
@@ -1110,6 +1196,16 @@ export function matchReference(
 ): ResolvedRef | null {
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
+
+  // Construction expressions name types. Do not run file/receiver/call-chain
+  // strategies: a qualified `new A::B()` must not resolve to method `A::B`.
+  if (ref.referenceKind === 'instantiates') {
+    result = matchByQualifiedName(ref, context);
+    if (result) return result;
+    result = matchByExactName(ref, context);
+    if (result) return result;
+    return matchFuzzy(ref, context);
+  }
 
   // 0. File path match (e.g., "snippets/drawer-menu.liquid" → file node)
   result = matchByFilePath(ref, context);

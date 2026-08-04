@@ -22,6 +22,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Code inside a project that's reachable both directly and through a symbolic link is no longer indexed twice as if it were two separate copies. The same file reached via its real path or any in-repo symlink is now indexed once, so `codegraph query`, `codegraph_explore`, and `codegraph_node` no longer return duplicate symbols for it, and an import written through either path resolves to the one symbol. Directory symlinks now store files under their real path deterministically instead of whichever path the scanner happened to hit first. Set `CODEGRAPH_DEDUP_SYMLINKS=0` to switch this off and fall back to the previous behavior; symlinks whose target is outside the project root are still not indexed, unchanged.
 
 - C/C++ enums generated with the self-including X-macro idiom now retain both hand-written and generated members with their real ownership and source locations, while ambiguous macro replacements and external `.inc`/`.def` lists remain untouched; re-index existing projects with `codegraph index -f` to pick up the added members. (C, C++)
+- Explicit construction references no longer resolve to same-named methods, fields, variables, functions, imports, or other non-constructible symbols, while C/C++ aliases, C-to-C++ and Objective-C++ interoperability, anonymous interface implementations, and dynamic-language `Foo()` construction continue to resolve normally; re-index with `codegraph index -f` to rebuild affected edges.
 
 ### New Features
 
