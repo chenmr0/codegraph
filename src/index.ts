@@ -613,8 +613,38 @@ export class CodeGraph {
       } catch {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
+      // Sync updates the same FTS and secondary-index pages as a full index.
+      // On a large existing database, SQLite's default 1000-page automatic
+      // checkpoint cadence can therefore repeatedly rewrite hot pages even
+      // when only a few source files changed. Mirror indexAll's WAL valve for
+      // the whole incremental run: append sequentially, bound WAL growth
+      // off-thread, and restore the connection policy on every exit path.
+      // CODEGRAPH_NO_WAL_DEFER=1 remains the shared escape hatch.
+      let deferWal = false;
+      let priorAutocheckpoint = 0;
+      let walValve: WalCheckpointValve | null = null;
       try {
+        deferWal =
+          process.env.CODEGRAPH_NO_WAL_DEFER !== '1' &&
+          this.db.getJournalMode() === 'wal';
+        if (deferWal) {
+          priorAutocheckpoint = this.db.getWalAutocheckpoint();
+          this.db.setWalAutocheckpoint(0);
+          walValve = new WalCheckpointValve(
+            this.db,
+            undefined,
+            undefined,
+            options.verbose ? (msg: string) => console.log(`[wal] ${msg}`) : undefined
+          );
+          walValve.start();
+        }
+
         const result = await this.orchestrator.sync(options.onProgress);
+
+        // Fold extraction writes before resolution starts reading the changed
+        // graph. Besides bounding the WAL, this avoids making the main thread
+        // page through a large unfurled write set at the phase boundary.
+        if (walValve) await walValve.foldNow();
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
@@ -702,7 +732,25 @@ export class CodeGraph {
 
         return result;
       } finally {
-        this.fileLock.release();
+        // Stop checkpoint activity before restoring SQLite's original policy.
+        // Keep restoration and lock release nested so even an unexpected valve
+        // teardown failure cannot leave later sync/index commands wedged.
+        try {
+          if (walValve) {
+            walValve.stop();
+            await walValve.drain();
+          }
+        } finally {
+          try {
+            if (deferWal) {
+              this.db.setWalAutocheckpoint(priorAutocheckpoint);
+            }
+          } catch {
+            // The connection may already be closing after a failed sync.
+          } finally {
+            this.fileLock.release();
+          }
+        }
       }
     });
   }
