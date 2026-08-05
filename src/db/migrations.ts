@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Migration definition
@@ -101,6 +101,31 @@ const migrations: Migration[] = [
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
           ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
+      `);
+    },
+  },
+  {
+    version: 8,
+    description:
+      'Keep attempted unresolved references so sync can retry them when matching symbols appear',
+    up: (db) => {
+      // ALTER TABLE has no IF NOT EXISTS. A database initialized from the
+      // current schema can still have an older recorded version in migration
+      // tests or after an interrupted upgrade, so guard both columns.
+      const columns = db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{
+        name: string;
+      }>;
+      const hasColumn = (name: string) => columns.some((column) => column.name === name);
+      if (!hasColumn('status')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+      }
+      if (!hasColumn('name_tail')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN name_tail TEXT NOT NULL DEFAULT ''");
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail
+          ON unresolved_refs(name_tail) WHERE status = 'failed';
       `);
     },
   },

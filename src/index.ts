@@ -652,6 +652,10 @@ export class CodeGraph {
         // (regex over *.module.ts only).
         if (result.filesAdded > 0 || result.filesModified > 0) {
           this.resolver.runPostExtract();
+        } else if (result.filesRemoved > 0) {
+          // Pure deletion still resolves resurrected incoming references below.
+          // Drop name/node caches warmed against the pre-deletion graph.
+          this.resolver.clearCaches();
         }
 
         // Resolve references for changed files first. This restores their
@@ -670,10 +674,51 @@ export class CodeGraph {
               options.onProgress?.({ phase: 'resolving', current, total });
             });
           }
+        }
 
-          // Second pass: chained calls whose method lives on a supertype the
-          // receiver conforms to (protocol-extension / inherited). Needs the
-          // implements/extends edges built above (#750).
+        // Whole-file deletion cascades incoming edges from unchanged callers.
+        // The extraction layer resurrects stamped edges as pending references;
+        // resolve just those source files rather than sweeping the whole table.
+        const resurrectedRefs = result.resurrectedReferenceSourceFiles?.length
+          ? this.queries.getUnresolvedReferencesByFiles(
+              result.resurrectedReferenceSourceFiles
+            )
+          : [];
+        if (resurrectedRefs.length > 0) {
+          this.resolver.resolveAndPersist(resurrectedRefs, (current, total) => {
+            options.onProgress?.({ phase: 'resolving', current, total });
+          });
+        }
+
+        // A changed file may introduce a symbol needed by references in files
+        // that did not change. Retry only failed rows whose final qualified
+        // name segment matches a node contributed by the changed files.
+        if (result.changedFilePaths?.length) {
+          const retryable = this.queries.getRetryableFailedReferences(
+            this.queries.getNodeNamesByFiles(result.changedFilePaths)
+          );
+          if (retryable.length > 0) {
+            options.onProgress?.({
+              phase: 'resolving',
+              current: 0,
+              total: retryable.length,
+            });
+            await this.resolver.resolveAndPersistListYielding(retryable);
+            options.onProgress?.({
+              phase: 'resolving',
+              current: retryable.length,
+              total: retryable.length,
+            });
+          }
+        }
+
+        if (
+          result.filesAdded > 0 ||
+          result.filesModified > 0 ||
+          resurrectedRefs.length > 0
+        ) {
+          // Run after scoped resolution, resurrection, and failed-ref retries:
+          // any of them can defer a chained call until conformance edges exist.
           this.resolver.resolveChainedCallsViaConformance();
         }
 

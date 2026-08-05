@@ -81,6 +81,29 @@ describe('phase 2 exact unresolved-reference cleanup', () => {
     expect(afterFirst.map((ref) => ref.line)).toEqual([20, 30]);
   });
 
+  it('parks only the attempted row and retries qualified C++ names by tail', () => {
+    queries.insertUnresolvedRefsBatch([
+      { ...makeRef(10), referenceName: 'ns::late_target', language: 'cpp' },
+      { ...makeRef(20), referenceName: 'ns::late_target', language: 'cpp' },
+    ]);
+
+    const first = queries.getUnresolvedReferencesBatchAfter(0, 1)[0]!;
+    expect(
+      queries.markReferencesFailedByRowIds([
+        { rowId: first.rowId!, referenceName: first.referenceName },
+      ])
+    ).toBe(1);
+
+    expect(queries.getUnresolvedReferencesCount()).toBe(1);
+    expect(queries.getUnresolvedReferencesBatchAfter(0, 10).map((ref) => ref.line)).toEqual([
+      20,
+    ]);
+    expect(queries.getRetryableFailedReferences(['late_target']).map((ref) => ref.line)).toEqual([
+      10,
+    ]);
+    expect(queries.getRetryableFailedReferences(['late_target'], 0)).toEqual([]);
+  });
+
   it('keeps edge identity deduplication while secondary indexes are deferred', async () => {
     connection.beginBulkResolutionEdgeLoad();
     connection.beginBulkResolutionRefLoad();
@@ -115,6 +138,8 @@ describe('phase 2 exact unresolved-reference cleanup', () => {
     );
     expect(namesAfter.has('idx_edges_kind')).toBe(true);
     expect(namesAfter.has('idx_unresolved_name')).toBe(true);
+    expect(namesAfter.has('idx_unresolved_status')).toBe(true);
+    expect(namesAfter.has('idx_unresolved_failed_tail')).toBe(true);
     expect(queries.getOutgoingEdges('caller')).toHaveLength(1);
   });
 

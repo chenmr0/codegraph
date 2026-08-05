@@ -110,6 +110,14 @@ interface UnresolvedRefRow {
   candidates: string | null;
   file_path: string;
   language: string;
+  status: string;
+  name_tail: string;
+}
+
+/** Last qualified segment that can match a newly-added plain node name. */
+function referenceNameTail(referenceName: string): string {
+  const separator = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
+  return separator >= 0 ? referenceName.slice(separator + 1) : referenceName;
 }
 
 /**
@@ -1981,7 +1989,7 @@ export class QueryBuilder {
   getUnresolvedReferencesCount(): number {
     if (!this.stmts.getUnresolvedCount) {
       this.stmts.getUnresolvedCount = this.db.prepare(
-        'SELECT COUNT(*) as count FROM unresolved_refs'
+        "SELECT COUNT(*) as count FROM unresolved_refs WHERE status = 'pending'"
       );
     }
     const row = this.stmts.getUnresolvedCount.get() as { count: number };
@@ -1995,7 +2003,7 @@ export class QueryBuilder {
   getUnresolvedReferencesBatch(offset: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatch) {
       this.stmts.getUnresolvedBatch = this.db.prepare(
-        'SELECT * FROM unresolved_refs ORDER BY id LIMIT ? OFFSET ?'
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' ORDER BY id LIMIT ? OFFSET ?"
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
@@ -2022,7 +2030,7 @@ export class QueryBuilder {
   getUnresolvedReferencesBatchAfter(afterRowId: number, limit: number): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedBatchAfter) {
       this.stmts.getUnresolvedBatchAfter = this.db.prepare(
-        'SELECT * FROM unresolved_refs WHERE id > ? ORDER BY id LIMIT ?'
+        "SELECT * FROM unresolved_refs WHERE status = 'pending' AND id > ? ORDER BY id LIMIT ?"
       );
     }
     const rows = this.stmts.getUnresolvedBatchAfter.all(afterRowId, limit) as UnresolvedRefRow[];
@@ -2077,7 +2085,9 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const chunkRows = this.db
-        .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
+        .prepare(
+          `SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`
+        )
         .all(...chunk) as UnresolvedRefRow[];
       rows.push(...chunkRows);
     }
@@ -2107,7 +2117,8 @@ export class QueryBuilder {
     const sql = `SELECT e.source, e.kind, e.metadata, e.line, e.col, e.provenance,
        nt.name  AS target_name,
        nt.kind  AS target_kind,
-       ns.file_path AS source_file_path
+       ns.file_path AS source_file_path,
+       ns.language AS source_language
 FROM nodes nt
 JOIN edges e ON e.target = nt.id
 JOIN nodes ns ON ns.id = e.source
@@ -2126,11 +2137,13 @@ WHERE nt.file_path = ?
       target_name: string;
       target_kind: string;
       source_file_path: string;
+      source_language: string;
     }>;
 
     return rows.map((r) => ({
       sourceId: r.source,
       sourceFilePath: r.source_file_path,
+      sourceLanguage: r.source_language as Language,
       targetName: r.target_name,
       targetKind: r.target_kind,
       edgeKind: r.kind,
@@ -2238,6 +2251,114 @@ WHERE e.kind = 'imports'
       }
     })();
     return changed;
+  }
+
+  /** Park database-backed references that a completed pass could not resolve. */
+  markReferencesFailedByRowIds(
+    refs: Array<{ rowId: number; referenceName: string }>
+  ): number {
+    if (refs.length === 0) return 0;
+    const statement = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? WHERE id = ?"
+    );
+    let changed = 0;
+    this.db.transaction(() => {
+      for (const ref of refs) {
+        changed += statement.run(referenceNameTail(ref.referenceName), ref.rowId).changes;
+      }
+    })();
+    return changed;
+  }
+
+  /** Tuple-key fallback for references constructed outside the database. */
+  markReferencesFailed(
+    refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>
+  ): number {
+    if (refs.length === 0) return 0;
+    const statement = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'failed', name_tail = ? " +
+        'WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
+    );
+    let changed = 0;
+    this.db.transaction(() => {
+      for (const ref of refs) {
+        changed += statement.run(
+          referenceNameTail(ref.referenceName),
+          ref.fromNodeId,
+          ref.referenceName,
+          ref.referenceKind
+        ).changes;
+      }
+    })();
+    return changed;
+  }
+
+  /**
+   * Failed references whose final name segment matches symbols introduced by
+   * changed files. Popular names are skipped wholesale to bound sync work.
+   */
+  getRetryableFailedReferences(
+    names: string[],
+    perNameCeiling: number = 500
+  ): UnresolvedReference[] {
+    if (names.length === 0) return [];
+
+    const retryNames = new Set<string>();
+    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = [...new Set(names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE))];
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT name_tail, COUNT(*) AS count FROM unresolved_refs ` +
+            `WHERE status = 'failed' AND name_tail IN (${placeholders}) GROUP BY name_tail`
+        )
+        .all(...chunk) as Array<{ name_tail: string; count: number }>;
+      for (const row of rows) {
+        if (row.count <= perNameCeiling) retryNames.add(row.name_tail);
+      }
+    }
+
+    const rows: UnresolvedRefRow[] = [];
+    const retryNameList = [...retryNames];
+    for (let i = 0; i < retryNameList.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = retryNameList.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(
+        ...(this.db
+          .prepare(
+            `SELECT * FROM unresolved_refs WHERE status = 'failed' ` +
+              `AND name_tail IN (${placeholders}) ORDER BY id`
+          )
+          .all(...chunk) as UnresolvedRefRow[])
+      );
+    }
+
+    return rows.map((row) => ({
+      rowId: row.id,
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+    }));
+  }
+
+  /** Distinct symbol names currently contributed by changed files. */
+  getNodeNamesByFiles(filePaths: string[]): string[] {
+    if (filePaths.length === 0) return [];
+    const names = new Set<string>();
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT name FROM nodes WHERE file_path IN (${placeholders})`)
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) names.add(row.name);
+    }
+    return [...names];
   }
 
   // ===========================================================================

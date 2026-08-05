@@ -968,6 +968,13 @@ export class ReferenceResolver {
         metadata: {
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
+          // Preserve the exact extracted reference. If the target file is
+          // later deleted, sync can reconstruct the same reference without
+          // losing C++ receiver/namespace context such as `ns::helper`.
+          refName: ref.original.referenceName,
+          ...(ref.original.referenceKind !== kind
+            ? { refKind: ref.original.referenceKind }
+            : {}),
         },
       };
     });
@@ -1001,6 +1008,34 @@ export class ReferenceResolver {
     return { rowIds, legacyKeys };
   }
 
+  private static partitionFailedCleanup(refs: UnresolvedRef[]): {
+    byRowId: Array<{ rowId: number; referenceName: string }>;
+    legacyKeys: Array<{
+      fromNodeId: string;
+      referenceName: string;
+      referenceKind: string;
+    }>;
+  } {
+    const byRowId: Array<{ rowId: number; referenceName: string }> = [];
+    const legacyKeys: Array<{
+      fromNodeId: string;
+      referenceName: string;
+      referenceKind: string;
+    }> = [];
+    for (const ref of refs) {
+      if (ref.rowId !== undefined) {
+        byRowId.push({ rowId: ref.rowId, referenceName: ref.referenceName });
+      } else {
+        legacyKeys.push({
+          fromNodeId: ref.fromNodeId,
+          referenceName: ref.referenceName,
+          referenceKind: ref.referenceKind,
+        });
+      }
+    }
+    return { byRowId, legacyKeys };
+  }
+
   /**
    * Resolve and persist edges to database
    */
@@ -1027,7 +1062,47 @@ export class ReferenceResolver {
       this.queries.deleteSpecificResolvedReferences(cleanup.legacyKeys);
     }
 
+    // A completed pass must also remove failures from the pending set. Keep
+    // them parked for a later symbol-driven retry instead of deleting them.
+    if (result.unresolved.length > 0) {
+      const cleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      this.queries.markReferencesFailedByRowIds(cleanup.byRowId);
+      this.queries.markReferencesFailed(cleanup.legacyKeys);
+    }
+
     return result;
+  }
+
+  /**
+   * Cooperative, bounded counterpart used for failed-reference retries during
+   * sync. Each chunk is fully persisted before yielding to the event loop.
+   */
+  async resolveAndPersistListYielding(
+    refs: UnresolvedReference[],
+    batchSize: number = 500
+  ): Promise<ResolutionResult> {
+    const safeBatchSize = Math.max(1, Math.floor(batchSize));
+    const aggregate: ResolutionResult = {
+      resolved: [],
+      unresolved: [],
+      stats: { total: 0, resolved: 0, unresolved: 0, byMethod: {} },
+    };
+
+    for (let offset = 0; offset < refs.length; offset += safeBatchSize) {
+      const result = this.resolveAndPersist(refs.slice(offset, offset + safeBatchSize));
+      aggregate.resolved.push(...result.resolved);
+      aggregate.unresolved.push(...result.unresolved);
+      aggregate.stats.total += result.stats.total;
+      aggregate.stats.resolved += result.stats.resolved;
+      aggregate.stats.unresolved += result.stats.unresolved;
+      for (const [method, count] of Object.entries(result.stats.byMethod)) {
+        aggregate.stats.byMethod[method] =
+          (aggregate.stats.byMethod[method] ?? 0) + count;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    return aggregate;
   }
 
   /**
@@ -1195,9 +1270,13 @@ export class ReferenceResolver {
         removedThisBatch += this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds);
         this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys);
 
-        const unresolvedCleanup = ReferenceResolver.partitionCleanup(result.unresolved);
-        removedThisBatch += this.queries.deleteReferencesByRowIds(unresolvedCleanup.rowIds);
-        this.queries.deleteSpecificResolvedReferences(unresolvedCleanup.legacyKeys);
+        const unresolvedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+        removedThisBatch += this.queries.markReferencesFailedByRowIds(
+          unresolvedCleanup.byRowId
+        );
+        removedThisBatch += this.queries.markReferencesFailed(
+          unresolvedCleanup.legacyKeys
+        );
 
         // Aggregate stats
         aggregateStats.total += result.stats.total;
@@ -1214,10 +1293,10 @@ export class ReferenceResolver {
         await new Promise(resolve => setImmediate(resolve));
 
         // Non-progress guard (defense-in-depth). Every SQLite-backed row in the
-        // batch must be removed by its exact row id. If none is removed, stop
+        // batch must leave the pending set. If none does, stop
         // instead of repeatedly admitting edges while walking newly appended rows.
         // An entirely unresolvable batch is still progress because those exact
-        // source rows are deleted and keyset pagination advances to the next ids.
+        // source rows are parked as failed and keyset pagination advances.
         if (removedThisBatch === 0 && batch.some((ref) => ref.rowId !== undefined)) {
           break;
         }

@@ -16,6 +16,8 @@ import {
   ExtractionResult,
   ExtractionError,
   SavedCrossFileEdge,
+  UnresolvedReference,
+  EdgeKind,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
@@ -133,6 +135,8 @@ export interface SyncResult {
    *  edge re-wiring ran and all edges were restored; an empty array
    *  means no rewiring was needed (0 incoming edges). */
   failedRewireSourceFiles?: string[];
+  /** Unchanged caller files whose dropped cross-file edges became pending refs. */
+  resurrectedReferenceSourceFiles?: string[];
 }
 
 /**
@@ -140,6 +144,44 @@ export interface SyncResult {
  */
 export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Rebuild the exact extracted reference stamped on a resolution edge. Edges
+ * without a stamp predate this feature or were synthesized; recreating those
+ * from the target's plain name could lose C++ namespace/receiver context and
+ * bind incorrectly, so they are deliberately skipped.
+ */
+function resurrectReferenceFromEdge(
+  edge: SavedCrossFileEdge
+): UnresolvedReference | null {
+  let metadata: Record<string, unknown> | undefined;
+  if (edge.metadata) {
+    try {
+      const parsed = JSON.parse(edge.metadata) as unknown;
+      if (parsed && typeof parsed === 'object') {
+        metadata = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const referenceName = metadata?.refName;
+  if (typeof referenceName !== 'string' || referenceName.length === 0) return null;
+  const referenceKind =
+    typeof metadata?.refKind === 'string'
+      ? (metadata.refKind as EdgeKind)
+      : (edge.edgeKind as EdgeKind);
+  return {
+    fromNodeId: edge.sourceId,
+    referenceName,
+    referenceKind,
+    line: edge.line ?? 0,
+    column: edge.col ?? 0,
+    filePath: edge.sourceFilePath,
+    language: edge.sourceLanguage,
+  };
 }
 
 /**
@@ -1969,6 +2011,7 @@ export class ExtractionOrchestrator {
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    const resurrectedReferenceSourceFiles = new Set<string>();
     this.syncRewireFailures = [];
 
     onProgress?.({
@@ -2003,6 +2046,20 @@ export class ExtractionOrchestrator {
     let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        // Deleting the target cascades its incoming edges even though callers
+        // in other files are unchanged. Preserve stamped resolution edges as
+        // pending refs so this same sync can rebind them or park them for a
+        // later symbol-driven retry.
+        const resurrected = this.queries
+          .getIncomingCrossFileEdges(tracked.path)
+          .map(resurrectReferenceFromEdge)
+          .filter((ref): ref is UnresolvedReference => ref !== null);
+        if (resurrected.length > 0) {
+          this.queries.insertUnresolvedRefsBatch(resurrected);
+          for (const ref of resurrected) {
+            if (ref.filePath) resurrectedReferenceSourceFiles.add(ref.filePath);
+          }
+        }
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
@@ -2096,6 +2153,10 @@ export class ExtractionOrchestrator {
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
       failedRewireSourceFiles: failedFiles.length > 0 ? failedFiles : undefined,
+      resurrectedReferenceSourceFiles:
+        resurrectedReferenceSourceFiles.size > 0
+          ? [...resurrectedReferenceSourceFiles]
+          : undefined,
     };
   }
 

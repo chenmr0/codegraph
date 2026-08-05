@@ -299,6 +299,8 @@ export interface SavedCrossFileEdge {
   sourceId: string;
   /** File path of the source node */
   sourceFilePath: string;
+  /** Language of the source node */
+  sourceLanguage: Language;
   /** Name of the target node (in the file being re-indexed) */
   targetName: string;
   /** Kind of the target node */
