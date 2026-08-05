@@ -4,6 +4,8 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
 import { QueryBuilder } from '../src/db/queries';
+import * as memoryBudget from '../src/resolution/memory-budget';
+import { registerFrameworkResolver } from '../src/resolution/frameworks';
 
 /**
  * End-to-end test for the C declaration-definition pairing synthesizer
@@ -136,7 +138,53 @@ int add(int a, int b) {
     }
   });
 
-  it('returns a non-success result when a synthesis pass fails', async () => {
+  it('allows SDK init to return a usable incomplete index when synthesis is explicitly disabled', async () => {
+    fs.writeFileSync(path.join(dir, 'sdk.c'), 'int sdk_api(void) { return 1; }\n');
+
+    const previous = process.env.CODEGRAPH_NO_SYNTHESIS;
+    process.env.CODEGRAPH_NO_SYNTHESIS = '1';
+    let cg: CodeGraph | undefined;
+    try {
+      cg = await CodeGraph.init(dir, { index: true });
+      expect(cg.getIndexCompleteness()).toMatchObject({
+        status: 'incomplete',
+        diagnostics: [expect.objectContaining({ code: 'synthesis_disabled' })],
+      });
+      expect(cg.getStats().nodeCount).toBeGreaterThan(0);
+    } finally {
+      cg?.close?.();
+      if (previous === undefined) delete process.env.CODEGRAPH_NO_SYNTHESIS;
+      else process.env.CODEGRAPH_NO_SYNTHESIS = previous;
+    }
+  });
+
+  it('keeps the base index usable when synthesis is skipped for memory safety', async () => {
+    fs.writeFileSync(path.join(dir, 'memory.c'), 'int memory_api(void) { return 1; }\n');
+
+    const budget = vi.spyOn(memoryBudget, 'memoryBudgetBytes').mockReturnValue(0);
+    const cg = await CodeGraph.init(dir);
+    try {
+      const result = await cg.indexAll();
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          severity: 'error',
+          code: 'synthesis_skipped_memory',
+        })
+      );
+      expect(cg.getStats().nodeCount).toBeGreaterThan(0);
+      expect(cg.getIndexCompleteness()).toMatchObject({
+        status: 'incomplete',
+        diagnostics: [expect.objectContaining({ code: 'synthesis_skipped_memory' })],
+      });
+    } finally {
+      cg.close?.();
+      budget.mockRestore();
+    }
+  });
+
+  it('returns a usable incomplete result when a synthesis pass fails', async () => {
     fs.writeFileSync(path.join(dir, 'broken.h'), 'int broken_api(void);\n');
     fs.writeFileSync(path.join(dir, 'broken.c'), 'int broken_api(void) { return 1; }\n');
 
@@ -148,7 +196,7 @@ int add(int a, int b) {
     const cg = await CodeGraph.init(dir, { silent: true });
     try {
       const result = await cg.indexAll();
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
       expect(result.complete).toBe(false);
       expect(result.errors).toContainEqual(
         expect.objectContaining({
@@ -164,6 +212,84 @@ int add(int a, int b) {
     } finally {
       cg.close?.();
       stage.mockRestore();
+    }
+  });
+
+  it('keeps the base index usable when optional framework detection fails', async () => {
+    fs.writeFileSync(path.join(dir, 'framework.c'), 'int framework_api(void) { return 1; }\n');
+
+    const resolverName = 'test-c-detection-failure';
+    registerFrameworkResolver({
+      name: resolverName,
+      languages: ['c'],
+      detect: () => {
+        throw new Error('injected framework detection failure');
+      },
+      resolve: () => null,
+    });
+
+    let cg: CodeGraph | undefined;
+    try {
+      cg = await CodeGraph.init(dir);
+      const result = await cg.indexAll();
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          severity: 'error',
+          code: 'framework_detection_failed',
+          message: expect.stringContaining('injected framework detection failure'),
+        })
+      );
+      expect(cg.getStats().nodeCount).toBeGreaterThan(0);
+    } finally {
+      cg?.close?.();
+      // Keep the global registry harmless for later tests in this worker.
+      registerFrameworkResolver({
+        name: resolverName,
+        languages: ['c'],
+        detect: () => false,
+        resolve: () => null,
+      });
+    }
+  });
+
+  it('keeps the base index usable when optional framework post-processing fails', async () => {
+    fs.writeFileSync(path.join(dir, 'post-extract.c'), 'int post_extract_api(void) { return 1; }\n');
+
+    const resolverName = 'test-c-post-extract-failure';
+    registerFrameworkResolver({
+      name: resolverName,
+      languages: ['c'],
+      detect: () => true,
+      resolve: () => null,
+      postExtract: () => {
+        throw new Error('injected framework postExtract failure');
+      },
+    });
+
+    let cg: CodeGraph | undefined;
+    try {
+      cg = await CodeGraph.init(dir);
+      const result = await cg.indexAll();
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          severity: 'error',
+          code: 'framework_post_extract_failed',
+          message: expect.stringContaining('injected framework postExtract failure'),
+        })
+      );
+      expect(cg.getStats().nodeCount).toBeGreaterThan(0);
+    } finally {
+      cg?.close?.();
+      registerFrameworkResolver({
+        name: resolverName,
+        languages: ['c'],
+        detect: () => false,
+        resolve: () => null,
+      });
     }
   });
 

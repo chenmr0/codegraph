@@ -311,6 +311,44 @@ type IndexResult = {
   durationMs: number;
 };
 
+type IndexDiagnostic = IndexResult['errors'][number];
+
+/** Actionable, reason-specific guidance for a valid but incomplete index. */
+function getIncompleteIndexHints(diagnostics: IndexDiagnostic[]): string[] {
+  const codes = new Set(diagnostics.map((diagnostic) => diagnostic.code).filter(Boolean));
+  const hints = ['The existing database is usable; only the reported graph coverage is missing.'];
+
+  if (codes.has('synthesis_skipped_memory') || codes.has('synthesis_stopped_memory')) {
+    hints.push(
+      'Increase available V8/system memory headroom before running "codegraph index" again; ' +
+      'a retry under the same memory conditions may remain incomplete.'
+    );
+  }
+  if (codes.has('synthesis_disabled')) {
+    hints.push(
+      'Dynamic-edge synthesis was explicitly disabled; re-run without ' +
+      'CODEGRAPH_NO_SYNTHESIS=1 only if complete graph coverage is required.'
+    );
+  }
+  if (codes.has('synthesis_pass_failed') || codes.has('synthesis_failed')) {
+    hints.push('Fix the reported synthesis failure before retrying "codegraph index".');
+  }
+  if (codes.has('framework_detection_failed') || codes.has('framework_post_extract_failed')) {
+    hints.push('Fix the reported framework resolver failure before retrying "codegraph index".');
+  }
+  if (
+    codes.has('files_not_indexed') ||
+    diagnostics.some((diagnostic) => diagnostic.filePath !== undefined)
+  ) {
+    hints.push('Fix the reported file errors, then run "codegraph index" to add the missing files.');
+  }
+  if (hints.length === 1) {
+    hints.push('Resolve the reported diagnostics before retrying "codegraph index".');
+  }
+
+  return hints;
+}
+
 /**
  * Print indexing results using clack log methods
  */
@@ -363,12 +401,18 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     clack.log.warn('No files found to index');
   }
 
-  // Non-file diagnostics include required tail failures such as an automatic
+  // Non-file diagnostics include recoverable tail failures such as an automatic
   // synthesis memory skip. Print them after the progress renderer has stopped
   // so an animated line can never erase the only warning.
   for (const diagnostic of globalDiagnostics) {
     if (diagnostic.severity === 'error') clack.log.error(diagnostic.message);
     else clack.log.warn(diagnostic.message);
+  }
+
+  if (result.success && result.complete === false) {
+    for (const hint of getIncompleteIndexHints(result.errors)) {
+      clack.log.info(hint);
+    }
   }
 
   if (hasFileErrors || globalDiagnostics.some((diagnostic) => diagnostic.severity === 'error')) {
@@ -405,7 +449,7 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info('See .codegraph/errors.log for details');
     }
 
-    if (result.success && result.filesIndexed > 0) {
+    if (result.success && result.filesIndexed > 0 && result.complete !== false) {
       clack.log.info(`The index is usable ${getGlyphs().dash} failed files are missing.`);
     }
   } else if (warningCount > 0 && projectPath) {
@@ -529,7 +573,9 @@ program
         await offerWatchFallback(clack, projectPath);
       } catch { /* non-fatal */ }
 
-      clack.outro('Done');
+      clack.outro(
+        result.complete === false ? 'Initialized with incomplete graph coverage' : 'Done'
+      );
       cg.destroy();
     } catch (err) {
       clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -652,7 +698,9 @@ program
         process.exit(1);
       }
 
-      clack.outro('Done');
+      clack.outro(
+        result.complete === false ? 'Index usable with incomplete graph coverage' : 'Done'
+      );
       cg.destroy();
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
@@ -843,7 +891,9 @@ program
         for (const diagnostic of completeness.diagnostics) {
           warn(diagnostic.message);
         }
-        info('Run "codegraph index" again to build a complete graph.');
+        for (const hint of getIncompleteIndexHints(completeness.diagnostics)) {
+          info(hint);
+        }
       }
       console.log();
 

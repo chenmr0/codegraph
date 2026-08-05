@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -85,5 +85,35 @@ describe('codegraph status --json — CI fields (#329)', () => {
     const ms = Date.parse(out.lastIndexed as string);
     expect(ms).toBeGreaterThanOrEqual(before - 1000);
     expect(ms).toBeLessThanOrEqual(after + 1000);
+  });
+
+  it('init exits successfully but reports and persists explicitly incomplete coverage', () => {
+    fs.writeFileSync(path.join(tempDir, 'a.c'), 'int answer(void) { return 42; }\n');
+    const initialized = spawnSync(process.execPath, [BIN, 'init', tempDir], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        CI: '1',
+        CODEGRAPH_NO_DAEMON: '1',
+        CODEGRAPH_NO_SYNTHESIS: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    expect(initialized.status).toBe(0);
+    expect(`${initialized.stdout}\n${initialized.stderr}`).toContain(
+      'Initialized with incomplete graph coverage'
+    );
+
+    const out = runStatusJson(tempDir);
+    const index = out.index as {
+      completeness: string;
+      diagnostics: Array<{ code?: string }>;
+    };
+    expect(index.completeness).toBe('incomplete');
+    expect(index.diagnostics).toContainEqual(
+      expect.objectContaining({ code: 'synthesis_disabled' })
+    );
   });
 });

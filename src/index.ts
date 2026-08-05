@@ -212,7 +212,10 @@ export class CodeGraph {
     // Run initial indexing if requested
     if (options.index) {
       const result = await instance.indexAll({ onProgress: options.onProgress });
-      if (!result.success || result.complete === false) {
+      // `success` means a usable index was produced. `complete` is a separate
+      // coverage signal: optional synthesis/framework phases may be incomplete
+      // while the base database remains valid and queryable.
+      if (!result.success) {
         instance.destroy();
         const errors = result.errors.filter((diagnostic) => diagnostic.severity === 'error');
         const detail = (errors.length > 0 ? errors : result.errors)
@@ -520,21 +523,19 @@ export class CodeGraph {
             } catch { /* metadata is advisory — never fail an index over it */ }
           }
 
-          // Never collapse an incomplete resolution/synthesis tail into a
-          // successful full-index result. Explicit opt-outs remain warnings,
-          // while automatic skips and pass failures make the command fail.
+          // Keep usability and coverage as independent signals. A recoverable
+          // resolution/synthesis/framework diagnostic makes the graph
+          // incomplete, but does not invalidate the base database. Fatal
+          // indexing failures already set `result.success = false` upstream.
           if (resolutionDiagnostics.length > 0) {
             result.errors.push(...resolutionDiagnostics);
           }
-          const hasGlobalError = result.errors.some(
+          const hasIncompleteGlobalError = result.errors.some(
             (diagnostic) => diagnostic.severity === 'error' && !diagnostic.filePath
           );
           result.complete =
-            result.success && result.filesErrored === 0 && !hasGlobalError &&
+            result.success && result.filesErrored === 0 && !hasIncompleteGlobalError &&
             resolutionDiagnostics.length === 0;
-          if (hasGlobalError) {
-            result.success = false;
-          }
           try {
             this.queries.setMetadata(
               'index_completeness',

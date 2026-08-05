@@ -96,8 +96,9 @@ export interface IndexProgress {
  * Result of an indexing operation
  */
 export interface IndexResult {
+  /** True when a valid, queryable index was produced, even if coverage is incomplete. */
   success: boolean;
-  /** False when any file or required post-processing phase was skipped/failed. */
+  /** False when any file or recoverable post-processing phase was skipped/failed. */
   complete?: boolean;
   filesIndexed: number;
   filesSkipped: number;

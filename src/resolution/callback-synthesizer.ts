@@ -1983,7 +1983,8 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
  * React re-render + JSX children + Vue templates + SvelteKit load + RN event
  * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain).
- * Returns the count added. Never throws into indexing — callers wrap in try/catch.
+ * Returns added-edge counts plus completeness diagnostics. Recoverable pass
+ * failures never invalidate the already-built base index.
  */
 export async function synthesizeCallbackEdges(
   queries: QueryBuilder,
