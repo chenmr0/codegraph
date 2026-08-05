@@ -44,19 +44,22 @@
  *
  *   detectXMacroConstructs(source, filePath)
  *     1. Lexically finds enum bodies (brace-context classification).
- *     2. Inside each enum body, recognizes the three-directive construct
- *        `#define M(formals) rep`, `#include "..."`, `#undef M` with a
- *        consistent macro name M, all closed within the enum body.
+ *     2. Inside each enum body, recognizes a self-include region made from one
+ *        or more function-like `#define`s, the `#include "..."`, and matching
+ *        `#undef`s. Besides the direct `M(formals) -> name,` form, it supports
+ *        conservative arity dispatch such as
+ *        `M(args...) -> CAT(M_, NARGS(args))(args)` with `M_1`, `M_2`, ...
+ *        helpers.
  *     3. Validates the `#include` is a SELF-include (normalized path suffix or
  *        basename matches filePath). A non-self include is NOT recovered.
- *     4. Analyzes the replacement body to uniquely identify which formal sits
- *        at the enumerator-name position (`name,` / `name = expr,` / `name`),
- *        rejecting stringify (`#`), token paste (`##`), and multi-candidate or
- *        ambiguous replacements.
- *     5. Returns the source with the three recognized directive lines blanked
+ *     4. Analyzes the direct replacement, or every arity helper, to uniquely
+ *        identify which call argument sits at the enumerator-name position
+ *        (`name,` / `name = expr,` / `name`), rejecting stringify (`#`), token
+ *        paste (`##`), missing cleanup, and ambiguous replacements.
+ *     5. Returns the source with every directive in the proven region blanked
  *        to equal-length spaces (newlines preserved — offsets/line numbers
  *        stay exact) so tree-sitter recovers the enum shell + hand-written
- *        enumerators, plus the list of constructs for member synthesis.
+ *        enumerators, plus definition metadata and calls for node synthesis.
  *
  *   scanXMacroCalls(source, macroName, nameParamIndex, excludeRanges)
  *     Scans OUTSIDE enum bodies (and outside preprocessor directive lines) for
@@ -65,11 +68,12 @@
  *      the name-parameter position for each call (rejecting non-identifier
  *      actuals), anchored at the call's line.
  *
- * The extractor (tree-sitter.ts) drives both: it blanks before parse, then —
- * after the tree walk has created the real `enum` nodes + hand-written
- * `enum_member` nodes — it synthesizes `enum_member` nodes + `enum->member`
- * `contains` edges for the generated enumerators, deduped against the
- * hand-written ones.
+ * The extractor (tree-sitter.ts) drives both: it blanks before parse, recreates
+ * the blanked definitions as file-owned `macro` nodes from the original text,
+ * then — after the tree walk has created the real `enum` nodes + hand-written
+ * `enum_member` nodes — synthesizes `enum_member` nodes + `enum->member`
+ * `contains` edges for generated enumerators, deduped against hand-written
+ * ones.
  *
  * All offsets are JavaScript string indices, matching tree-sitter's
  * `startIndex`/`endIndex` (the codebase reads source via
@@ -93,22 +97,43 @@ export interface XMacroConstruct {
   /** Formal parameter names (leading identifier of each formal). */
   formals: string[];
   /**
-   * Index into `formals` of the parameter the replacement places at the
-   * enumerator-name position. -1 means the replacement was ambiguous/invalid
-   * (stringify, token paste, multi-candidate, no formal at the name spot): the
-   * construct is rejected entirely — directives left untouched, nothing
-   * blanked and no members synthesized — so unprovable input is not altered.
+   * Index into `formals` of the parameter a direct replacement places at the
+   * enumerator-name position. Arity-dispatched constructs use -1 here and
+   * provide `arityRules` instead.
    */
   nameParamIndex: number;
+  /** Per-call-arity name positions proven through dispatcher helper macros. */
+  arityRules?: XMacroArityRule[];
   /** Raw replacement body text (trimmed, trailing line comments stripped). */
   replacement: string;
   /** Source range of the enum body, including its braces. */
   enumBodyStart: number;
   enumBodyEnd: number;
-  /** The three directive ranges (define, include, undef), in source order. */
+  /** Every define/include/undef range that must be blanked, in source order. */
   directiveRanges: XMacroDirectiveRange[];
+  /** Function-like macro definitions blanked from the parser input. */
+  macroDefinitions?: XMacroDefinition[];
   /** Proven data-list calls used to synthesize the enum members. */
   calls: XMacroCall[];
+}
+
+/** Original-source coordinates for one blanked X-macro definition. */
+export interface XMacroDefinition {
+  name: string;
+  /** Offset of the directive's `#`. */
+  start: number;
+  /** Offset just after the directive, excluding its terminating newline. */
+  end: number;
+  /** Offset of the macro-name token. */
+  nameStart: number;
+}
+
+/** A proven mapping from a dispatcher call's arity to its enumerator argument. */
+export interface XMacroArityRule {
+  arity: number;
+  nameParamIndex: number;
+  /** Helper selected for this arity, retained for diagnostics/auditability. */
+  helperMacroName: string;
 }
 
 export interface XMacroDetectionResult {
@@ -138,6 +163,7 @@ const MAX_CALLS = 8192;
 const MAX_ARGS = 256;
 const MAX_MEMBERS = 8192;
 const MAX_PAREN_DEPTH = 512;
+const MAX_REGION_MACROS = 256;
 
 const isIdentStart = (c: string): boolean => /[A-Za-z_]/.test(c);
 const isIdentPart = (c: string): boolean => /[A-Za-z0-9_]/.test(c);
@@ -210,8 +236,12 @@ interface ParsedDirective {
   end: number;
   /** Macro name (define/undef). */
   name?: string;
+  /** Offset of the macro-name token (define only). */
+  nameStart?: number;
   isFunctionLike?: boolean;
   formals?: string[];
+  /** Variadic argument token: GNU `args...` or standard `__VA_ARGS__`. */
+  variadicFormal?: string;
   /** Raw replacement text (define), trimmed, trailing line comment stripped. */
   replacement?: string;
   /** Include path for a quote include. */
@@ -240,6 +270,7 @@ function parseDirective(source: string, hash: number, dirEnd: number): ParsedDir
     const name = source.slice(ns, i);
     let isFunctionLike = false;
     let formals: string[] = [];
+    let variadicFormal: string | undefined;
     // Function-like iff `(` immediately follows the name (no space).
     if (i < dirEnd && at(i) === '(') {
       isFunctionLike = true;
@@ -254,16 +285,38 @@ function parseDirective(source: string, hash: number, dirEnd: number): ParsedDir
       }
       const formalsText = source.slice(fstart, i);
       i++; // consume `)`
-      formals = formalsText
-        .split(',')
+      const formalSegments = formalsText.split(',');
+      formals = formalSegments
         .map(leadingIdent)
         .filter((f) => f.length > 0);
+      for (const segment of formalSegments) {
+        const trimmed = segment.trim();
+        if (trimmed === '...') {
+          variadicFormal = '__VA_ARGS__';
+          break;
+        }
+        const variadic = trimmed.match(/^([A-Za-z_]\w*)\s*\.\.\.$/);
+        if (variadic) {
+          variadicFormal = variadic[1]!;
+          break;
+        }
+      }
     }
     let rep = source.slice(i, dirEnd).replace(/\\\r?\n/g, ' ').trim();
     // Strip a trailing line comment so `name, // note` → `name,`.
     const lc = rep.indexOf('//');
     if (lc !== -1) rep = rep.slice(0, lc).trim();
-    return { kind: 'define', start: hash, end: dirEnd, name, isFunctionLike, formals, replacement: rep };
+    return {
+      kind: 'define',
+      start: hash,
+      end: dirEnd,
+      name,
+      nameStart: ns,
+      isFunctionLike,
+      formals,
+      variadicFormal,
+      replacement: rep,
+    };
   }
 
   if (keyword === 'include') {
@@ -453,6 +506,108 @@ function analyzeReplacement(formals: string[], replacement: string): number {
   return candidateCount === 1 ? candidate : -1;
 }
 
+interface ArityDispatcherShape {
+  prefix: string;
+}
+
+interface ArityDispatcherAnalysis {
+  rules: XMacroArityRule[];
+  helperDefinitions: ParsedDirective[];
+}
+
+/** Escape a literal identifier for interpolation into a regular expression. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Recognize the deliberately narrow arity-dispatch shape used by X-macro
+ * enums such as:
+ *
+ *   #define ITEM(args...) CAT(ITEM_, NARGS(args))(args)
+ *
+ * The function names (`CAT`, `NARGS`) are intentionally not hard-coded, but
+ * the nested-call structure, variadic forwarding, and helper prefix are
+ * exact. This keeps the recovery conservative without tying it to OceanBase.
+ */
+function parseArityDispatcherShape(define: ParsedDirective): ArityDispatcherShape | null {
+  const variadic = define.variadicFormal;
+  if (!variadic) return null;
+  const expectedFormals = variadic === '__VA_ARGS__' ? 0 : 1;
+  if (
+    define.formals?.length !== expectedFormals ||
+    (expectedFormals === 1 && define.formals[0] !== variadic)
+  ) return null;
+
+  const ident = '([A-Za-z_]\\w*)';
+  const arg = escapeRegExp(variadic);
+  const pattern = new RegExp(
+    `^\\s*${ident}\\s*\\(\\s*${ident}\\s*,\\s*${ident}\\s*\\(\\s*${arg}\\s*\\)\\s*\\)\\s*` +
+    `\\(\\s*${arg}\\s*\\)\\s*$`,
+  );
+  const match = (define.replacement ?? '').match(pattern);
+  if (!match) return null;
+  return { prefix: match[2]! };
+}
+
+/**
+ * Prove all helpers selected by one arity dispatcher. Every helper must:
+ *   - be named `<prefix><arity>` with a positive decimal arity,
+ *   - declare exactly that many formals,
+ *   - place exactly one formal at the enumerator-name position, and
+ *   - have a matching #undef after the self-include.
+ *
+ * Requiring at least two helpers distinguishes a real arity dispatcher from
+ * an incidental wrapper and is sufficient for the common 1/2/3-argument
+ * X-macro family.
+ */
+function analyzeArityDispatcher(
+  dispatcher: ParsedDirective,
+  shape: ArityDispatcherShape,
+  definitions: ParsedDirective[],
+  undefByName: Map<string, ParsedDirective>,
+): ArityDispatcherAnalysis | null {
+  if (!dispatcher.name || !undefByName.has(dispatcher.name)) return null;
+
+  const helperPattern = new RegExp(`^${escapeRegExp(shape.prefix)}([1-9]\\d*)$`);
+  const helperDefinitions = definitions.filter((define) =>
+    Boolean(define.name && helperPattern.test(define.name)));
+  if (helperDefinitions.length < 2) return null;
+
+  const rules: XMacroArityRule[] = [];
+  const seenArities = new Set<number>();
+  for (const helper of helperDefinitions) {
+    const match = helper.name!.match(helperPattern);
+    const arity = Number(match?.[1]);
+    if (
+      !Number.isSafeInteger(arity) ||
+      arity < 1 ||
+      arity > MAX_ARGS ||
+      seenArities.has(arity) ||
+      helper.formals?.length !== arity ||
+      !undefByName.has(helper.name!)
+    ) {
+      return null;
+    }
+    const nameParamIndex = analyzeReplacement(helper.formals, helper.replacement ?? '');
+    if (nameParamIndex < 0) return null;
+    seenArities.add(arity);
+    rules.push({ arity, nameParamIndex, helperMacroName: helper.name! });
+  }
+
+  rules.sort((a, b) => a.arity - b.arity);
+  return { rules, helperDefinitions };
+}
+
+function toXMacroDefinition(directive: ParsedDirective): XMacroDefinition {
+  return {
+    name: directive.name!,
+    start: directive.start,
+    end: directive.end,
+    nameStart: directive.nameStart!,
+  };
+}
+
 interface EnumFrame {
   kind: 'enum' | 'other';
   bodyStart: number; // offset of `{`
@@ -461,7 +616,7 @@ interface EnumFrame {
 
 /**
  * Detect self-include X-macro constructs in enum bodies and return the source
- * with the recognized three-directive lines blanked (length-preserving).
+ * with every directive in each proven region blanked (length-preserving).
  */
 export function detectXMacroConstructs(
   source: string,
@@ -523,6 +678,7 @@ export function detectXMacroConstructs(
         enumBodyRanges.push({ start: frame.bodyStart, end: i + 1 });
         const found = analyzeEnumDirectives(frame, i, filePath);
         for (const con of found) {
+          if (candidates.length >= MAX_CONSTRUCTS) break;
           candidates.push(con);
         }
       }
@@ -533,8 +689,8 @@ export function detectXMacroConstructs(
     i++;
   }
 
-  // Blank any construct whose replacement provably names one formal as the
-  // enumerator (nameParamIndex >= 0): the three directives would otherwise make
+  // Blank any construct whose direct replacement or arity helpers provably
+  // name one call argument as the enumerator: the directives would otherwise make
   // tree-sitter swallow the whole enum_specifier, dropping the enum and its
   // hand-written members. Generated members are synthesized only when the
   // self-included source has at least one provably-active guarded data-list
@@ -544,12 +700,13 @@ export function detectXMacroConstructs(
   const constructs: XMacroConstruct[] = [];
   const blankRanges: XMacroDirectiveRange[] = [];
   for (const candidate of candidates) {
-    if (candidate.nameParamIndex < 0) continue;
+    if (candidate.nameParamIndex < 0 && !candidate.arityRules?.length) continue;
     const calls = scanXMacroCalls(
       source,
       candidate.macroName,
       candidate.nameParamIndex,
       enumBodyRanges,
+      candidate.arityRules,
     );
     const accepted = { ...candidate, calls };
     constructs.push(accepted);
@@ -566,9 +723,10 @@ export function detectXMacroConstructs(
 }
 
 /**
- * Run the define→include→undef state machine over one enum body's directives
- * (in source order) and emit a construct for each complete, self-include
- * triple with a consistent macro name.
+ * Analyze self-include regions in one enum body. A region is a consecutive
+ * group of function-like defines, one quote self-include, and a consecutive
+ * group of undefs. It may describe independent direct X-macros or a variadic
+ * entry macro plus arity helpers.
  */
 function analyzeEnumDirectives(
   frame: EnumFrame,
@@ -577,69 +735,118 @@ function analyzeEnumDirectives(
 ): XMacroConstruct[] {
   const found: XMacroConstruct[] = [];
   const dirs = frame.directives;
-  type State = 'need_define' | 'need_include' | 'need_undef';
-  let state: State = 'need_define';
-  let curDefine: ParsedDirective | null = null;
-  let curInclude: ParsedDirective | null = null;
-
-  const reset = (): void => {
-    state = 'need_define';
-    curDefine = null;
-    curInclude = null;
-  };
-
-  for (const d of dirs) {
-    if (d.kind === 'define' && d.isFunctionLike && d.name) {
-      // (Re)start a candidate at this function-like define.
-      curDefine = d;
-      curInclude = null;
-      state = 'need_include';
-      continue;
-    }
-    if (d.kind === 'include' && state === 'need_include' && curInclude === null) {
-      curInclude = d;
-      state = 'need_undef';
-      continue;
-    }
+  for (let includeIndex = 0; includeIndex < dirs.length; includeIndex++) {
+    const include = dirs[includeIndex]!;
     if (
-      d.kind === 'undef' &&
-      state === 'need_undef' &&
-      d.name &&
-      curDefine &&
-      curDefine.name === d.name &&
-      curInclude
-    ) {
-      // Complete shape (define M + include + undef M). Validate self-include.
-      if (
-        curInclude.isQuoteInclude &&
-        curInclude.includePath &&
-        isSelfInclude(curInclude.includePath, filePath)
-      ) {
-        const nameParamIndex = analyzeReplacement(
-          curDefine.formals ?? [],
-          curDefine.replacement ?? '',
-        );
-        found.push({
-          macroName: curDefine.name!,
-          formals: curDefine.formals ?? [],
-          nameParamIndex,
-          replacement: curDefine.replacement ?? '',
-          enumBodyStart: frame.bodyStart,
-          enumBodyEnd: braceClose + 1,
-          directiveRanges: [
-            { start: curDefine.start, end: curDefine.end },
-            { start: curInclude.start, end: curInclude.end },
-            { start: d.start, end: d.end },
-          ],
-          calls: [],
-        });
-      }
-      reset();
-      continue;
+      include.kind !== 'include' ||
+      !include.isQuoteInclude ||
+      !include.includePath ||
+      !isSelfInclude(include.includePath, filePath)
+    ) continue;
+
+    let defineStart = includeIndex;
+    while (defineStart > 0) {
+      const previous = dirs[defineStart - 1]!;
+      if (previous.kind !== 'define' || !previous.isFunctionLike || !previous.name) break;
+      defineStart--;
     }
-    // Any other directive (conditional, pragma, system include, object-like
-    // define, mismatched undef) breaks the candidate — be conservative.
-    if (state !== 'need_define') reset();
+    const definitions = dirs.slice(defineStart, includeIndex);
+    if (definitions.length === 0 || definitions.length > MAX_REGION_MACROS) continue;
+
+    let undefEnd = includeIndex + 1;
+    while (undefEnd < dirs.length && dirs[undefEnd]!.kind === 'undef' && dirs[undefEnd]!.name) {
+      undefEnd++;
+    }
+    const undefs = dirs.slice(includeIndex + 1, undefEnd);
+    if (undefs.length === 0 || undefs.length > MAX_REGION_MACROS) continue;
+
+    const defineByName = new Map<string, ParsedDirective>();
+    const undefByName = new Map<string, ParsedDirective>();
+    let ambiguous = false;
+    for (const define of definitions) {
+      if (!define.name || defineByName.has(define.name)) { ambiguous = true; break; }
+      defineByName.set(define.name, define);
+    }
+    for (const undef of undefs) {
+      if (!undef.name || undefByName.has(undef.name)) { ambiguous = true; break; }
+      undefByName.set(undef.name, undef);
+    }
+    if (ambiguous) continue;
+    const regionCandidates: XMacroConstruct[] = [];
+
+    // Dispatcher helpers must not be mistaken for independent entry macros,
+    // even if an incomplete dispatcher is conservatively rejected.
+    const dispatcherShapes = new Map<ParsedDirective, ArityDispatcherShape>();
+    const claimedHelperNames = new Set<string>();
+    for (const define of definitions) {
+      const shape = parseArityDispatcherShape(define);
+      if (!shape) continue;
+      dispatcherShapes.set(define, shape);
+      const helperPattern = new RegExp(`^${escapeRegExp(shape.prefix)}[1-9]\\d*$`);
+      for (const possibleHelper of definitions) {
+        if (possibleHelper.name && helperPattern.test(possibleHelper.name)) {
+          claimedHelperNames.add(possibleHelper.name);
+        }
+      }
+    }
+
+    const dispatcherNames = new Set<string>();
+    for (const [dispatcher, shape] of dispatcherShapes) {
+      const analysis = analyzeArityDispatcher(dispatcher, shape, definitions, undefByName);
+      if (!analysis || !dispatcher.name) continue;
+      dispatcherNames.add(dispatcher.name);
+      const ownedDefinitions = [dispatcher, ...analysis.helperDefinitions];
+      const ranges = [
+        ...ownedDefinitions.map((define) => ({ start: define.start, end: define.end })),
+        { start: include.start, end: include.end },
+        ...ownedDefinitions.map((define) => {
+          const undef = undefByName.get(define.name!)!;
+          return { start: undef.start, end: undef.end };
+        }),
+      ].sort((a, b) => a.start - b.start);
+      regionCandidates.push({
+        macroName: dispatcher.name,
+        formals: dispatcher.formals ?? [],
+        nameParamIndex: -1,
+        arityRules: analysis.rules,
+        replacement: dispatcher.replacement ?? '',
+        enumBodyStart: frame.bodyStart,
+        enumBodyEnd: braceClose + 1,
+        directiveRanges: ranges,
+        macroDefinitions: ownedDefinitions.map(toXMacroDefinition),
+        calls: [],
+      });
+    }
+
+    // Preserve the established direct form and allow multiple independent
+    // direct macros to share one self-include.
+    for (const define of definitions) {
+      if (
+        !define.name ||
+        dispatcherNames.has(define.name) ||
+        claimedHelperNames.has(define.name)
+      ) continue;
+      const undef = undefByName.get(define.name);
+      if (!undef) continue;
+      const nameParamIndex = analyzeReplacement(define.formals ?? [], define.replacement ?? '');
+      if (nameParamIndex < 0) continue;
+      regionCandidates.push({
+        macroName: define.name,
+        formals: define.formals ?? [],
+        nameParamIndex,
+        replacement: define.replacement ?? '',
+        enumBodyStart: frame.bodyStart,
+        enumBodyEnd: braceClose + 1,
+        directiveRanges: [
+          { start: define.start, end: define.end },
+          { start: include.start, end: include.end },
+          { start: undef.start, end: undef.end },
+        ],
+        macroDefinitions: [toXMacroDefinition(define)],
+        calls: [],
+      });
+    }
+    found.push(...regionCandidates);
   }
 
   return found;
@@ -916,8 +1123,9 @@ export function scanXMacroCalls(
   macroName: string,
   nameParamIndex: number,
   excludeRanges: { start: number; end: number }[],
+  arityRules?: XMacroArityRule[],
 ): XMacroCall[] {
-  if (nameParamIndex < 0) return [];
+  if (nameParamIndex < 0 && !arityRules?.length) return [];
   const calls: XMacroCall[] = [];
   const n = source.length;
   const at = (idx: number): string => (idx >= 0 && idx < n) ? source[idx]! : '';
@@ -925,6 +1133,9 @@ export function scanXMacroCalls(
   const excludes = mergeRanges(excludeRanges);
   const guardRanges = collectPositiveMacroGuardRanges(source, macroName);
   if (guardRanges.length === 0) return [];
+  const nameParamIndexByArity = arityRules?.length
+    ? new Map(arityRules.map((rule) => [rule.arity, rule.nameParamIndex]))
+    : undefined;
   const seen = new Set<string>();
   let exIdx = 0;
   let i = 0;
@@ -993,8 +1204,11 @@ export function scanXMacroCalls(
             if (ok) {
               callCount++;
               if (callCount > MAX_CALLS) break;
-              if (nameParamIndex < args.length) {
-                const nameArg = identifierArgument(args[nameParamIndex]!);
+              const selectedNameParamIndex = nameParamIndexByArity
+                ? nameParamIndexByArity.get(args.length)
+                : nameParamIndex;
+              if (selectedNameParamIndex !== undefined && selectedNameParamIndex < args.length) {
+                const nameArg = identifierArgument(args[selectedNameParamIndex]!);
                 if (nameArg && !seen.has(nameArg)) {
                   const line = lineOf(lineStarts, i);
                   const lineOffset = lineStarts[line - 1] ?? i;
@@ -1102,7 +1316,13 @@ function parseCallArgs(
   return { args, end: p, ok: true };
 }
 
-export const XMACRO_LIMITS = { MAX_CALLS, MAX_ARGS, MAX_MEMBERS, MAX_CONSTRUCTS } as const;
+export const XMACRO_LIMITS = {
+  MAX_CALLS,
+  MAX_ARGS,
+  MAX_MEMBERS,
+  MAX_CONSTRUCTS,
+  MAX_REGION_MACROS,
+} as const;
 
 /** Whether a language participates in X-macro enum recovery (C/C++ only). */
 export function xmacroSupported(language: Language | undefined): boolean {

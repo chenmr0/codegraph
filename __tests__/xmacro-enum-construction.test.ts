@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { CodeGraph } from '../src';
 import { extractFromSource } from '../src/extraction';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
+import { detectXMacroConstructs } from '../src/extraction/xmacro';
 
 type Extracted = ReturnType<typeof extractFromSource>;
 
@@ -64,6 +65,11 @@ enum EventCode {
       expect(member?.signature).toContain(`EVENT_ITEM(${name}`);
       expect(member?.docstring).toContain('self-including X-macro EVENT_ITEM');
     }
+    const [macro] = nodes(result, 'macro', 'EVENT_ITEM');
+    expect(macro?.signature).toBe('#define EVENT_ITEM(name, metadata, description) name,');
+    const fileNode = nodes(result, 'file')[0]!;
+    expect(result.edges.some((edge) =>
+      edge.kind === 'contains' && edge.source === fileNode.id && edge.target === macro?.id)).toBe(true);
   });
 
   it('supports a non-first name parameter, continued definition, and multiline call', () => {
@@ -98,6 +104,112 @@ struct Owner {
     ]);
     expect(nodes(result, 'enum_member', 'COMMENT_ONLY')).toHaveLength(0);
     expect(nodes(result, 'enum_member', 'STRING_ONLY')).toHaveLength(0);
+    const [macro] = nodes(result, 'macro', 'ROW');
+    expect(macro?.signature).toContain('#define ROW(metadata, name) \\\n  name,');
+    expect(macro?.endLine).toBe((macro?.startLine ?? 0) + 1);
+  });
+
+  it('keeps direct recovery when an unrelated function-like define is adjacent', () => {
+    const source = `
+#ifdef ITEM
+ITEM(VALUE)
+#endif
+enum E {
+#define UNUSED(x) x
+#define ITEM(name) name,
+#include "self.h"
+#undef ITEM
+};
+`;
+    const result = extractFromSource('self.h', source, 'c');
+    expect(containedMemberNames(result, 'E')).toEqual(['VALUE']);
+    expect(nodes(result, 'macro', 'ITEM')).toHaveLength(1);
+  });
+
+  it('recovers a variadic arity dispatcher with multiple enum helpers', () => {
+    const source = `
+#ifdef DEF_FLAG
+DEF_FLAG(FIRST, 0x0)
+DEF_FLAG(SECOND)
+DEF_FLAG(THIRD, 42)
+#endif
+
+enum Flag {
+  Existing,
+#define DEF_FLAG(args...) CONCAT(DEF_FLAG_, ARGS_NUM(args))(args)
+#define DEF_FLAG_1(flag) flag,
+#define DEF_FLAG_2(flag, value) flag = value,
+#include "flag.h"
+#undef DEF_FLAG_2
+#undef DEF_FLAG_1
+#undef DEF_FLAG
+  End
+};
+`;
+    const result = extractFromSource('flag.h', source, 'cpp');
+    expect(containedMemberNames(result, 'Flag')).toEqual([
+      'Existing',
+      'End',
+      'FIRST',
+      'SECOND',
+      'THIRD',
+    ]);
+    expect(nodes(result, 'enum_member', 'FIRST')[0]?.signature).toBe('DEF_FLAG(FIRST, 0x0)');
+    expect(nodes(result, 'enum_member', 'SECOND')[0]?.signature).toBe('DEF_FLAG(SECOND)');
+    const macros = result.nodes
+      .filter((node) => node.kind === 'macro' && node.name.startsWith('DEF_FLAG'))
+      .sort((a, b) => a.startLine - b.startLine);
+    expect(macros.map((node) => node.name)).toEqual(['DEF_FLAG', 'DEF_FLAG_1', 'DEF_FLAG_2']);
+    expect(macros[0]?.signature).toContain('CONCAT(DEF_FLAG_, ARGS_NUM(args))(args)');
+    const fileNode = nodes(result, 'file')[0]!;
+    const enumNode = nodes(result, 'enum', 'Flag')[0]!;
+    for (const macro of macros) {
+      expect(result.edges.some((edge) =>
+        edge.kind === 'contains' && edge.source === fileNode.id && edge.target === macro.id)).toBe(true);
+      expect(result.edges.some((edge) =>
+        edge.kind === 'contains' && edge.source === enumNode.id && edge.target === macro.id)).toBe(false);
+    }
+  });
+
+  it('selects the enum-name argument independently for each dispatched arity', () => {
+    const source = `
+#ifdef ENTRY
+ENTRY(ONE)
+ENTRY(99, TWO)
+#endif
+enum E {
+#define ENTRY(...) JOIN(ENTRY_, COUNT(__VA_ARGS__))(__VA_ARGS__)
+#define ENTRY_1(name) name,
+#define ENTRY_2(value, name) name = value,
+#include "self.h"
+#undef ENTRY_2
+#undef ENTRY_1
+#undef ENTRY
+};
+`;
+    const result = extractFromSource('self.h', source, 'c');
+    expect(containedMemberNames(result, 'E')).toEqual(['ONE', 'TWO']);
+    expect(nodes(result, 'enum_member', '99')).toHaveLength(0);
+  });
+
+  it('rejects an arity dispatcher unless every helper has matching cleanup', () => {
+    const source = `
+#ifdef ENTRY
+ENTRY(ONE)
+ENTRY(TWO, 2)
+#endif
+enum E {
+#define ENTRY(args...) JOIN(ENTRY_, COUNT(args))(args)
+#define ENTRY_1(name) name,
+#define ENTRY_2(name, value) name = value,
+#include "self.h"
+#undef ENTRY_1
+#undef ENTRY
+};
+`;
+    const detection = detectXMacroConstructs(source, 'self.h');
+    expect(detection.constructs).toHaveLength(0);
+    expect(detection.blankedSource).toBe(source);
   });
 
   it('deduplicates a generated name already present in the enum', () => {
@@ -258,8 +370,11 @@ enum Status {
         expect(enumNode).toBeDefined();
         const ready = graph!.getNodesByName('READY').filter((node) => node.kind === 'enum_member');
         const running = graph!.getNodesByName('RUNNING').filter((node) => node.kind === 'enum_member');
+        const macros = graph!.getNodesByName('STATUS_ITEM').filter((node) => node.kind === 'macro');
         expect(ready).toHaveLength(1);
         expect(running).toHaveLength(1);
+        expect(macros).toHaveLength(1);
+        expect(macros[0]!.signature).toBe('#define STATUS_ITEM(name) name,');
         const outgoing = graph!.getOutgoingEdges(enumNode!.id);
         expect(outgoing.some((edge) => edge.kind === 'contains' && edge.target === ready[0]!.id)).toBe(true);
         expect(outgoing.some((edge) => edge.kind === 'contains' && edge.target === running[0]!.id)).toBe(true);
@@ -369,7 +484,10 @@ enum Second {
       // independent SHARED_A nodes, each contained by its own enum
       const assertTwoIndependent = () => {
         const sharedA = graph!.getNodesByName('SHARED_A').filter((n) => n.kind === 'enum_member');
+        const macros = graph!.getNodesByName('ITEM').filter((n) => n.kind === 'macro');
         expect(sharedA).toHaveLength(2);
+        expect(macros).toHaveLength(2);
+        expect(macros[0]!.id).not.toBe(macros[1]!.id);
         expect(sharedA[0]!.id).not.toBe(sharedA[1]!.id);
         const firstEnum = graph!.getNodesByName('First').find((n) => n.kind === 'enum');
         const secondEnum = graph!.getNodesByName('Second').find((n) => n.kind === 'enum');

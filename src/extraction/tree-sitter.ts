@@ -431,7 +431,7 @@ export class TreeSitterExtractor {
       // A self-including X-macro enum is recoverable without a filesystem or a
       // full preprocessor because both the macro data list and the enum live in
       // this source string. Analyze the original bytes first; only complete,
-      // provable constructs have their three directive lines blanked.
+      // provable constructs have their owned directive lines blanked.
       if (xmacroSupported(this.language)) {
         const xmacro = detectXMacroConstructs(this.originalSource, this.filePath);
         this.source = xmacro.blankedSource;
@@ -470,6 +470,11 @@ export class TreeSitterExtractor {
 
       // Push file node onto stack so top-level declarations get contains edges
       this.nodeStack.push(fileNode.id);
+
+      // The parser input has proven X-macro definitions blanked so the enum
+      // grammar can recover. Recreate those definitions from originalSource as
+      // ordinary file-owned macro nodes before walking the transformed tree.
+      this.recoverXMacroMacros();
 
       // Collect `#define` macro names for misparse filtering. C/C++ parsers
       // lack a preprocessor: when a macro invocation has the shape
@@ -1100,6 +1105,53 @@ export class TreeSitterExtractor {
       this.edges.push({ source: parentId, target: id, kind: 'contains' });
     }
     return newNode;
+  }
+
+  /** Recreate X-macro definitions removed from the parser input by blanking. */
+  private recoverXMacroMacros(): void {
+    if (this.xMacroConstructs.length === 0) return;
+
+    const lineStarts = [0];
+    for (let i = 0; i < this.originalSource.length; i++) {
+      if (this.originalSource[i] === '\n') lineStarts.push(i + 1);
+    }
+    const positionAt = (offset: number): { line: number; column: number } => {
+      let lo = 0;
+      let hi = lineStarts.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (lineStarts[mid]! <= offset) lo = mid + 1;
+        else hi = mid;
+      }
+      const lineIndex = Math.max(0, lo - 1);
+      return { line: lineIndex + 1, column: offset - lineStarts[lineIndex]! };
+    };
+
+    const seen = new Set<string>();
+    for (const construct of this.xMacroConstructs) {
+      for (const definition of construct.macroDefinitions ?? []) {
+        const key = `${definition.nameStart}:${definition.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        let directiveEnd = definition.end;
+        if (this.originalSource[directiveEnd - 1] === '\r') directiveEnd--;
+        const start = positionAt(definition.start);
+        const end = positionAt(directiveEnd);
+        this.createSyntheticNode(
+          'macro',
+          definition.name,
+          start.line,
+          start.column,
+          end.column,
+          {
+            endLine: end.line,
+            signature: this.originalSource.slice(definition.start, directiveEnd),
+            isExported: true,
+          },
+        );
+      }
+    }
   }
 
   /**
