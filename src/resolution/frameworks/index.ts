@@ -85,11 +85,15 @@ export function getFrameworkResolver(name: string): FrameworkResolver | undefine
 /**
  * Detect which frameworks are used in a project
  */
-export function detectFrameworks(context: ResolutionContext): FrameworkResolver[] {
+export function detectFrameworks(
+  context: ResolutionContext,
+  onError?: (framework: string, error: unknown) => void
+): FrameworkResolver[] {
   return FRAMEWORK_RESOLVERS.filter((resolver) => {
     try {
       return resolver.detect(context);
-    } catch {
+    } catch (error) {
+      onError?.(resolver.name, error);
       return false;
     }
   });

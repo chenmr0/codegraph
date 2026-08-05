@@ -215,6 +215,7 @@ export class ReferenceResolver {
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  private frameworkDiagnostics: import('./types').ResolutionDiagnostic[] = [];
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
   // collected in-memory (the batched resolver deletes unresolved refs from the
   // DB, so they can't be re-read). Drained by resolveChainedCallsViaConformance
@@ -279,7 +280,16 @@ export class ReferenceResolver {
    * Initialize the resolver (detect frameworks, etc.)
    */
   initialize(): void {
-    this.frameworks = detectFrameworks(this.context);
+    this.frameworkDiagnostics = [];
+    this.frameworks = detectFrameworks(this.context, (framework, error) => {
+      this.frameworkDiagnostics.push({
+        severity: 'error',
+        code: 'framework_detection_failed',
+        message: `Framework detection '${framework}' failed: ` +
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          `The index may be incomplete.`,
+      });
+    });
     this.clearCaches();
   }
 
@@ -303,9 +313,14 @@ export class ReferenceResolver {
           updated++;
         }
       } catch (err) {
-        logDebug(`Framework '${fw.name}' postExtract failed`, {
-          error: err instanceof Error ? err.message : String(err),
+        const error = err instanceof Error ? err.message : String(err);
+        this.frameworkDiagnostics.push({
+          severity: 'error',
+          code: 'framework_post_extract_failed',
+          message: `Framework post-processing '${fw.name}' failed: ${error}. ` +
+            `The index may be incomplete.`,
         });
+        logDebug(`Framework '${fw.name}' postExtract failed`, { error });
       }
     }
     if (updated > 0) this.clearCaches();
@@ -1236,13 +1251,25 @@ export class ReferenceResolver {
     this.clearCaches();
     await new Promise(resolve => setImmediate(resolve));
     const synthesisStartedAt = Date.now();
+    const diagnostics: import('./types').ResolutionDiagnostic[] =
+      this.frameworkDiagnostics.splice(0);
     try {
-      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
+      const synthesis = await synthesizeCallbackEdges(
         this.queries,
         this.context
       );
-    } catch {
-      // synthesis is additive and optional; ignore failures
+      aggregateStats.byMethod['callback-synthesis'] = synthesis.edgesAdded;
+      diagnostics.push(...synthesis.diagnostics);
+    } catch (error) {
+      const message = `Dynamic-edge synthesis failed: ` +
+        `${error instanceof Error ? error.message : String(error)}. ` +
+        `The index is incomplete.`;
+      console.error(`[CodeGraph] ${message}`);
+      diagnostics.push({
+        severity: 'error',
+        code: 'synthesis_failed',
+        message,
+      });
     }
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
       console.error(
@@ -1255,6 +1282,7 @@ export class ReferenceResolver {
       resolved: [],
       unresolved: [],
       stats: aggregateStats,
+      diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
     };
   }
 

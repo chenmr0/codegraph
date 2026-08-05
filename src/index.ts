@@ -211,7 +211,15 @@ export class CodeGraph {
 
     // Run initial indexing if requested
     if (options.index) {
-      await instance.indexAll({ onProgress: options.onProgress });
+      const result = await instance.indexAll({ onProgress: options.onProgress });
+      if (!result.success || result.complete === false) {
+        instance.destroy();
+        const errors = result.errors.filter((diagnostic) => diagnostic.severity === 'error');
+        const detail = (errors.length > 0 ? errors : result.errors)
+          .map((diagnostic) => diagnostic.message)
+          .join('; ');
+        throw new Error(detail || 'Initial indexing failed');
+      }
     }
 
     return instance;
@@ -391,6 +399,7 @@ export class CodeGraph {
           let bulkFtsStarted = false;
           let parseIndexesDeferred = false;
           let result: IndexResult;
+          let resolutionDiagnostics: NonNullable<ResolutionResult['diagnostics']> = [];
           try {
             if (bulkFts) {
               this.db.beginBulkNodeLoad();
@@ -456,7 +465,7 @@ export class CodeGraph {
               total: unresolvedCount,
             });
 
-            await this.resolveReferencesBatched(
+            const resolution = await this.resolveReferencesBatched(
               (current, total) => {
                 options.onProgress?.({
                   phase: 'resolving',
@@ -472,6 +481,7 @@ export class CodeGraph {
                 });
               }
             );
+            resolutionDiagnostics = resolution.diagnostics ?? [];
 
             // Second pass: chained calls whose method lives on a supertype the
             // receiver conforms to (protocol-extension / inherited / default-
@@ -509,6 +519,43 @@ export class CodeGraph {
               this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
             } catch { /* metadata is advisory — never fail an index over it */ }
           }
+
+          // Never collapse an incomplete resolution/synthesis tail into a
+          // successful full-index result. Explicit opt-outs remain warnings,
+          // while automatic skips and pass failures make the command fail.
+          if (resolutionDiagnostics.length > 0) {
+            result.errors.push(...resolutionDiagnostics);
+          }
+          const hasGlobalError = result.errors.some(
+            (diagnostic) => diagnostic.severity === 'error' && !diagnostic.filePath
+          );
+          result.complete =
+            result.success && result.filesErrored === 0 && !hasGlobalError &&
+            resolutionDiagnostics.length === 0;
+          if (hasGlobalError) {
+            result.success = false;
+          }
+          try {
+            this.queries.setMetadata(
+              'index_completeness',
+              result.complete ? 'complete' : 'incomplete'
+            );
+            this.queries.setMetadata(
+              'index_diagnostics',
+              result.complete
+                ? '[]'
+                : JSON.stringify([
+                    ...result.errors.filter((diagnostic) => !diagnostic.filePath),
+                    ...(result.filesErrored > 0
+                      ? [{
+                          severity: 'error',
+                          code: 'files_not_indexed',
+                          message: `${result.filesErrored} files could not be indexed.`,
+                        }]
+                      : []),
+                  ])
+            );
+          } catch { /* the returned diagnostics remain authoritative */ }
 
           return result;
         } finally {
@@ -772,6 +819,23 @@ export class CodeGraph {
     const ev = this.queries.getMetadata('indexed_with_extraction_version');
     const parsed = ev != null ? parseInt(ev, 10) : NaN;
     return { version, extractionVersion: Number.isFinite(parsed) ? parsed : null };
+  }
+
+  /** Persisted completeness of the last full index, including visible reasons. */
+  getIndexCompleteness(): {
+    status: 'complete' | 'incomplete' | 'unknown';
+    diagnostics: Array<{ message: string; severity: string; code?: string }>;
+  } {
+    const rawStatus = this.queries.getMetadata('index_completeness');
+    const status = rawStatus === 'complete' || rawStatus === 'incomplete'
+      ? rawStatus
+      : 'unknown';
+    try {
+      const parsed = JSON.parse(this.queries.getMetadata('index_diagnostics') ?? '[]');
+      return { status, diagnostics: Array.isArray(parsed) ? parsed : [] };
+    } catch {
+      return { status, diagnostics: [] };
+    }
   }
 
   /**

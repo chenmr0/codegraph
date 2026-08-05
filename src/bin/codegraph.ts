@@ -301,6 +301,7 @@ function warn(message: string): void {
 
 type IndexResult = {
   success: boolean;
+  complete?: boolean;
   filesIndexed: number;
   filesSkipped: number;
   filesErrored: number;
@@ -314,7 +315,9 @@ type IndexResult = {
  * Print indexing results using clack log methods
  */
 function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
-  const hasErrors = result.filesErrored > 0;
+  const hasFileErrors = result.filesErrored > 0;
+  const globalDiagnostics = result.errors.filter((diagnostic) => !diagnostic.filePath);
+  const warningCount = result.errors.filter((diagnostic) => diagnostic.severity === 'warning').length;
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -327,26 +330,48 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
   // but worth guarding because the result shape is plumbed through
   // multiple call sites), fall back to a generic message rather than
   // continuing to the misleading "No files found" branch or throwing.
-  if (!result.success && !hasErrors && result.filesIndexed === 0) {
+  if (!result.success && !hasFileErrors && result.filesIndexed === 0) {
     const generic = result.errors.find((e) => e.severity === 'error');
     clack.log.error(generic?.message ?? `Indexing failed ${getGlyphs().dash} no further details available`);
     return;
   }
 
   if (result.filesIndexed > 0) {
-    if (hasErrors) {
+    if (!result.success) {
+      clack.log.error(
+        `Indexing incomplete ${getGlyphs().dash} processed ${formatNumber(result.filesIndexed)} files, ` +
+        `but one or more required indexing phases did not finish`
+      );
+    } else if (result.complete === false) {
+      clack.log.warn(
+        `Indexed ${formatNumber(result.filesIndexed)} files with incomplete graph coverage`
+      );
+    } else if (hasFileErrors) {
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.filesErrored)} could not be parsed)`);
     } else {
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
-  } else if (hasErrors) {
+    if (result.filesSkipped > 0) {
+      clack.log.info(
+        `${formatNumber(result.filesSkipped)} files produced no indexable symbols`
+      );
+    }
+  } else if (hasFileErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
     clack.log.warn('No files found to index');
   }
 
-  if (hasErrors) {
+  // Non-file diagnostics include required tail failures such as an automatic
+  // synthesis memory skip. Print them after the progress renderer has stopped
+  // so an animated line can never erase the only warning.
+  for (const diagnostic of globalDiagnostics) {
+    if (diagnostic.severity === 'error') clack.log.error(diagnostic.message);
+    else clack.log.warn(diagnostic.message);
+  }
+
+  if (hasFileErrors || globalDiagnostics.some((diagnostic) => diagnostic.severity === 'error')) {
     const errorsByCode = new Map<string, number>();
     for (const err of result.errors) {
       if (err.severity === 'error') {
@@ -362,21 +387,30 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       path_traversal: 'blocked paths',
       unsupported_language: 'unsupported language',
       parser_error: 'parser initialization failures',
+      synthesis_skipped_memory: 'dynamic-edge synthesis skipped for memory safety',
+      synthesis_stopped_memory: 'dynamic-edge synthesis stopped for memory safety',
+      synthesis_pass_failed: 'dynamic-edge synthesis passes failed',
+      synthesis_failed: 'dynamic-edge synthesis failures',
+      framework_detection_failed: 'framework detection failures',
+      framework_post_extract_failed: 'framework post-processing failures',
     };
 
     const breakdown = Array.from(errorsByCode)
       .map(([code, count]) => `${formatNumber(count)} ${codeLabels[code] || code}`)
       .join('\n');
-    clack.note(breakdown, 'Error breakdown');
+    if (breakdown) clack.note(breakdown, 'Error breakdown');
 
     if (projectPath) {
       writeErrorLog(projectPath, result.errors);
       clack.log.info('See .codegraph/errors.log for details');
     }
 
-    if (result.filesIndexed > 0) {
-      clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
+    if (result.success && result.filesIndexed > 0) {
+      clack.log.info(`The index is usable ${getGlyphs().dash} failed files are missing.`);
     }
+  } else if (warningCount > 0 && projectPath) {
+    writeErrorLog(projectPath, result.errors);
+    clack.log.info('See .codegraph/errors.log for warning details');
   } else if (projectPath) {
     const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
     if (fs.existsSync(logPath)) {
@@ -395,37 +429,36 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
   const logPath = path.join(cgDir, 'errors.log');
 
   // Group errors by file path
-  const errorsByFile = new Map<string, Array<{ message: string; code?: string }>>();
-  const noFileErrors: Array<{ message: string; code?: string }> = [];
+  const errorsByFile = new Map<string, Array<{ message: string; code?: string; severity: string }>>();
+  const noFileErrors: Array<{ message: string; code?: string; severity: string }> = [];
 
   for (const err of errors) {
-    if (err.severity !== 'error') continue;
     if (err.filePath) {
       let list = errorsByFile.get(err.filePath);
       if (!list) {
         list = [];
         errorsByFile.set(err.filePath, list);
       }
-      list.push({ message: err.message, code: err.code });
+      list.push({ message: err.message, code: err.code, severity: err.severity });
     } else {
-      noFileErrors.push({ message: err.message, code: err.code });
+      noFileErrors.push({ message: err.message, code: err.code, severity: err.severity });
     }
   }
 
   const lines: string[] = [
     `CodeGraph Error Log - ${new Date().toISOString()}`,
-    `${errorsByFile.size} files with errors`,
+    `${errorsByFile.size} files with diagnostics`,
     '',
   ];
 
   for (const [filePath, fileErrors] of errorsByFile) {
     for (const err of fileErrors) {
-      lines.push(`${filePath}: ${err.message}`);
+      lines.push(`[${err.severity}] ${filePath}: ${err.message}`);
     }
   }
 
   for (const err of noFileErrors) {
-    lines.push(err.message);
+    lines.push(`[${err.severity}] ${err.message}`);
   }
 
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
@@ -483,6 +516,13 @@ program
         await progress.stop();
       }
       printIndexResult(clack, result, projectPath);
+
+      if (!result.success) {
+        clack.outro('Index incomplete');
+        cg.destroy();
+        process.exitCode = 1;
+        return;
+      }
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -724,6 +764,7 @@ program
       const journalMode = cg.getJournalMode();
 
       const buildInfo = cg.getIndexBuildInfo();
+      const completeness = cg.getIndexCompleteness();
       const reindexRecommended = cg.isIndexStale();
 
       // JSON output mode
@@ -756,6 +797,8 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            completeness: completeness.status,
+            diagnostics: completeness.diagnostics,
           },
         }));
         cg.destroy();
@@ -790,6 +833,18 @@ program
         ? chalk.green('wal')
         : chalk.yellow(`${journalMode || 'unknown'} ${getGlyphs().dash} WAL inactive; reads can block on writes`);
       console.log(`  Journal:   ${journalLabel}`);
+      const completenessLabel = completeness.status === 'complete'
+        ? chalk.green('complete')
+        : completeness.status === 'incomplete'
+          ? chalk.yellow('incomplete')
+          : chalk.yellow('unknown (index predates completeness tracking)');
+      console.log(`  Coverage:  ${completenessLabel}`);
+      if (completeness.status === 'incomplete') {
+        for (const diagnostic of completeness.diagnostics) {
+          warn(diagnostic.message);
+        }
+        info('Run "codegraph index" again to build a complete graph.');
+      }
       console.log();
 
       // Node breakdown

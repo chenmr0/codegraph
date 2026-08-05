@@ -61,7 +61,10 @@ int add(int a, int b) {
     );
 
     const cg = await CodeGraph.init(dir, { silent: true });
-    await cg.indexAll();
+    const result = await cg.indexAll();
+    expect(result.success).toBe(true);
+    expect(result.complete).toBe(true);
+    expect(cg.getIndexCompleteness()).toEqual({ status: 'complete', diagnostics: [] });
     const db = (cg as any).db.db;
     const edges = definesEdges(db);
     cg.close?.();
@@ -99,7 +102,7 @@ int add(int a, int b) {
     }
   });
 
-  it('completes indexing when optional synthesis is disabled for memory safety', async () => {
+  it('reports incomplete coverage when synthesis is explicitly disabled', async () => {
     fs.writeFileSync(path.join(dir, 'safe.h'), 'int safe_api(void);\n');
     fs.writeFileSync(path.join(dir, 'safe.c'), 'int safe_api(void) { return 1; }\n');
 
@@ -112,12 +115,55 @@ int add(int a, int b) {
       const result = await cg.indexAll({ onProgress: (progress) => phases.push(progress.phase) });
       expect(result.nodesCreated).toBeGreaterThan(0);
       expect(phases).toContain('synthesizing');
+      expect(result.success).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          severity: 'warning',
+          code: 'synthesis_disabled',
+        })
+      );
+      expect(cg.getIndexCompleteness()).toMatchObject({
+        status: 'incomplete',
+        diagnostics: [expect.objectContaining({ code: 'synthesis_disabled' })],
+      });
       const db = (cg as any).db.db;
       expect(definesEdges(db).filter((edge) => edge.src_name === 'safe_api')).toEqual([]);
     } finally {
       cg?.close?.();
       if (previous === undefined) delete process.env.CODEGRAPH_NO_SYNTHESIS;
       else process.env.CODEGRAPH_NO_SYNTHESIS = previous;
+    }
+  });
+
+  it('returns a non-success result when a synthesis pass fails', async () => {
+    fs.writeFileSync(path.join(dir, 'broken.h'), 'int broken_api(void);\n');
+    fs.writeFileSync(path.join(dir, 'broken.c'), 'int broken_api(void) { return 1; }\n');
+
+    const stage = vi
+      .spyOn(QueryBuilder.prototype, 'stageSynthesisEdges')
+      .mockImplementation(() => {
+        throw new Error('injected synthesis failure');
+      });
+    const cg = await CodeGraph.init(dir, { silent: true });
+    try {
+      const result = await cg.indexAll();
+      expect(result.success).toBe(false);
+      expect(result.complete).toBe(false);
+      expect(result.errors).toContainEqual(
+        expect.objectContaining({
+          severity: 'error',
+          code: 'synthesis_pass_failed',
+          message: expect.stringContaining('injected synthesis failure'),
+        })
+      );
+      expect(cg.getIndexCompleteness()).toMatchObject({
+        status: 'incomplete',
+        diagnostics: [expect.objectContaining({ code: 'synthesis_pass_failed' })],
+      });
+    } finally {
+      cg.close?.();
+      stage.mockRestore();
     }
   });
 

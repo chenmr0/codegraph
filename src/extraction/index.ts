@@ -97,6 +97,8 @@ export interface IndexProgress {
  */
 export interface IndexResult {
   success: boolean;
+  /** False when any file or required post-processing phase was skipped/failed. */
+  complete?: boolean;
   filesIndexed: number;
   filesSkipped: number;
   filesErrored: number;
@@ -676,6 +678,7 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  private frameworkDetectionErrors: ExtractionError[] = [];
   /**
    * Project-wide `#define` macro names collected by a regex pre-scan over
    * all C/C++/ObjC files. Passed to extractFromSource so isMisparsedFunction
@@ -767,7 +770,16 @@ export class ExtractionOrchestrator {
     if (this.detectedFrameworkNames !== null) return this.detectedFrameworkNames;
     const fileList = files ?? scanDirectory(this.rootDir);
     const context = this.buildDetectionContext(fileList);
-    this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
+    this.frameworkDetectionErrors = [];
+    this.detectedFrameworkNames = detectFrameworks(context, (framework, error) => {
+      this.frameworkDetectionErrors.push({
+        severity: 'error',
+        code: 'framework_detection_failed',
+        message: `Framework detection '${framework}' failed: ` +
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          `The index may be incomplete.`,
+      });
+    }).map((r) => r.name);
     return this.detectedFrameworkNames;
   }
 
@@ -912,6 +924,7 @@ export class ExtractionOrchestrator {
     // between runs is picked up without restarting the process.
     this.detectedFrameworkNames = null;
     const frameworkNames = this.ensureDetectedFrameworks(files);
+    errors.push(...this.frameworkDetectionErrors);
 
     // Pre-scan C/C++/ObjC files for project-wide #define macro names so
     // isMisparsedFunction can filter cross-file macro misparses (macro

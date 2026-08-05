@@ -62,6 +62,15 @@ export interface ResolutionResult {
     unresolved: number;
     byMethod: Record<string, number>;
   };
+  /** Non-file diagnostics from resolution/synthesis that callers must surface. */
+  diagnostics?: ResolutionDiagnostic[];
+}
+
+/** A user-visible resolution diagnostic; errors mean the graph is incomplete. */
+export interface ResolutionDiagnostic {
+  message: string;
+  severity: 'error' | 'warning';
+  code: string;
 }
 
 /**

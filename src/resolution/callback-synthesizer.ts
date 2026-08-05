@@ -23,7 +23,7 @@
  */
 import type { Edge, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
-import type { ResolutionContext } from './types';
+import type { ResolutionContext, ResolutionDiagnostic } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { memoryBudgetBytes } from './memory-budget';
 import { stripCommentsForRegex } from './strip-comments';
@@ -48,6 +48,12 @@ export interface SynthesisAdmission {
   run: boolean;
   requiredHeadroomBytes: number;
   reason?: 'disabled' | 'heap-headroom' | 'system-headroom';
+}
+
+export interface SynthesisResult {
+  edgesAdded: number;
+  complete: boolean;
+  diagnostics: ResolutionDiagnostic[];
 }
 
 /**
@@ -1982,8 +1988,14 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
 export async function synthesizeCallbackEdges(
   queries: QueryBuilder,
   ctx: ResolutionContext
-): Promise<number> {
+): Promise<SynthesisResult> {
   const graphNodes = queries.getNodeAndEdgeCount().nodes;
+  const diagnostics: ResolutionDiagnostic[] = [];
+  const report = (diagnostic: ResolutionDiagnostic): void => {
+    diagnostics.push(diagnostic);
+    const log = diagnostic.severity === 'error' ? console.error : console.warn;
+    log(`[CodeGraph] ${diagnostic.message}`);
+  };
   const admissionNow = (): SynthesisAdmission => {
     const heap = getHeapStatistics();
     return resolveSynthesisAdmission({
@@ -1996,15 +2008,18 @@ export async function synthesizeCallbackEdges(
   };
   const initialAdmission = admissionNow();
   if (!initialAdmission.run) {
-    if (initialAdmission.reason !== 'disabled' || process.env.CODEGRAPH_SYNTH_TIMINGS) {
-      console.warn(
-        `[CodeGraph] Skipping optional dynamic-edge synthesis to avoid an out-of-memory crash ` +
+    const explicitlyDisabled = initialAdmission.reason === 'disabled';
+    report({
+      severity: explicitlyDisabled ? 'warning' : 'error',
+      code: explicitlyDisabled ? 'synthesis_disabled' : 'synthesis_skipped_memory',
+      message: explicitlyDisabled
+        ? 'Dynamic-edge synthesis was disabled by CODEGRAPH_NO_SYNTHESIS=1; the index is usable but incomplete.'
+        : `Dynamic-edge synthesis was skipped to avoid an out-of-memory crash ` +
           `(reason=${initialAdmission.reason}, nodes=${graphNodes}, ` +
           `requiredHeadroomMB=${Math.ceil(initialAdmission.requiredHeadroomBytes / MIB)}). ` +
-          `Parsing and reference resolution completed successfully.`
-      );
-    }
-    return 0;
+          `The index is incomplete.`,
+    });
+    return { edgesAdded: 0, complete: false, diagnostics };
   }
 
   // A single indexed DISTINCT lets language-specific passes short-circuit
@@ -2092,13 +2107,15 @@ export async function synthesizeCallbackEdges(
       try {
         totalAdded += await persistSynthEdges(queries, pass.run(), true);
       } catch (error) {
-        // Every pass is additive; a normal exception must not abort the index.
-        if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
-          console.error(
-            `[synth-timing] ${pass.name} failed: ` +
-              `${error instanceof Error ? error.message : String(error)}`
-          );
-        }
+        // Keep the base index usable, but never report a complete index when a
+        // synthesis pass failed or only produced a partial staged result.
+        report({
+          severity: 'error',
+          code: 'synthesis_pass_failed',
+          message: `Dynamic-edge synthesis pass '${pass.name}' failed: ` +
+            `${error instanceof Error ? error.message : String(error)}. ` +
+            `The index is incomplete.`,
+        });
       }
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
         console.error(`[synth-timing] ${pass.name}: ${Date.now() - startedAt}ms`);
@@ -2106,11 +2123,13 @@ export async function synthesizeCallbackEdges(
 
       const admission = admissionNow();
       if (!admission.run) {
-        console.warn(
-          `[CodeGraph] Stopped optional dynamic-edge synthesis early to avoid an ` +
-            `out-of-memory crash (reason=${admission.reason}). ` +
-            `Already staged synthesis edges will be kept.`
-        );
+        report({
+          severity: 'error',
+          code: 'synthesis_stopped_memory',
+          message: `Dynamic-edge synthesis stopped early to avoid an out-of-memory crash ` +
+            `(reason=${admission.reason}); already completed pass results were kept, ` +
+            `but the index is incomplete.`,
+        });
         break;
       }
     }
@@ -2120,5 +2139,9 @@ export async function synthesizeCallbackEdges(
     // any normal exception so the next index starts from a known state.
     queries.discardSynthesisEdgeStaging();
   }
-  return totalAdded;
+  return {
+    edgesAdded: totalAdded,
+    complete: diagnostics.length === 0,
+    diagnostics,
+  };
 }
