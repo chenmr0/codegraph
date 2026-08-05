@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { UnresolvedReference } from '../types';
+import { memoryBudgetBytes } from './memory-budget';
 import type { ResolvedRef, UnresolvedRef } from './types';
 
 export interface ResolverAdmissionResult {
@@ -125,16 +126,18 @@ export class ResolverPool {
       // The 256 MB per-worker floor remains in effect.
     }
 
+    const availableMemoryBytes = memoryBudgetBytes();
+    const availableParallelism = os.availableParallelism();
     const size = resolveResolverPoolSize({
       explicit: process.env.CODEGRAPH_RESOLVE_WORKERS,
-      availableParallelism: os.availableParallelism(),
-      availableMemoryBytes: os.freemem(),
+      availableParallelism,
+      availableMemoryBytes,
       databaseSizeBytes,
     });
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
       console.error(
         `[resolve-pool] ${size === null ? 'disabled' : `workers=${size}`} ` +
-          `(cpus=${os.availableParallelism()}, freeMB=${Math.round(os.freemem() / 1024 / 1024)}, ` +
+          `(cpus=${availableParallelism}, freeMB=${Math.round(availableMemoryBytes / 1024 / 1024)}, ` +
           `dbMB=${Math.round(databaseSizeBytes / 1024 / 1024)})`
       );
     }

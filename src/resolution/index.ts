@@ -1069,6 +1069,7 @@ export class ReferenceResolver {
       dbPath?: string;
       bulkEdgeLoad?: { begin: () => void; end: () => void | Promise<void> };
       bulkRefLoad?: { begin: () => void; end: () => void | Promise<void> };
+      onSynthesisProgress?: (current: number, total: number) => void;
     }
   ): Promise<ResolutionResult> {
     this.warmCaches();
@@ -1229,9 +1230,17 @@ export class ReferenceResolver {
     // synthesize observer/callback dispatch edges (dispatcher → registered
     // callbacks) that static parsing leaves out. Best-effort — never fail the
     // index on it. See docs/design/callback-edge-synthesis.md.
+    options?.onSynthesisProgress?.(0, 1);
+    // Release resolution-only name/file sets and populated LRUs before the
+    // post-100% synthesis tail. Any pass-specific lookup is rebuilt lazily.
+    this.clearCaches();
+    await new Promise(resolve => setImmediate(resolve));
     const synthesisStartedAt = Date.now();
     try {
-      aggregateStats.byMethod['callback-synthesis'] = synthesizeCallbackEdges(this.queries, this.context);
+      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
+        this.queries,
+        this.context
+      );
     } catch {
       // synthesis is additive and optional; ignore failures
     }
@@ -1240,6 +1249,7 @@ export class ReferenceResolver {
         `[phase-timing] callback-synthesis=${Date.now() - synthesisStartedAt}ms`
       );
     }
+    options?.onSynthesisProgress?.(1, 1);
 
     return {
       resolved: [],

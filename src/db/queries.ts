@@ -1532,6 +1532,111 @@ export class QueryBuilder {
     })();
   }
 
+  /**
+   * Stream nodes matching a language and decorator without hydrating the
+   * entire node table. The LIKE is only a cheap JSON-text prefilter; callers
+   * retain the exact `decorators.includes()` check.
+   */
+  *iterateNodesByLanguageWithDecorator(
+    language: Language,
+    decorator: string
+  ): IterableIterator<Node> {
+    const stmt = this.db.prepare(
+      "SELECT * FROM nodes WHERE language = ? AND decorators LIKE '%' || ? || '%'"
+    );
+    for (const row of stmt.iterate(language, `"${decorator}"`)) {
+      yield rowToNode(row as NodeRow);
+    }
+  }
+
+  /**
+   * Start a SQLite-backed staging area for optional synthesis edges. Main
+   * synthesis passes must all read the same committed graph snapshot; staging
+   * avoids retaining their results in JS while keeping them invisible until
+   * every pass has run. The source/target uniqueness matches the synthesizer's
+   * historical first-pass-wins deduplication.
+   */
+  beginSynthesisEdgeStaging(): void {
+    // Prefer a temp file over SQLite's process heap for graph-sized staging.
+    // Builds compiled with a fixed temp-store policy may ignore this pragma.
+    try { this.db.pragma('temp_store = FILE'); } catch { /* best effort */ }
+    this.db.exec(`
+      DROP TABLE IF EXISTS _codegraph_synthesis_edges;
+      CREATE TEMP TABLE _codegraph_synthesis_edges (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        metadata TEXT,
+        line INTEGER,
+        col INTEGER,
+        provenance TEXT,
+        UNIQUE(source, target)
+      )
+    `);
+  }
+
+  /** Stage one bounded synthesis chunk; returns newly accepted edge count. */
+  stageSynthesisEdges(edges: Edge[]): number {
+    if (edges.length === 0) return 0;
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO _codegraph_synthesis_edges
+        (source, target, kind, metadata, line, col, provenance)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    return this.db.transaction(() => {
+      let changed = 0;
+      for (const edge of edges) {
+        changed += stmt.run(
+          edge.source,
+          edge.target,
+          edge.kind,
+          edge.metadata ? JSON.stringify(edge.metadata) : null,
+          edge.line ?? null,
+          edge.column ?? null,
+          edge.provenance ?? null
+        ).changes;
+      }
+      return changed;
+    })();
+  }
+
+  /** Flush staged synthesis edges to the graph in bounded batches. */
+  flushSynthesisEdgeStaging(batchSize: number = 1_000): number {
+    const total = (
+      this.db.prepare('SELECT COUNT(*) AS count FROM _codegraph_synthesis_edges').get() as {
+        count: number;
+      }
+    ).count;
+    let afterSeq = 0;
+    while (true) {
+      const rows = this.db
+        .prepare(`
+          SELECT seq AS id, source, target, kind, metadata, line, col, provenance
+          FROM _codegraph_synthesis_edges
+          WHERE seq > ?
+          ORDER BY seq
+          LIMIT ?
+        `)
+        .all(afterSeq, batchSize) as EdgeRow[];
+      if (rows.length === 0) break;
+      this.insertEdges(rows.map(rowToEdge));
+      afterSeq = rows[rows.length - 1]!.id;
+    }
+    this.db.exec('DROP TABLE IF EXISTS _codegraph_synthesis_edges');
+    try { this.db.pragma('temp_store = MEMORY'); } catch { /* best effort */ }
+    return total;
+  }
+
+  /** Remove an abandoned staging area after a normal exception. */
+  discardSynthesisEdgeStaging(): void {
+    this.db.exec('DROP TABLE IF EXISTS _codegraph_synthesis_edges');
+    // configureConnection() normally keeps transient query work in memory.
+    // Restore that connection policy after the graph-sized staging table is
+    // gone so later interactive queries do not inherit disk-backed temp work.
+    try { this.db.pragma('temp_store = MEMORY'); } catch { /* best effort */ }
+  }
+
   private insertEdgesUnchecked(edges: Edge[]): void {
     const rows = edges.map((edge) => [
       edge.source,
@@ -2150,6 +2255,17 @@ WHERE e.kind = 'imports'
     return this.db
       .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
       .get() as { nodes: number; edges: number };
+  }
+
+  /**
+   * Languages present in the indexed file set. Dynamic-edge synthesis uses
+   * this indexed query to skip passes whose result is provably empty.
+   */
+  getDistinctFileLanguages(): Set<string> {
+    const rows = this.db
+      .prepare('SELECT DISTINCT language FROM files')
+      .all() as Array<{ language: string }>;
+    return new Set(rows.map((row) => row.language));
   }
 
   /**

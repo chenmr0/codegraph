@@ -9,6 +9,12 @@ import {
   minRefsForResolverPool,
   resolveResolverPoolSize,
 } from '../src/resolution/resolver-pool';
+import {
+  cgroupMemoryAvailable,
+  darwinMemoryAvailable,
+  memoryBudgetBytes,
+} from '../src/resolution/memory-budget';
+import { resolveSynthesisAdmission } from '../src/resolution/callback-synthesizer';
 import { ReferenceResolver } from '../src/resolution';
 import type { ResolutionContext } from '../src/resolution/types';
 import type { Node, UnresolvedReference } from '../src/types';
@@ -110,6 +116,49 @@ describe('phase 2 exact unresolved-reference cleanup', () => {
     expect(namesAfter.has('idx_edges_kind')).toBe(true);
     expect(namesAfter.has('idx_unresolved_name')).toBe(true);
     expect(queries.getOutgoingEdges('caller')).toHaveLength(1);
+  });
+
+  it('stages synthesis edges invisibly and flushes them in bounded batches', () => {
+    const targets = Array.from({ length: 1_101 }, (_, index) =>
+      makeNode(`staged-target-${index}`)
+    );
+    queries.insertNodes(targets);
+    const edges = targets.map((target, index) => ({
+      source: 'caller',
+      target: target.id,
+      kind: 'calls' as const,
+      line: index + 1,
+      metadata: { pass: 'first' },
+    }));
+
+    queries.beginSynthesisEdgeStaging();
+    expect(queries.stageSynthesisEdges(edges)).toBe(1_101);
+    // Historical dedup semantics are source/target first-pass-wins, even when
+    // a later pass proposes a different kind or metadata for the same pair.
+    expect(
+      queries.stageSynthesisEdges([
+        {
+          source: 'caller',
+          target: targets[0]!.id,
+          kind: 'references',
+          metadata: { pass: 'second' },
+        },
+      ])
+    ).toBe(0);
+    expect(queries.getOutgoingEdges('caller')).toHaveLength(0);
+
+    expect(queries.flushSynthesisEdgeStaging(1_000)).toBe(1_101);
+    const persisted = queries.getOutgoingEdges('caller');
+    expect(persisted).toHaveLength(1_101);
+    expect(persisted.find((edge) => edge.target === targets[0]!.id)).toMatchObject({
+      kind: 'calls',
+      metadata: { pass: 'first' },
+    });
+    const tempTables = connection
+      .getDb()
+      .prepare("SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = '_codegraph_synthesis_edges'")
+      .all();
+    expect(tempTables).toEqual([]);
   });
 
   it('self-heals resolution indexes after an interrupted bulk window', () => {
@@ -263,5 +312,54 @@ describe('phase 2 resolver pool policy', () => {
       if (previous === undefined) delete process.env.CODEGRAPH_NO_PARALLEL_RESOLVE;
       else process.env.CODEGRAPH_NO_PARALLEL_RESOLVE = previous;
     }
+  });
+
+  it('reports a finite, non-negative platform memory budget', () => {
+    for (const available of [cgroupMemoryAvailable(), darwinMemoryAvailable()]) {
+      expect(available === null || (Number.isFinite(available) && available >= 0)).toBe(true);
+    }
+    const budget = memoryBudgetBytes();
+    expect(Number.isFinite(budget)).toBe(true);
+    expect(budget).toBeGreaterThanOrEqual(0);
+  });
+
+  it('admits synthesis only when both V8 and system headroom are sufficient', () => {
+    const gib = 1024 ** 3;
+    expect(
+      resolveSynthesisAdmission({
+        nodeCount: 1_000_000,
+        heapUsedBytes: 1 * gib,
+        heapLimitBytes: 4 * gib,
+        availableMemoryBytes: 4 * gib,
+      }).run
+    ).toBe(true);
+
+    expect(
+      resolveSynthesisAdmission({
+        nodeCount: 1_000_000,
+        heapUsedBytes: 3.5 * gib,
+        heapLimitBytes: 4 * gib,
+        availableMemoryBytes: 4 * gib,
+      }).reason
+    ).toBe('heap-headroom');
+
+    expect(
+      resolveSynthesisAdmission({
+        nodeCount: 1_000_000,
+        heapUsedBytes: 1 * gib,
+        heapLimitBytes: 4 * gib,
+        availableMemoryBytes: 512 * 1024 ** 2,
+      }).reason
+    ).toBe('system-headroom');
+
+    expect(
+      resolveSynthesisAdmission({
+        nodeCount: 1,
+        heapUsedBytes: 0,
+        heapLimitBytes: 4 * gib,
+        availableMemoryBytes: 4 * gib,
+        disabled: true,
+      }).reason
+    ).toBe('disabled');
   });
 });

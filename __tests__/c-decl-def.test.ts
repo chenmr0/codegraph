@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
+import { QueryBuilder } from '../src/db/queries';
 
 /**
  * End-to-end test for the C declaration-definition pairing synthesizer
@@ -77,6 +78,47 @@ int add(int a, int b) {
     expect(edge.synthBy).toBe('c-decl-def');
     expect(edge.provenance).toBe('heuristic');
     expect(edge.registeredAt).toMatch(/foo\.h:\d+/);
+  });
+
+  it('skips language-specific whole-graph passes on a pure C project', async () => {
+    fs.writeFileSync(path.join(dir, 'only.c'), 'int answer(void) { return 42; }\n');
+
+    // A pure C index must gate the Kotlin expect/actual pass before it even
+    // opens that pass's (now streamed) node cursor.
+    const kotlinNodes = vi.spyOn(
+      QueryBuilder.prototype,
+      'iterateNodesByLanguageWithDecorator'
+    );
+    const cg = await CodeGraph.init(dir, { silent: true });
+    try {
+      await cg.indexAll();
+      expect(kotlinNodes).not.toHaveBeenCalled();
+    } finally {
+      cg.close?.();
+      kotlinNodes.mockRestore();
+    }
+  });
+
+  it('completes indexing when optional synthesis is disabled for memory safety', async () => {
+    fs.writeFileSync(path.join(dir, 'safe.h'), 'int safe_api(void);\n');
+    fs.writeFileSync(path.join(dir, 'safe.c'), 'int safe_api(void) { return 1; }\n');
+
+    const previous = process.env.CODEGRAPH_NO_SYNTHESIS;
+    process.env.CODEGRAPH_NO_SYNTHESIS = '1';
+    let cg: CodeGraph | undefined;
+    try {
+      cg = await CodeGraph.init(dir, { silent: true });
+      const phases: string[] = [];
+      const result = await cg.indexAll({ onProgress: (progress) => phases.push(progress.phase) });
+      expect(result.nodesCreated).toBeGreaterThan(0);
+      expect(phases).toContain('synthesizing');
+      const db = (cg as any).db.db;
+      expect(definesEdges(db).filter((edge) => edge.src_name === 'safe_api')).toEqual([]);
+    } finally {
+      cg?.close?.();
+      if (previous === undefined) delete process.env.CODEGRAPH_NO_SYNTHESIS;
+      else process.env.CODEGRAPH_NO_SYNTHESIS = previous;
+    }
   });
 
   it('pairs a .h declaration with multiple platform .c definitions', async () => {

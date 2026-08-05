@@ -25,12 +25,92 @@ import type { Edge, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
+import { memoryBudgetBytes } from './memory-budget';
 import { stripCommentsForRegex } from './strip-comments';
+import { getHeapStatistics } from 'node:v8';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
 const MAX_CALLBACKS_PER_CHANNEL = 40;
 const EVENT_FANOUT_CAP = 6; // skip events with more handlers/dispatchers than this (too generic without type info)
+const SYNTH_EDGE_CHUNK_SIZE = 1_000;
+const MIB = 1024 * 1024;
+
+export interface SynthesisAdmissionOptions {
+  nodeCount: number;
+  heapUsedBytes: number;
+  heapLimitBytes: number;
+  availableMemoryBytes: number;
+  disabled?: boolean;
+}
+
+export interface SynthesisAdmission {
+  run: boolean;
+  requiredHeadroomBytes: number;
+  reason?: 'disabled' | 'heap-headroom' | 'system-headroom';
+}
+
+/**
+ * Decide whether optional whole-graph synthesis has enough headroom to run.
+ *
+ * A V8 heap OOM is fatal and cannot be caught by the best-effort wrapper in
+ * the resolver. Admission therefore happens before a pass can allocate its
+ * graph-wide indexes. The reserve scales with graph size but stays bounded so
+ * normal repositories are not penalized by an overly conservative fixed cap.
+ */
+export function resolveSynthesisAdmission(
+  options: SynthesisAdmissionOptions
+): SynthesisAdmission {
+  const requiredHeadroomBytes = Math.min(
+    1_536 * MIB,
+    Math.max(384 * MIB, Math.max(0, options.nodeCount) * 2_048)
+  );
+  if (options.disabled) {
+    return { run: false, requiredHeadroomBytes, reason: 'disabled' };
+  }
+  const heapHeadroom = Math.max(0, options.heapLimitBytes - options.heapUsedBytes);
+  if (heapHeadroom < requiredHeadroomBytes) {
+    return { run: false, requiredHeadroomBytes, reason: 'heap-headroom' };
+  }
+  if (options.availableMemoryBytes < requiredHeadroomBytes) {
+    return { run: false, requiredHeadroomBytes, reason: 'system-headroom' };
+  }
+  return { run: true, requiredHeadroomBytes };
+}
+
+const yieldToEventLoop = (): Promise<void> =>
+  new Promise((resolve) => setImmediate(resolve));
+
+/** Persist one pass without retaining a second graph-sized merged edge array. */
+async function persistSynthEdges(
+  queries: QueryBuilder,
+  edges: Iterable<Edge>,
+  stage: boolean = false
+): Promise<number> {
+  let inserted = 0;
+  let chunk: Edge[] = [];
+  for (const edge of edges) {
+    chunk.push(edge);
+    if (chunk.length >= SYNTH_EDGE_CHUNK_SIZE) {
+      if (stage) inserted += queries.stageSynthesisEdges(chunk);
+      else {
+        queries.insertEdges(chunk);
+        inserted += chunk.length;
+      }
+      chunk = [];
+      await yieldToEventLoop();
+    }
+  }
+  if (chunk.length > 0) {
+    if (stage) inserted += queries.stageSynthesisEdges(chunk);
+    else {
+      queries.insertEdges(chunk);
+      inserted += chunk.length;
+    }
+  }
+  await yieldToEventLoop();
+  return inserted;
+}
 
 const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))/g;
 const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
@@ -415,15 +495,14 @@ function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
  * implementation(s). Over-approximation accepted (reachability-correct); capped
  * per class and gated to C++ to avoid touching other languages' dispatch.
  */
-function cppOverrideEdges(queries: QueryBuilder): Edge[] {
-  const edges: Edge[] = [];
+function* cppOverrideEdges(queries: QueryBuilder): IterableIterator<Edge> {
   const seen = new Set<string>();
   const methodsOf = (classId: string): Node[] =>
     queries
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
-  for (const cls of queries.getNodesByKind('class')) {
+  for (const cls of queries.iterateNodesByKind('class')) {
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
@@ -438,19 +517,18 @@ function cppOverrideEdges(queries: QueryBuilder): Edge[] {
         const key = `${bm.id}>${m.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        edges.push({
+        yield {
           source: bm.id,
           target: m.id,
           kind: 'calls',
           line: bm.startLine,
           provenance: 'heuristic',
           metadata: { synthesizedBy: 'cpp-override', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
-        });
+        };
         added++;
       }
     }
   }
-  return edges;
 }
 
 /**
@@ -494,8 +572,7 @@ function cppLastTwoSegments(qn: string): string {
   return parts.slice(-2).join('::');
 }
 
-function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
-  const edges: Edge[] = [];
+function* cppDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
   const seen = new Set<string>();
 
   // Prefetch cpp class/struct names for receiver verification.
@@ -554,7 +631,7 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
         const key = `${def.id}>${decl.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        edges.push({
+        yield {
           source: def.id,
           target: decl.id,
           kind: 'defines',
@@ -564,12 +641,11 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
             synthesizedBy: 'cpp-decl-def',
             registeredAt: `${decl.filePath}:${decl.startLine}`,
           },
-        });
+        };
       }
     }
   }
 
-  return edges;
 }
 
 /**
@@ -591,8 +667,7 @@ function cppDeclDefEdges(queries: QueryBuilder): Edge[] {
  * mis-pairing a local forward declaration with an unrelated same-named
  * definition in another .c file).
  */
-function cDeclDefEdges(queries: QueryBuilder): Edge[] {
-  const edges: Edge[] = [];
+function* cDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
   const seen = new Set<string>();
 
   // Group c function nodes by name (bare name, no '::').
@@ -624,7 +699,7 @@ function cDeclDefEdges(queries: QueryBuilder): Edge[] {
         const key = `${def.id}>${decl.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        edges.push({
+        yield {
           source: def.id,
           target: decl.id,
           kind: 'defines',
@@ -634,12 +709,11 @@ function cDeclDefEdges(queries: QueryBuilder): Edge[] {
             synthesizedBy: 'c-decl-def',
             registeredAt: `${decl.filePath}:${decl.startLine}`,
           },
-        });
+        };
       }
     }
   }
 
-  return edges;
 }
 
 /**
@@ -660,8 +734,7 @@ function cDeclDefEdges(queries: QueryBuilder): Edge[] {
  * function synthesizer: two unrelated same-named globals plus one header
  * extern → both defs link the decl; reachability-correct.
  */
-function cCppVarDeclDefEdges(queries: QueryBuilder): Edge[] {
-  const edges: Edge[] = [];
+function* cCppVarDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
   const seen = new Set<string>();
   const HEADER_EXTS = ['.h', '.hpp', '.hh', '.hxx', '.h++'];
   const isHeader = (p: string) => {
@@ -691,7 +764,7 @@ function cCppVarDeclDefEdges(queries: QueryBuilder): Edge[] {
           const key = `${kind}:${def.id}>${decl.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          edges.push({
+          yield {
             source: def.id,
             target: decl.id,
             kind: 'defines',
@@ -701,13 +774,12 @@ function cCppVarDeclDefEdges(queries: QueryBuilder): Edge[] {
               synthesizedBy: 'c-cpp-var-decl-def',
               registeredAt: `${decl.filePath}:${decl.startLine}`,
             },
-          });
+          };
         }
       }
     }
   }
 
-  return edges;
 }
 
 /**
@@ -889,13 +961,12 @@ function kmpKindsCompatible(a: string, b: string): boolean {
   return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
 }
 
-function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
-  const edges: Edge[] = [];
+function* kotlinExpectActualEdges(queries: QueryBuilder): IterableIterator<Edge> {
   const seen = new Set<string>();
-  const actuals = queries
-    .getAllNodes()
-    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
-  for (const act of actuals) {
+  // SQL-side prefilter plus streaming avoids hydrating the entire graph just
+  // to discover that a C/C++ repository has no Kotlin `actual` declarations.
+  for (const act of queries.iterateNodesByLanguageWithDecorator('kotlin', 'actual')) {
+    if (!act.decorators?.includes('actual')) continue;
     let added = 0;
     for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -907,7 +978,7 @@ function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
       const key = `${cand.id}>${act.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      edges.push({
+      yield {
         source: cand.id,
         target: act.id,
         kind: 'calls',
@@ -918,11 +989,10 @@ function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
           via: act.name,
           registeredAt: `${act.filePath}:${act.startLine}`,
         },
-      });
+      };
       added++;
     }
   }
-  return edges;
 }
 
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
@@ -1909,76 +1979,146 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
  * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
+export async function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext
+): Promise<number> {
+  const graphNodes = queries.getNodeAndEdgeCount().nodes;
+  const admissionNow = (): SynthesisAdmission => {
+    const heap = getHeapStatistics();
+    return resolveSynthesisAdmission({
+      nodeCount: graphNodes,
+      heapUsedBytes: process.memoryUsage().heapUsed,
+      heapLimitBytes: heap.heap_size_limit,
+      availableMemoryBytes: memoryBudgetBytes(),
+      disabled: process.env.CODEGRAPH_NO_SYNTHESIS === '1',
+    });
+  };
+  const initialAdmission = admissionNow();
+  if (!initialAdmission.run) {
+    if (initialAdmission.reason !== 'disabled' || process.env.CODEGRAPH_SYNTH_TIMINGS) {
+      console.warn(
+        `[CodeGraph] Skipping optional dynamic-edge synthesis to avoid an out-of-memory crash ` +
+          `(reason=${initialAdmission.reason}, nodes=${graphNodes}, ` +
+          `requiredHeadroomMB=${Math.ceil(initialAdmission.requiredHeadroomBytes / MIB)}). ` +
+          `Parsing and reference resolution completed successfully.`
+      );
+    }
+    return 0;
+  }
+
+  // A single indexed DISTINCT lets language-specific passes short-circuit
+  // without scanning the graph. Only gates whose result is provably empty are
+  // used here; language-agnostic callback passes continue to run unchanged.
+  const languages = queries.getDistinctFileLanguages();
+  const has = (...values: string[]): boolean => values.some((value) => languages.has(value));
+  const jsFamily = ['typescript', 'javascript', 'tsx', 'jsx'];
+  let totalAdded = 0;
+
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
   // FIRST: a method declared in a different file from its receiver type is
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
   // struct's method set from its `contains` edges — so without this it would
   // under-count the interfaces a cross-file struct satisfies. (#583)
-  const goMethodContains = goCrossFileMethodContainsEdges(queries);
-  if (goMethodContains.length > 0) queries.insertEdges(goMethodContains);
+  if (has('go')) {
+    totalAdded += await persistSynthEdges(queries, goCrossFileMethodContainsEdges(queries));
+  }
 
   // Go implicit `implements` edges must be synthesized AND persisted next: the
   // interface-dispatch bridge below reads `implements` edges from the DB, and
   // Go has none statically. (Other languages already have static implements
   // edges from extraction, so they don't need this pre-pass.)
-  const goImpl = goImplementsEdges(queries);
-  if (goImpl.length > 0) queries.insertEdges(goImpl);
-
-  const fieldEdges = fieldChannelEdges(queries, ctx);
-  const closureCollEdges = closureCollectionEdges(queries, ctx);
-  const emitterEdges = eventEmitterEdges(ctx);
-  const renderEdges = reactRenderEdges(queries, ctx);
-  const jsxEdges = reactJsxChildEdges(ctx);
-  const vueEdges = vueTemplateEdges(ctx);
-  const svelteKitEdges = svelteKitLoadEdges(ctx);
-  const pascalEdges = pascalFormEdges(ctx);
-  const flutterEdges = flutterBuildEdges(queries, ctx);
-  const cppEdges = cppOverrideEdges(queries);
-  const cppDeclDef = cppDeclDefEdges(queries);
-  const cDeclDef = cDeclDefEdges(queries);
-  const varDeclDef = cCppVarDeclDefEdges(queries);
-  const ifaceEdges = interfaceOverrideEdges(queries);
-  const kotlinExpectActual = kotlinExpectActualEdges(queries);
-  const goGrpcEdges = goGrpcStubImplEdges(queries);
-  const rnEventEdgesList = rnEventEdges(ctx);
-  const fabricNativeEdges = fabricNativeImplEdges(ctx);
-  const expoXPlatEdges = expoCrossPlatformEdges(queries);
-  const rnXPlatEdges = rnCrossPlatformEdges(queries);
-  const mybatisEdges = mybatisJavaXmlEdges(queries);
-  const ginEdges = ginMiddlewareChainEdges(queries, ctx);
-
-  const merged: Edge[] = [];
-  const seen = new Set<string>();
-  for (const e of [
-    ...fieldEdges,
-    ...closureCollEdges,
-    ...emitterEdges,
-    ...renderEdges,
-    ...jsxEdges,
-    ...vueEdges,
-    ...svelteKitEdges,
-    ...pascalEdges,
-    ...flutterEdges,
-    ...cppEdges,
-    ...cppDeclDef,
-    ...cDeclDef,
-    ...varDeclDef,
-    ...ifaceEdges,
-    ...kotlinExpectActual,
-    ...goGrpcEdges,
-    ...rnEventEdgesList,
-    ...fabricNativeEdges,
-    ...expoXPlatEdges,
-    ...rnXPlatEdges,
-    ...mybatisEdges,
-    ...ginEdges,
-  ]) {
-    const key = `${e.source}>${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(e);
+  if (has('go')) {
+    totalAdded += await persistSynthEdges(queries, goImplementsEdges(queries));
   }
-  if (merged.length > 0) queries.insertEdges(merged);
-  return merged.length + goImpl.length + goMethodContains.length;
+
+  interface SynthPass {
+    name: string;
+    enabled: boolean;
+    run: () => Iterable<Edge>;
+  }
+  const passes: SynthPass[] = [
+    { name: 'fieldEdges', enabled: true, run: () => fieldChannelEdges(queries, ctx) },
+    {
+      name: 'closureCollEdges',
+      // Its dispatcher regexes are Swift/Kotlin trailing-closure syntax.
+      enabled: has('swift', 'kotlin'),
+      run: () => closureCollectionEdges(queries, ctx),
+    },
+    { name: 'emitterEdges', enabled: true, run: () => eventEmitterEdges(ctx) },
+    // These are intentionally not JS-gated: existing Java/Litho-style source
+    // can satisfy their source-shape predicates too.
+    { name: 'renderEdges', enabled: true, run: () => reactRenderEdges(queries, ctx) },
+    { name: 'jsxEdges', enabled: true, run: () => reactJsxChildEdges(ctx) },
+    { name: 'vueEdges', enabled: has('vue'), run: () => vueTemplateEdges(ctx) },
+    { name: 'svelteKitEdges', enabled: has('svelte'), run: () => svelteKitLoadEdges(ctx) },
+    { name: 'pascalEdges', enabled: true, run: () => pascalFormEdges(ctx) },
+    { name: 'flutterEdges', enabled: has('dart'), run: () => flutterBuildEdges(queries, ctx) },
+    { name: 'cppEdges', enabled: has('cpp'), run: () => cppOverrideEdges(queries) },
+    { name: 'cppDeclDef', enabled: has('cpp'), run: () => cppDeclDefEdges(queries) },
+    { name: 'cDeclDef', enabled: has('c'), run: () => cDeclDefEdges(queries) },
+    { name: 'varDeclDef', enabled: has('c', 'cpp'), run: () => cCppVarDeclDefEdges(queries) },
+    {
+      name: 'ifaceEdges',
+      enabled: has(
+        'java', 'kotlin', 'csharp', 'typescript', 'javascript', 'tsx', 'jsx',
+        'swift', 'scala', 'go', 'rust'
+      ),
+      run: () => interfaceOverrideEdges(queries),
+    },
+    { name: 'kotlinExpectActual', enabled: has('kotlin'), run: () => kotlinExpectActualEdges(queries) },
+    { name: 'goGrpcEdges', enabled: has('go'), run: () => goGrpcStubImplEdges(queries) },
+    { name: 'rnEventEdgesList', enabled: has(...jsFamily), run: () => rnEventEdges(ctx) },
+    { name: 'fabricNativeEdges', enabled: true, run: () => fabricNativeImplEdges(ctx) },
+    {
+      name: 'expoXPlatEdges',
+      enabled: has('swift') && has('kotlin'),
+      run: () => expoCrossPlatformEdges(queries),
+    },
+    { name: 'rnXPlatEdges', enabled: has(...jsFamily), run: () => rnCrossPlatformEdges(queries) },
+    {
+      name: 'mybatisEdges',
+      enabled: has('java', 'kotlin') && has('xml'),
+      run: () => mybatisJavaXmlEdges(queries),
+    },
+    { name: 'ginEdges', enabled: has('go'), run: () => ginMiddlewareChainEdges(queries, ctx) },
+  ];
+
+  queries.beginSynthesisEdgeStaging();
+  try {
+    for (const pass of passes) {
+      if (!pass.enabled) continue;
+      const startedAt = Date.now();
+      try {
+        totalAdded += await persistSynthEdges(queries, pass.run(), true);
+      } catch (error) {
+        // Every pass is additive; a normal exception must not abort the index.
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+          console.error(
+            `[synth-timing] ${pass.name} failed: ` +
+              `${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+        console.error(`[synth-timing] ${pass.name}: ${Date.now() - startedAt}ms`);
+      }
+
+      const admission = admissionNow();
+      if (!admission.run) {
+        console.warn(
+          `[CodeGraph] Stopped optional dynamic-edge synthesis early to avoid an ` +
+            `out-of-memory crash (reason=${admission.reason}). ` +
+            `Already staged synthesis edges will be kept.`
+        );
+        break;
+      }
+    }
+    queries.flushSynthesisEdgeStaging(SYNTH_EDGE_CHUNK_SIZE);
+  } finally {
+    // Idempotent after a successful flush; cleans up a partially staged run on
+    // any normal exception so the next index starts from a known state.
+    queries.discardSynthesisEdgeStaging();
+  }
+  return totalAdded;
 }

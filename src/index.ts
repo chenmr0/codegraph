@@ -456,13 +456,22 @@ export class CodeGraph {
               total: unresolvedCount,
             });
 
-            await this.resolveReferencesBatched((current, total) => {
-              options.onProgress?.({
-                phase: 'resolving',
-                current,
-                total,
-              });
-            });
+            await this.resolveReferencesBatched(
+              (current, total) => {
+                options.onProgress?.({
+                  phase: 'resolving',
+                  current,
+                  total,
+                });
+              },
+              (current, total) => {
+                options.onProgress?.({
+                  phase: 'synthesizing',
+                  current,
+                  total,
+                });
+              }
+            );
 
             // Second pass: chained calls whose method lives on a supertype the
             // receiver conforms to (protocol-extension / inherited / default-
@@ -808,7 +817,10 @@ export class CodeGraph {
    * Resolve references in batches to keep memory bounded on large codebases.
    * Processes chunks of unresolved refs, persisting results after each batch.
    */
-  async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
+  async resolveReferencesBatched(
+    onProgress?: (current: number, total: number) => void,
+    onSynthesisProgress?: (current: number, total: number) => void
+  ): Promise<ResolutionResult> {
     const deferResolutionIndexes =
       process.env.CODEGRAPH_NO_RESOLVE_INDEX_DEFER !== '1';
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, {
@@ -828,6 +840,7 @@ export class CodeGraph {
             end: () => this.db.endBulkResolutionRefLoad(),
           }
         : undefined,
+      onSynthesisProgress,
     });
   }
 
