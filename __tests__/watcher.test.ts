@@ -161,11 +161,32 @@ describe('FileWatcher', () => {
 
       // A non-source-file event — FileWatcher's `isSourceFile` gate must drop
       // it before scheduling sync.
+      // It must exist: a missing non-source path is conservatively treated as
+      // a possible deleted directory and deliberately schedules a reconcile.
+      fs.writeFileSync(path.join(testDir, 'src', 'readme.md'), '# docs\n');
       __emitWatchEventForTests(testDir, 'src/readme.md');
 
       // Wait a bit longer than debounce — sync should NOT trigger.
       await new Promise((r) => setTimeout(r, 400));
       expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('should schedule sync when a directory is deleted', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      const removedDir = path.join(testDir, 'src', 'removed');
+      fs.mkdirSync(removedDir, { recursive: true });
+      fs.writeFileSync(path.join(removedDir, 'nested.ts'), 'export const nested = 1;');
+
+      watcher.start();
+      await watcher.waitUntilReady();
+      fs.rmSync(removedDir, { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'src/removed');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn).toHaveBeenCalledTimes(1);
 
       watcher.stop();
     });
@@ -394,6 +415,32 @@ describe('FileWatcher', () => {
       // After close, isWatching should be false
       // (we can't call isWatching after close since DB is closed,
       //  but we verify no errors are thrown)
+    });
+
+    it('should remove an indexed subtree after a directory-delete event', async () => {
+      const nestedDir = path.join(testDir, 'src', 'obsolete', 'nested');
+      fs.mkdirSync(nestedDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(nestedDir, 'removed.ts'),
+        'export function removedWithDirectory() { return 1; }'
+      );
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+      expect(cg.searchNodes('removedWithDirectory').length).toBeGreaterThan(0);
+
+      const started = cg.watch({ debounceMs: 100, inertForTests: true });
+      expect(started).toBe(true);
+      await cg.waitUntilWatcherReady();
+      fs.rmSync(path.join(testDir, 'src', 'obsolete'), { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'src/obsolete');
+
+      await waitFor(
+        () => cg.searchNodes('removedWithDirectory').length === 0,
+        5000
+      );
+      cg.unwatch();
     });
 
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {

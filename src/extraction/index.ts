@@ -39,6 +39,14 @@ import {
  */
 const FILE_IO_BATCH_SIZE = 10;
 
+/**
+ * Number of filesystem reconciliation checks between cooperative event-loop
+ * yields during sync. Large repositories otherwise run two uninterrupted O(N)
+ * loops of synchronous exists/stat calls, which can starve MCP requests and
+ * the daemon liveness heartbeat even though the sync itself is healthy.
+ */
+const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
+
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
 /**
@@ -1979,7 +1987,7 @@ export class ExtractionOrchestrator {
     // whether or not the project uses git, and crucially also catches committed
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
-    const currentFiles = scanDirectory(this.rootDir);
+    const currentFiles = await scanDirectoryAsync(this.rootDir);
     filesChecked = currentFiles.length;
     const currentSet = new Set(currentFiles);
 
@@ -1992,15 +2000,24 @@ export class ExtractionOrchestrator {
     // Removals: tracked in the DB but no longer a present source file. Check the
     // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
     // file deleted from disk but not yet staged, so set membership alone misses it.
+    let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
 
     // Adds / modifications.
     for (const filePath of currentFiles) {
+      // Keep the unchanged-file fast path cooperative too: most entries leave
+      // through `continue` after stat, so the yield must happen at loop entry.
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
 

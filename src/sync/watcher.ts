@@ -370,7 +370,7 @@ export class FileWatcher {
     // A newly-created directory needs its own watch (recursive isn't available
     // on Linux). statSync is cheap and these events are rare relative to file
     // edits. If the path vanished (rapid create/delete) the stat throws and we
-    // fall through to the change handler, which no-ops on a non-source path.
+    // fall through to the change handler, which also detects directory removal.
     try {
       if (fs.statSync(full).isDirectory()) {
         if (!this.shouldIgnoreDir(full)) this.watchTree(full, /* markExisting */ true);
@@ -397,7 +397,10 @@ export class FileWatcher {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (this.isAlwaysIgnored(rel)) return;
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    if (!isSourceFile(rel)) return;
+    if (!isSourceFile(rel)) {
+      this.maybeScheduleForRemovedDir(rel);
+      return;
+    }
 
     // Canonicalize for STORAGE so the staleness banner — which compares tool
     // responses (canonical, from the DB) against these keys — matches a change
@@ -413,6 +416,30 @@ export class FileWatcher {
         lastSeenMs: now,
       });
     }
+    this.scheduleSync();
+  }
+
+  /**
+   * Directory deletion may arrive as one event for the directory itself, with
+   * no child-file events. Because that path has no source extension, silently
+   * dropping it leaves every indexed child stale until an unrelated edit.
+   *
+   * A missing non-source path is therefore treated as a possible removed
+   * directory and schedules the normal full scan-diff. Existing non-source
+   * files remain ignored, so documentation/build churn does not trigger sync.
+   * The occasional deleted non-source file is an intentional false positive:
+   * one debounced no-op reconcile is safer than retaining a vanished subtree.
+   */
+  private maybeScheduleForRemovedDir(rel: string): void {
+    try {
+      fs.statSync(path.join(this.projectRoot, rel));
+      return;
+    } catch {
+      // Missing or inaccessible: the full reconcile is the source of truth.
+    }
+    logDebug('Non-source path removed; scheduling sync for possible directory removal', {
+      path: rel,
+    });
     this.scheduleSync();
   }
 
