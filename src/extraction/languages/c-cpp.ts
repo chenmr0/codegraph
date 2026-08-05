@@ -477,6 +477,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   const out: string[] = [];
   let i = 0;
   let parenDepth = 0;
+  let bracketDepth = 0;
   // Brace context stack — records the KIND of each `{` so macro-replacement
   // decisions can distinguish contexts that share the same parenDepth:
   //   'init'      initializer list / aggregate body  `{ NULL, 0 }`  → don't replace
@@ -492,7 +493,18 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   // (C `typedef struct { VOS_MSG_HEADER ... }`) — replacing it with `0;` makes
   // the field list illegal and the whole struct is lost. So object-like macros
   // are kept verbatim here; the replace decision is in the identifier handler.
-  const braceStack: string[] = [];
+  type BraceKind = 'init' | 'enum' | 'struct' | 'class' | 'stmt' | 'namespace';
+  interface BraceFrame {
+    kind: BraceKind;
+    parenDepthAtOpen: number;
+    bracketDepthAtOpen: number;
+    // Directly-written enum members need one narrow exception to project-wide
+    // bodyless-macro blanking: an unrelated `#define MEMBER` must not erase the
+    // declaration's name. This flag stays true through the initializer and is
+    // reset only at the next direct enum-list comma.
+    enumMemberSeen: boolean;
+  }
+  const braceStack: BraceFrame[] = [];
 
   // Scan back over `out` to find the last non-whitespace character — used to
   // classify a `{` as function body (preceded by ')', ':', ';', '}') vs
@@ -556,6 +568,88 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   };
 
   const n = source.length;
+
+  const currentBraceFrame = (): BraceFrame | undefined =>
+    braceStack.length > 0 ? braceStack[braceStack.length - 1] : undefined;
+
+  const isDirectEnumBody = (frame: BraceFrame | undefined): frame is BraceFrame =>
+    frame?.kind === 'enum' &&
+    parenDepth === frame.parenDepthAtOpen &&
+    bracketDepth === frame.bracketDepthAtOpen;
+
+  // Return the next token that determines whether an identifier is the enum
+  // member's declared name. Trivia, C/C++ attributes, and following bodyless
+  // postfix macros disappear before parsing and therefore do not change the
+  // decision. Examples:
+  //   MEMBER [[deprecated]],  -> ','  (MEMBER is the declared name)
+  //   MEMBER EMPTY_ATTR,      -> ','  (MEMBER is the declared name)
+  //   EMPTY_ATTR MEMBER,      -> 'M'  (EMPTY_ATTR is a prefix; blank it)
+  const nextEnumStructuralToken = (start: number): number => {
+    let k = start;
+    while (k < n) {
+      while (k < n && /\s/.test(at(k))) k++;
+
+      if (at(k) === '/' && at(k + 1) === '/') {
+        const end = source.indexOf('\n', k + 2);
+        k = end === -1 ? n : end + 1;
+        continue;
+      }
+      if (at(k) === '/' && at(k + 1) === '*') {
+        const end = source.indexOf('*/', k + 2);
+        k = end === -1 ? n : end + 2;
+        continue;
+      }
+
+      // Enumerator attributes follow the identifier in C++/C23. Skip balanced
+      // `[[...]]` groups so a colliding name before an attribute is preserved.
+      if (at(k) === '[' && at(k + 1) === '[') {
+        let depth = 1;
+        k += 2;
+        while (k < n && depth > 0) {
+          if (at(k) === '[' && at(k + 1) === '[') {
+            depth++;
+            k += 2;
+          } else if (at(k) === ']' && at(k + 1) === ']') {
+            depth--;
+            k += 2;
+          } else if (at(k) === '"' || at(k) === "'") {
+            const quote = at(k);
+            k++;
+            while (k < n) {
+              if (at(k) === '\\') {
+                k += 2;
+              } else if (at(k) === quote) {
+                k++;
+                break;
+              } else {
+                k++;
+              }
+            }
+          } else {
+            k++;
+          }
+        }
+        continue;
+      }
+
+      if (bodylessMacroNames && isIdentStart(at(k))) {
+        let end = k + 1;
+        while (end < n && isIdentPart(at(end))) end++;
+        if (bodylessMacroNames.has(source.slice(k, end))) {
+          k = end;
+          continue;
+        }
+      }
+
+      break;
+    }
+    return k;
+  };
+
+  const looksLikeEnumMemberName = (end: number): boolean => {
+    const next = at(nextEnumStructuralToken(end));
+    return next === '=' || next === ',' || next === '}';
+  };
 
   while (i < n) {
     const c = at(i);
@@ -652,34 +746,50 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     // Bodyless object-like macro (`#define NAME` with empty body, NOT
     // function-like `NAME(...)`) expands to nothing, so blank the whole
     // identifier to spaces (byte-length preserved — keeps offsets/line
-    // numbers exact so getNodeText stays correct). These only ever appear as
-    // attribute/placeholder prefixes in valid C (a bodyless macro used as a
-    // value would already expand to invalid C), so blanking is safe in any
-    // declarator / parameter / initializer context. NOT gated by parenDepth
-    // or braceStack: `BORROW` inside a parameter list `T * BORROW name`
-    // (parenDepth=1) must still be blanked, and a bodyless macro inside an
-    // initializer list also expands to nothing. String/char/comment/
-    // preprocessor-directive contexts are already skipped above. This runs
-    // before the statement-level `0;` logic so a bodyless prefix macro like
+    // numbers exact so getNodeText stays correct). This is deliberately NOT
+    // gated by parenDepth or general brace context: `BORROW` inside a parameter
+    // list `T * BORROW name`, an empty prefix/postfix in an enum, and a bodyless
+    // macro inside an initializer must still be blanked. The narrow exception
+    // is a directly-written enum member name: the project-wide macro union may
+    // contain an unrelated `#define MEMBER`, and erasing the declaration name
+    // would silently drop that enum_member. String/char/comment/preprocessor-
+    // directive contexts are already skipped above. This runs before the
+    // statement-level `0;` logic so a bodyless prefix macro like
     // `typedef SAFE VOS_BOOL (*FnPtr)(...)` is reduced to the clean
-    // `typedef  VOS_BOOL (*FnPtr)(...)` shape that tree-sitter parses
-    // correctly (without it, `SAFE` is taken as the `type` and the real name
-    // is buried in an error-recovery `parameter_list`, so the typedef is
-    // named `VOS_BOOL (*FnPtr)` and never matches an exact-name query).
+    // `typedef  VOS_BOOL (*FnPtr)(...)` shape that tree-sitter parses correctly.
     if (bodylessMacroNames && bodylessMacroNames.size > 0 && isIdentStart(c)) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
       if (bodylessMacroNames.has(ident)) {
+        const frame = currentBraceFrame();
+        if (isDirectEnumBody(frame) && !frame.enumMemberSeen && looksLikeEnumMemberName(j)) {
+          frame.enumMemberSeen = true;
+          out.push(source.slice(i, j));
+          i = j;
+          continue;
+        }
         out.push(' '.repeat(j - i));
         i = j;
         continue;
       }
     }
 
+    // Record ordinary enum names too, including names followed by bodyless
+    // postfix attributes. This prevents the postfix token from being mistaken
+    // for the member name merely because it is followed by a comma.
+    const enumFrame = currentBraceFrame();
+    if (isDirectEnumBody(enumFrame) && !enumFrame.enumMemberSeen && isIdentStart(c)) {
+      let j = i + 1;
+      while (j < n && isIdentPart(at(j))) j++;
+      if (looksLikeEnumMemberName(j)) enumFrame.enumMemberSeen = true;
+    }
+
     // Track paren depth.
     if (c === '(') { parenDepth++; out.push(c); i++; continue; }
     if (c === ')') { parenDepth--; out.push(c); i++; continue; }
+    if (c === '[') { bracketDepth++; out.push(c); i++; continue; }
+    if (c === ']') { bracketDepth--; out.push(c); i++; continue; }
 
     // Track brace context — classify each `{` by kind (see braceStack decl).
     if (c === '{') {
@@ -689,7 +799,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       // Type keywords win over the `)`/`:`/`;` heuristics: `class Foo : Base {`
       // has pc=':' but is a class body; `typedef struct {` has pc=identifier-char
       // but is a struct body.
-      let kind: string;
+      let kind: BraceKind;
       if (tk === 'namespace') kind = 'namespace';
       else if (tk === 'enum') kind = 'enum';
       else if (tk === 'class') kind = 'class';
@@ -697,7 +807,12 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       else if (pc === ')' || pc === ':' || pc === ';' || pc === '}' ||
                pw === 'do' || pw === 'else' || pw === 'try' || pw === 'finally') kind = 'stmt';
       else kind = 'init';
-      braceStack.push(kind);
+      braceStack.push({
+        kind,
+        parenDepthAtOpen: parenDepth,
+        bracketDepthAtOpen: bracketDepth,
+        enumMemberSeen: false,
+      });
       out.push(c);
       i++;
       continue;
@@ -709,8 +824,16 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       continue;
     }
 
+    // Only a direct enum-list comma starts the next member. Commas inside
+    // parentheses, attributes, or nested braced initializers leave the current
+    // enum frame untouched.
+    const commaFrame = currentBraceFrame();
+    if (c === ',' && isDirectEnumBody(commaFrame)) {
+      commaFrame.enumMemberSeen = false;
+    }
+
     // Identifier at depth 0 — candidate statement-level macro.
-    const braceTop = braceStack.length > 0 ? braceStack[braceStack.length - 1] : '';
+    const braceTop = currentBraceFrame()?.kind ?? '';
     const inNoReplace = braceTop === 'init' || braceTop === 'enum';
     if (isIdentStart(c) && parenDepth === 0 && !inNoReplace) {
       let j = i + 1;
