@@ -59,6 +59,9 @@ function supportsRecursiveWatch(): boolean {
  */
 const DEFAULT_MAX_DIR_WATCHES = 50_000;
 
+/** Above this event-set size a full reconcile is safer and comparably cheap. */
+const SCOPED_SYNC_MAX_PENDING = 500;
+
 function maxDirWatches(): number {
   const raw = process.env.CODEGRAPH_MAX_DIR_WATCHES;
   if (raw && /^\d+$/.test(raw)) {
@@ -168,6 +171,8 @@ export class FileWatcher {
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** An uncertain event (notably a directory deletion) requires a full scan. */
+  private needsFullScan = false;
   /**
    * Files seen by the watcher since the last successful sync — populated on
    * every change event, cleared at the start of a sync, and re-populated by
@@ -207,14 +212,16 @@ export class FileWatcher {
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
-  private readonly syncFn: () => Promise<{ filesChanged: number; durationMs: number }>;
+  private readonly syncFn: (
+    paths?: string[]
+  ) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
   private readonly onSyncError?: WatchOptions['onSyncError'];
   private readonly inertForTests: boolean;
 
   constructor(
     projectRoot: string,
-    syncFn: () => Promise<{ filesChanged: number; durationMs: number }>,
+    syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
     options: WatchOptions = {}
   ) {
     this.projectRoot = projectRoot;
@@ -440,6 +447,7 @@ export class FileWatcher {
     logDebug('Non-source path removed; scheduling sync for possible directory removal', {
       path: rel,
     });
+    this.needsFullScan = true;
     this.scheduleSync();
   }
 
@@ -590,8 +598,19 @@ export class FileWatcher {
     this.syncStartedMs = Date.now();
     this.syncing = true;
 
+    // Plain file events fully describe the work, so avoid an O(repository)
+    // scan. Directory removals, retries without a file set, and branch-sized
+    // event storms retain the full reconcile as the correctness backstop.
+    const scopedPaths =
+      !this.needsFullScan &&
+      this.pendingFiles.size > 0 &&
+      this.pendingFiles.size <= SCOPED_SYNC_MAX_PENDING
+        ? [...this.pendingFiles.keys()]
+        : undefined;
+
     try {
-      const result = await this.syncFn();
+      const result = await this.syncFn(scopedPaths);
+      if (!scopedPaths) this.needsFullScan = false;
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends
@@ -625,7 +644,7 @@ export class FileWatcher {
 
       // If pending files remain (mid-sync events, or this sync failed),
       // schedule another pass.
-      if (this.pendingFiles.size > 0 && !this.stopped) {
+      if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
         this.scheduleSync();
       }
     }

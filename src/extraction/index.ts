@@ -2000,7 +2000,14 @@ export class ExtractionOrchestrator {
    * changes. This works in non-git projects and catches committed changes from
    * `git pull`/`checkout`/`merge`/`rebase` that `git status` cannot see.
    */
-  async sync(onProgress?: (progress: IndexProgress) => void): Promise<SyncResult> {
+  async sync(
+    onProgress?: (progress: IndexProgress) => void,
+    /**
+     * Exact watcher paths. Undefined keeps the full filesystem reconcile as
+     * the source of truth for manual sync and uncertain watcher events.
+     */
+    scopedPaths?: string[]
+  ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     // Sync rescans; clear the canonical-path cache so repointed symlinks are seen.
     clearCanonicalCache();
@@ -2030,11 +2037,52 @@ export class ExtractionOrchestrator {
     // whether or not the project uses git, and crucially also catches committed
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
-    const currentFiles = await scanDirectoryAsync(this.rootDir);
-    filesChecked = currentFiles.length;
+    let currentFiles: string[];
+    let trackedFiles: FileRecord[];
+    if (scopedPaths && scopedPaths.length > 0) {
+      // Watcher paths are already filtered and canonicalized. Validate again
+      // at this API boundary so a direct caller cannot make the pre-hash read
+      // escape the project root.
+      const unique = new Set<string>();
+      let safe = true;
+      for (const rawPath of scopedPaths) {
+        const normalized = normalizePath(rawPath);
+        if (!normalized || normalized === '.' || normalized.startsWith('..')) {
+          safe = false;
+          break;
+        }
+        if (!validatePathWithinRoot(this.rootDir, normalized)) {
+          safe = false;
+          break;
+        }
+        unique.add(canonicalFilePath(this.rootDir, normalized));
+      }
+
+      if (safe && unique.size > 0) {
+        const paths = [...unique];
+        currentFiles = paths.filter((filePath) =>
+          fs.existsSync(path.join(this.rootDir, filePath))
+        );
+        trackedFiles = [];
+        for (const filePath of paths) {
+          const tracked = this.queries.getFileByPath(filePath);
+          if (tracked) trackedFiles.push(tracked);
+        }
+        // Count examined paths, including deletions, so a successful scoped
+        // delete cannot resemble the zero-shape used for lock contention.
+        filesChecked = paths.length;
+      } else {
+        currentFiles = await scanDirectoryAsync(this.rootDir);
+        trackedFiles = this.queries.getAllFiles();
+        filesChecked = currentFiles.length;
+      }
+    } else {
+      currentFiles = await scanDirectoryAsync(this.rootDir);
+      trackedFiles = this.queries.getAllFiles();
+      filesChecked = currentFiles.length;
+    }
     const currentSet = new Set(currentFiles);
 
-    const trackedFiles = this.queries.getAllFiles();
     const trackedMap = new Map<string, FileRecord>();
     for (const f of trackedFiles) {
       trackedMap.set(f.path, f);

@@ -68,9 +68,10 @@ describe('C/C++ sync cross-file reference recovery', () => {
       'int existing_api(void) { return 1; }\nint late_api(void) { return 2; }\n'
     );
 
-    const result = await cg.sync();
+    const result = await cg.sync({ paths: ['provider.c'] });
 
     expect(result.filesModified).toBe(1);
+    expect(result.filesChecked).toBe(1);
     expect(hasCall(cg, 'caller', 'late_api')).toBe(true);
     expect(cg.getFile('caller.c')!.indexedAt).toBe(callerIndexedAt);
     expect(
@@ -96,9 +97,10 @@ describe('C/C++ sync cross-file reference recovery', () => {
     const callerIndexedAt = cg.getFile('caller.c')!.indexedAt;
 
     fs.unlinkSync(path.join(directory, 'provider.c'));
-    const removal = await cg.sync();
+    const removal = await cg.sync({ paths: ['provider.c'] });
 
     expect(removal.filesRemoved).toBe(1);
+    expect(removal.filesChecked).toBe(1);
     expect(cg.getNodesByName('recoverable_api')).toHaveLength(0);
     const parked = rawDb(cg)
       .prepare(
@@ -112,9 +114,10 @@ describe('C/C++ sync cross-file reference recovery', () => {
       path.join(directory, 'provider.c'),
       'int recoverable_api(void) { return 9; }\n'
     );
-    const addition = await cg.sync();
+    const addition = await cg.sync({ paths: ['provider.c'] });
 
     expect(addition.filesAdded).toBe(1);
+    expect(addition.filesChecked).toBe(1);
     expect(hasCall(cg, 'caller', 'recoverable_api')).toBe(true);
     expect(cg.getFile('caller.c')!.indexedAt).toBe(callerIndexedAt);
   });
@@ -143,8 +146,9 @@ describe('C/C++ sync cross-file reference recovery', () => {
       path.join(directory, 'provider.cpp'),
       'namespace ns { int existing_cpp() { return 1; } int late_cpp() { return 2; } }\n'
     );
-    await cg.sync();
+    const result = await cg.sync({ paths: ['provider.cpp'] });
 
+    expect(result.filesChecked).toBe(1);
     expect(hasCall(cg, 'caller', 'late_cpp')).toBe(true);
   });
 });

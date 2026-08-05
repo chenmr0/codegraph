@@ -149,6 +149,29 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('should reconcile only explicitly scoped watcher paths', async () => {
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'index.ts'),
+          `export function scopedOnly() { return 'updated'; }`
+        );
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'outside-scope.ts'),
+          `export function outsideScope() { return 'later'; }`
+        );
+
+        const scoped = await cg.sync({ paths: ['src/index.ts'] });
+
+        expect(scoped.filesChecked).toBe(1);
+        expect(scoped.filesModified).toBe(1);
+        expect(scoped.filesAdded).toBe(0);
+        expect(cg.searchNodes('scopedOnly').length).toBeGreaterThan(0);
+        expect(cg.searchNodes('outsideScope')).toHaveLength(0);
+
+        const catchUp = await cg.sync();
+        expect(catchUp.filesAdded).toBe(1);
+        expect(cg.searchNodes('outsideScope').length).toBeGreaterThan(0);
+      });
     });
   });
 

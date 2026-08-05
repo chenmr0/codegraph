@@ -29,7 +29,7 @@ import {
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
 
-type SyncFn = () => Promise<{ filesChanged: number; durationMs: number }>;
+type SyncFn = (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
 
 /**
  * Helper to wait for a condition with timeout. Used for assertions that depend
@@ -375,6 +375,85 @@ describe('FileWatcher', () => {
       expect(onSyncError).toHaveBeenCalled();
       expect(onSyncError.mock.calls[0]![0]).toBeInstanceOf(Error);
 
+      watcher.stop();
+    });
+  });
+
+  describe('scoped sync fast path', () => {
+    it('passes the exact pending source paths to sync', async () => {
+      const calls: Array<string[] | undefined> = [];
+      const watcher = newWatcher(async (paths) => {
+        calls.push(paths);
+        return { filesChanged: paths?.length ?? 0, durationMs: 5 };
+      }, { debounceMs: 30 });
+
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      __emitWatchEventForTests(testDir, 'src/added.ts');
+
+      await waitFor(() => calls.length > 0);
+      expect(calls[0]).toEqual(['src/index.ts', 'src/added.ts']);
+      watcher.stop();
+    });
+
+    it('falls back to a full sync for a directory removal', async () => {
+      const calls: Array<string[] | undefined> = [];
+      const watcher = newWatcher(async (paths) => {
+        calls.push(paths);
+        return { filesChanged: 1, durationMs: 5 };
+      }, { debounceMs: 30 });
+
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/removed-directory');
+
+      await waitFor(() => calls.length > 0);
+      expect(calls[0]).toBeUndefined();
+      watcher.stop();
+    });
+
+    it('falls back to a full sync for an event storm', async () => {
+      const calls: Array<string[] | undefined> = [];
+      const watcher = newWatcher(async (paths) => {
+        calls.push(paths);
+        return { filesChanged: 501, durationMs: 5 };
+      }, { debounceMs: 30 });
+
+      watcher.start();
+      await watcher.waitUntilReady();
+      for (let index = 0; index < 501; index++) {
+        __emitWatchEventForTests(testDir, `src/storm-${index}.ts`);
+      }
+
+      await waitFor(() => calls.length > 0);
+      expect(calls[0]).toBeUndefined();
+      watcher.stop();
+    });
+
+    it('runs a full follow-up when a directory removal arrives mid-sync', async () => {
+      const calls: Array<string[] | undefined> = [];
+      let releaseFirst!: () => void;
+      const firstSyncBlocked = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const watcher = newWatcher(async (paths) => {
+        calls.push(paths);
+        if (calls.length === 1) await firstSyncBlocked;
+        return { filesChanged: 1, durationMs: 5 };
+      }, { debounceMs: 30 });
+
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      await waitFor(() => calls.length === 1);
+
+      __emitWatchEventForTests(testDir, 'src/removed-mid-sync');
+      releaseFirst();
+
+      await waitFor(() => calls.length === 2);
+      expect(calls[0]).toEqual(['src/index.ts']);
+      expect(calls[1]).toBeUndefined();
       watcher.stop();
     });
   });

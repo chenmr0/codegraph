@@ -124,6 +124,15 @@ export interface IndexOptions {
   verbose?: boolean;
 }
 
+/** Options for incremental synchronization. */
+export interface SyncOptions extends IndexOptions {
+  /**
+   * Exact project-relative source paths reported by the file watcher.
+   * @internal Callers without a complete event set must leave this undefined.
+   */
+  paths?: string[];
+}
+
 /**
  * Main CodeGraph class
  *
@@ -606,7 +615,7 @@ export class CodeGraph {
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
-  async sync(options: IndexOptions = {}): Promise<SyncResult> {
+  async sync(options: SyncOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -639,7 +648,7 @@ export class CodeGraph {
           walValve.start();
         }
 
-        const result = await this.orchestrator.sync(options.onProgress);
+        const result = await this.orchestrator.sync(options.onProgress, options.paths);
 
         // Fold extraction writes before resolution starts reading the changed
         // graph. Besides bounding the WAL, this avoids making the main thread
@@ -825,8 +834,8 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      async () => {
-        const result = await this.sync();
+      async (paths?: string[]) => {
+        const result = await this.sync({ paths });
         // sync() returns this exact zero-shape iff it failed to acquire the
         // file lock (a real empty sync always has filesChecked > 0 because
         // scanDirectory ran). Surface that to the watcher as a typed error
