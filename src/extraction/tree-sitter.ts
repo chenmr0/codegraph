@@ -670,6 +670,34 @@ export class TreeSitterExtractor {
       !this.isInsideFunctionNode() &&
       !this.isInsideCompoundStatement(node)
     ) {
+      // C/C++ unresolved wrapper macros can split
+      //
+      //   EXTERN_STDC_BEGIN
+      //   typedef enum { A, B } Alias;
+      //
+      // into a broken `EXTERN_STDC_BEGIN typedef` declaration followed by a
+      // normal declaration whose type is the still-intact anonymous enum. The
+      // latter otherwise goes through extractVariable and skips its children,
+      // losing the enum and every member. Recover only this precise two-node
+      // error shape; a legal `enum { A } variable;` has no broken `typedef`
+      // prefix and must remain a variable declaration.
+      const splitTypedefEnum =
+        (this.language === 'c' || this.language === 'cpp')
+          ? this.getSplitTypedefEnumDeclaration(node)
+          : null;
+      const nextSplitTypedefEnum =
+        (this.language === 'c' || this.language === 'cpp')
+          ? this.getSplitTypedefEnumDeclaration(node.nextNamedSibling)
+          : null;
+
+      if (splitTypedefEnum) {
+        this.extractEnum(splitTypedefEnum.enumNode, splitTypedefEnum.alias);
+        skipChildren = true;
+      } else if (nextSplitTypedefEnum?.prefixNode.id === node.id) {
+        // Suppress the bogus variable named `typedef`; the following
+        // declaration is recovered as the enum typedef above.
+        skipChildren = true;
+      }
       // C/C++ split-prototype stray half: this declaration is the spurious
       // `(declaration type:(type_identifier) declarator:(identifier) (MISSING
       // ";"))` that tree-sitter-c emits as the FIRST half of a misparsed
@@ -682,7 +710,7 @@ export class TreeSitterExtractor {
       // `*name(args)` expression_statement, so this never suppresses a
       // legitimate symbol. See isBrokenTypeSplitDeclaration /
       // rescueSplitPrototypeExprStmt.
-      if (
+      else if (
         (this.language === 'c' || this.language === 'cpp') &&
         this.isBrokenTypeSplitDeclaration(node) &&
         (this.rescueSplitPrototypeExprStmt(node.nextNamedSibling) !== null ||
@@ -1420,6 +1448,51 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * C/C++: recover a typedef enum split by an unresolved statement wrapper.
+   *
+   * tree-sitter parses `WRAPPER\ntypedef enum { ... } Alias;` as two sibling
+   * declarations when WRAPPER is unknown:
+   *
+   *   declaration(type_identifier: WRAPPER, identifier: typedef, MISSING ';')
+   *   declaration(type: enum_specifier, declarator: Alias, ';')
+   *
+   * The enum_specifier and its enumerators are intact. Return them only when
+   * the preceding broken declaration's declarator is literally `typedef`, so
+   * ordinary anonymous-enum variables cannot be reclassified as type aliases.
+   */
+  private getSplitTypedefEnumDeclaration(node: SyntaxNode | null): {
+    prefixNode: SyntaxNode;
+    enumNode: SyntaxNode;
+    alias: string;
+  } | null {
+    if (!node || node.type !== 'declaration' || !this.extractor) return null;
+
+    const prefixNode = node.previousNamedSibling;
+    if (!prefixNode || !this.isBrokenTypeSplitDeclaration(prefixNode)) return null;
+
+    const prefixDeclarator = getChildByField(prefixNode, 'declarator');
+    if (!prefixDeclarator || getNodeText(prefixDeclarator, this.source) !== 'typedef') return null;
+
+    const enumNode = getChildByField(node, 'type');
+    if (!enumNode || !this.extractor.enumTypes.includes(enumNode.type)) return null;
+    const body = this.extractor.resolveBody?.(enumNode, this.extractor.bodyField)
+      ?? getChildByField(enumNode, this.extractor.bodyField);
+    if (!body) return null;
+
+    const aliasNode = getChildByField(node, 'declarator');
+    if (!aliasNode || (aliasNode.type !== 'identifier' && aliasNode.type !== 'type_identifier')) {
+      return null;
+    }
+    const alias = getNodeText(aliasNode, this.source);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) return null;
+
+    const hasRealTerminator = node.children.some((child) => child.type === ';' && !child.isMissing);
+    if (!hasRealTerminator) return null;
+
+    return { prefixNode, enumNode, alias };
+  }
+
+  /**
    * C/C++: detect the SECOND half of the split-prototype misparse — an
    * `expression_statement` at translation_unit / namespace scope whose single
    * expression is `*name(args)`, i.e. a `pointer_expression` wrapping a
@@ -1876,7 +1949,7 @@ export class TreeSitterExtractor {
   /**
    * Extract an enum
    */
-  private extractEnum(node: SyntaxNode): void {
+  private extractEnum(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
     // Skip forward declarations and type references (no body = not a definition)
@@ -1884,7 +1957,7 @@ export class TreeSitterExtractor {
       ?? getChildByField(node, this.extractor.bodyField);
     if (!body) return;
 
-    const name = extractName(node, this.source, this.extractor);
+    const name = nameOverride ?? extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
