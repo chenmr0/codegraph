@@ -16,9 +16,11 @@
  * BUMP THIS when a release changes extraction output enough that existing
  * indexes should be rebuilt to benefit — e.g. a new language/framework
  * extractor, a new dynamic-dispatch synthesizer, a new node/edge kind, or a
- * resolver fix that materially changes which edges exist. Do NOT bump for
- * pure bug fixes, CLI/UX changes, or schema-only migrations. Over-bumping
+ * resolver fix that materially changes which edges exist. A bug fix that
+ * restores missing persisted nodes or edges is material and should bump; do
+ * not bump for fixes that leave persisted extraction output unchanged,
+ * CLI/UX changes, or schema-only migrations. Over-bumping
  * turns the re-index hint into noise — keep it honest (see CLAUDE.md, "Honesty
  * in the product is load-bearing").
  */
-export const EXTRACTION_VERSION = 14;
+export const EXTRACTION_VERSION = 15;
