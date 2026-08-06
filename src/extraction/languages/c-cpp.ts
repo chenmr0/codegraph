@@ -473,6 +473,15 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   // equality comparisons below; the loop guards ensure we never push the
   // empty string from an out-of-range read).
   const at = (idx: number): string => (idx >= 0 && idx < source.length) ? source[idx]! : '';
+  // Macro names are preprocessing TOKENS, never substrings of a larger C/C++
+  // identifier. The scanner normally consumes a whole identifier in its
+  // statement-macro branch, but contexts where replacement is disabled (most
+  // importantly enum bodies and parenthesized declarators) advance one byte at
+  // a time. Without this left-boundary check, `#define IN` is retried at the
+  // `I` inside `SYNCETH_TYPE_IN` and erases the suffix, producing the bogus
+  // symbol `SYNCETH_TYPE_`.
+  const isIdentTokenStart = (idx: number): boolean =>
+    isIdentStart(at(idx)) && (idx === 0 || !isIdentPart(at(idx - 1)));
 
   const out: string[] = [];
   let i = 0;
@@ -632,7 +641,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
         continue;
       }
 
-      if (bodylessMacroNames && isIdentStart(at(k))) {
+      if (bodylessMacroNames && isIdentTokenStart(k)) {
         let end = k + 1;
         while (end < n && isIdentPart(at(end))) end++;
         if (bodylessMacroNames.has(source.slice(k, end))) {
@@ -757,7 +766,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     // statement-level `0;` logic so a bodyless prefix macro like
     // `typedef SAFE VOS_BOOL (*FnPtr)(...)` is reduced to the clean
     // `typedef  VOS_BOOL (*FnPtr)(...)` shape that tree-sitter parses correctly.
-    if (bodylessMacroNames && bodylessMacroNames.size > 0 && isIdentStart(c)) {
+    if (bodylessMacroNames && bodylessMacroNames.size > 0 && isIdentTokenStart(i)) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
@@ -779,7 +788,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     // postfix attributes. This prevents the postfix token from being mistaken
     // for the member name merely because it is followed by a comma.
     const enumFrame = currentBraceFrame();
-    if (isDirectEnumBody(enumFrame) && !enumFrame.enumMemberSeen && isIdentStart(c)) {
+    if (isDirectEnumBody(enumFrame) && !enumFrame.enumMemberSeen && isIdentTokenStart(i)) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       if (looksLikeEnumMemberName(j)) enumFrame.enumMemberSeen = true;
@@ -835,7 +844,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     // Identifier at depth 0 — candidate statement-level macro.
     const braceTop = currentBraceFrame()?.kind ?? '';
     const inNoReplace = braceTop === 'init' || braceTop === 'enum';
-    if (isIdentStart(c) && parenDepth === 0 && !inNoReplace) {
+    if (isIdentTokenStart(i) && parenDepth === 0 && !inNoReplace) {
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
