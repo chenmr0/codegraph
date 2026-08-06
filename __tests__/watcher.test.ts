@@ -149,6 +149,69 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    it('should quick-fire small C/C++ saves but retain the full delay for larger bursts', async () => {
+      vi.useFakeTimers();
+      const quickSync = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const quickWatcher = newWatcher(quickSync, { debounceMs: 2000 });
+      let burstWatcher: FileWatcher | null = null;
+
+      try {
+        quickWatcher.start();
+        await quickWatcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/edited.cpp');
+
+        await vi.advanceTimersByTimeAsync(299);
+        expect(quickSync).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(quickSync).toHaveBeenCalledTimes(1);
+        quickWatcher.stop();
+
+        const burstSync = vi.fn().mockResolvedValue({ filesChanged: 3, durationMs: 10 });
+        burstWatcher = newWatcher(burstSync, { debounceMs: 2000 });
+        burstWatcher.start();
+        await burstWatcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/one.cpp');
+        __emitWatchEventForTests(testDir, 'src/two.cpp');
+        __emitWatchEventForTests(testDir, 'src/three.cpp');
+
+        await vi.advanceTimersByTimeAsync(1999);
+        expect(burstSync).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(burstSync).toHaveBeenCalledTimes(1);
+        burstWatcher.stop();
+      } finally {
+        quickWatcher.stop();
+        burstWatcher?.stop();
+        vi.useRealTimers();
+      }
+    });
+
+    it('should not quick-fire retries after a failed C/C++ sync', async () => {
+      vi.useFakeTimers();
+      const syncFn = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('temporary failure'))
+        .mockResolvedValueOnce({ filesChanged: 1, durationMs: 10 });
+      const watcher = newWatcher(syncFn, { debounceMs: 2000 });
+
+      try {
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/retry.cpp');
+
+        await vi.advanceTimersByTimeAsync(300);
+        expect(syncFn).toHaveBeenCalledTimes(1);
+
+        await vi.advanceTimersByTimeAsync(1999);
+        expect(syncFn).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(syncFn).toHaveBeenCalledTimes(2);
+      } finally {
+        watcher.stop();
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('filtering', () => {

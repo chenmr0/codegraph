@@ -59,6 +59,11 @@ function supportsRecursiveWatch(): boolean {
  */
 const DEFAULT_MAX_DIR_WATCHES = 50_000;
 
+/** Small editor saves should reach the graph without paying the full delay. */
+const QUICK_SYNC_MAX_PENDING = 2;
+const QUICK_SYNC_QUIET_MS = 300;
+const MAX_RETRY_BACKOFF_MS = 30_000;
+
 /** Above this event-set size a full reconcile is safer and comparably cheap. */
 const SCOPED_SYNC_MAX_PENDING = 500;
 
@@ -189,6 +194,8 @@ export class FileWatcher {
    */
   private syncStartedMs = 0;
   private syncing = false;
+  /** Consecutive failed sync attempts; reset by the next successful sync. */
+  private syncRetryCount = 0;
   private stopped = false;
   /**
    * True once the initial watch set is established. Unlike the previous
@@ -239,6 +246,7 @@ export class FileWatcher {
   start(): boolean {
     if (this.recursiveWatcher || this.dirWatchers.size > 0 || this.inert) return true; // Already watching
     this.stopped = false;
+    this.syncRetryCount = 0;
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -517,6 +525,7 @@ export class FileWatcher {
     }
     this.dirWatchers.clear();
     this.dirCapWarned = false;
+    this.syncRetryCount = 0;
     this.inert = false;
 
     this.pendingFiles.clear();
@@ -567,16 +576,40 @@ export class FileWatcher {
   }
 
   /**
-   * Schedule a debounced sync.
+   * Schedule a trailing-edge sync. A normal one- or two-file editor save uses
+   * a short quiet window; larger bursts retain the configured debounce so they
+   * still coalesce into one update.
    */
   private scheduleSync(): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
+    // Keep an explicitly shorter configured debounce authoritative. The 100ms
+    // floor applies only to the adaptive window, not to larger event bursts.
+    const quickMs = Math.max(100, Math.min(QUICK_SYNC_QUIET_MS, this.debounceMs));
+    const delay =
+      this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING
+        ? quickMs
+        : this.debounceMs;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
-    }, this.debounceMs);
+    }, delay);
+  }
+
+  /** Failed syncs retry with bounded exponential backoff, never quick-fire. */
+  private scheduleRetrySync(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    const delay = Math.min(
+      this.debounceMs * 2 ** Math.max(0, this.syncRetryCount - 1),
+      MAX_RETRY_BACKOFF_MS
+    );
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.flush();
+    }, delay);
   }
 
   /**
@@ -611,6 +644,7 @@ export class FileWatcher {
     try {
       const result = await this.syncFn(scopedPaths);
       if (!scopedPaths) this.needsFullScan = false;
+      this.syncRetryCount = 0;
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends
@@ -625,6 +659,7 @@ export class FileWatcher {
       }
       this.onSyncComplete?.(result);
     } catch (err) {
+      this.syncRetryCount += 1;
       if (err instanceof LockUnavailableError) {
         // Lock-failure no-op (another writer holds the lock). pendingFiles
         // stays intact and the `finally` block reschedules. Debug-only —
@@ -645,7 +680,11 @@ export class FileWatcher {
       // If pending files remain (mid-sync events, or this sync failed),
       // schedule another pass.
       if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
-        this.scheduleSync();
+        if (this.syncRetryCount > 0) {
+          this.scheduleRetrySync();
+        } else {
+          this.scheduleSync();
+        }
       }
     }
   }
