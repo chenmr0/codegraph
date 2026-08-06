@@ -721,16 +721,6 @@ export class CodeGraph {
           }
         }
 
-        if (
-          result.filesAdded > 0 ||
-          result.filesModified > 0 ||
-          resurrectedRefs.length > 0
-        ) {
-          // Run after scoped resolution, resurrection, and failed-ref retries:
-          // any of them can defer a chained call until conformance edges exist.
-          this.resolver.resolveChainedCallsViaConformance();
-        }
-
         // Edge re-wiring (done inside storeExtractionResult during
         // orchestrator.sync()) already restored incoming cross-file edges
         // from unchanged files to the changed files' new nodes.  Only the
@@ -779,8 +769,41 @@ export class CodeGraph {
           );
         }
 
+        // A process killed during reference resolution can leave untouched
+        // pending rows behind. Scoped sync normally reads only changed files,
+        // so those rows (and their missing call/import edges) would otherwise
+        // survive forever. Sweep them after all scoped work, including during
+        // a no-change sync. A healthy sync pays for only this COUNT query.
+        const orphanCount = this.queries.getUnresolvedReferencesCount();
+        if (orphanCount > 0) {
+          options.onProgress?.({
+            phase: 'resolving',
+            current: 0,
+            total: orphanCount,
+          });
+          await this.resolveReferencesBatched((current, total) => {
+            options.onProgress?.({ phase: 'resolving', current, total });
+          });
+        }
+
+        if (
+          result.filesAdded > 0 ||
+          result.filesModified > 0 ||
+          resurrectedRefs.length > 0 ||
+          orphanCount > 0
+        ) {
+          // Run after every resolution source: scoped refs, resurrected refs,
+          // co-importer fallback, and the interrupted-run orphan sweep.
+          this.resolver.resolveChainedCallsViaConformance();
+        }
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
+        if (
+          result.filesAdded > 0 ||
+          result.filesModified > 0 ||
+          result.filesRemoved > 0 ||
+          orphanCount > 0
+        ) {
           await this.db.runMaintenance();
         }
 
@@ -1009,6 +1032,15 @@ export class CodeGraph {
         : undefined,
       onSynthesisProgress,
     });
+  }
+
+  /**
+   * References extracted but not yet attempted by a resolution pass. A
+   * non-zero value at rest normally means indexing was interrupted; the next
+   * sync sweeps these rows in bounded batches.
+   */
+  getPendingReferenceCount(): number {
+    return this.queries.getUnresolvedReferencesCount();
   }
 
   /**
