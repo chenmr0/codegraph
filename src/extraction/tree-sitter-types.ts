@@ -88,6 +88,16 @@ export interface LanguageExtractor {
    */
   preParse?: (source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>) => string;
 
+  /**
+   * Controls when preParse is applied. The default is `always`, which is
+   * appropriate for deterministic grammar workarounds such as blanking C#
+   * conditional directives. `on-error` first parses the unmodified source and
+   * uses the transform only as a targeted recovery attempt when that tree has
+   * ERROR/MISSING nodes or a proven silent macro-structure artifact, and the
+   * transformed parse is objectively better.
+   */
+  preParseStrategy?: 'always' | 'on-error';
+
   // --- Node type mappings ---
 
   /** Node types that represent functions */

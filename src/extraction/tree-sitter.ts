@@ -293,6 +293,254 @@ const TYPE_PARAMETER_KINDS: ReadonlySet<NodeKind> = new Set([
   'function', 'method', 'class', 'struct', 'interface', 'trait', 'enum', 'type_alias',
 ]);
 
+interface ParseDamage {
+  errorCount: number;
+  missingCount: number;
+  macroArtifactCount: number;
+  totalErrorSpan: number;
+  largestErrorSpan: number;
+  score: number;
+}
+
+interface SourceRange {
+  start: number;
+  end: number;
+}
+
+/** Find the narrow silent misparse produced by `SWITCH(x)\nnext_call()`. */
+function findStatementMacroArtifacts(
+  root: SyntaxNode,
+  macroNames?: Set<string> | null,
+): SyntaxNode[] {
+  if (!macroNames || macroNames.size === 0) return [];
+
+  const artifacts: SyntaxNode[] = [];
+  for (const macroType of root.descendantsOfType('macro_type_specifier')) {
+    const nameNode = macroType.childForFieldName('name');
+    if (!nameNode || !macroNames.has(nameNode.text)) continue;
+
+    let declaration = macroType.parent;
+    while (
+      declaration &&
+      declaration.type !== 'declaration' &&
+      declaration.type !== 'field_declaration' &&
+      declaration.type !== 'translation_unit' &&
+      declaration.type !== 'compound_statement'
+    ) {
+      declaration = declaration.parent;
+    }
+    if (!declaration || declaration.type !== 'declaration') continue;
+
+    // The hallmark of the silent SWITCH(x) misparse is that the macro type on
+    // one line absorbs the next line's `bar()` as a function declarator. A real
+    // macro type declaration normally keeps its declarator on the same line;
+    // requiring both the line break and function_declarator keeps this signal
+    // narrow and avoids treating ordinary macro-based variable types as damage.
+    if (declaration.endPosition.row <= macroType.endPosition.row) continue;
+    if (declaration.descendantsOfType('function_declarator').length === 0) continue;
+
+    let parent = declaration.parent;
+    let insideCompound = false;
+    while (parent && parent.type !== 'translation_unit') {
+      if (parent.type === 'compound_statement') {
+        insideCompound = true;
+        break;
+      }
+      parent = parent.parent;
+    }
+    if (insideCompound) artifacts.push(declaration);
+  }
+  return artifacts;
+}
+
+/**
+ * Quantify tree-sitter recovery damage. ERROR byte span is weighted most
+ * heavily because one giant recovery node swallowing a function/file is much
+ * worse for extraction than a tiny missing token. Counts keep several small
+ * errors from looking free. Zero means a structurally clean parse.
+ */
+function measureParseDamage(
+  root: SyntaxNode,
+  macroNames?: Set<string> | null,
+): ParseDamage {
+  const macroArtifacts = findStatementMacroArtifacts(root, macroNames);
+  if (!root.hasError && macroArtifacts.length === 0) {
+    return {
+      errorCount: 0,
+      missingCount: 0,
+      macroArtifactCount: 0,
+      totalErrorSpan: 0,
+      largestErrorSpan: 0,
+      score: 0,
+    };
+  }
+
+  let errorCount = 0;
+  let missingCount = 0;
+  let totalErrorSpan = 0;
+  let largestErrorSpan = 0;
+  if (root.hasError) {
+    const stack: SyntaxNode[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (node.isError) {
+        errorCount++;
+        const span = Math.max(1, node.endIndex - node.startIndex);
+        totalErrorSpan += span;
+        if (span > largestErrorSpan) largestErrorSpan = span;
+      }
+      if (node.isMissing) missingCount++;
+      if (!node.hasError && !node.isError && !node.isMissing) continue;
+      for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child) stack.push(child);
+      }
+    }
+  }
+
+  const macroArtifactSpan = macroArtifacts.reduce(
+    (sum, node) => sum + Math.max(1, node.endIndex - node.startIndex),
+    0,
+  );
+
+  return {
+    errorCount,
+    missingCount,
+    macroArtifactCount: macroArtifacts.length,
+    totalErrorSpan,
+    largestErrorSpan,
+    score:
+      largestErrorSpan * 8 +
+      totalErrorSpan * 4 +
+      errorCount * 64 +
+      missingCount * 32 +
+      macroArtifacts.length * 128 +
+      macroArtifactSpan * 2,
+  };
+}
+
+/** Return true only for a material, measurable parser-recovery improvement. */
+function isParseDamageBetter(candidate: ParseDamage, original: ParseDamage): boolean {
+  return candidate.score < original.score;
+}
+
+/** Expand a bare ERROR range by two source lines for root-level recovery. */
+function expandRangeByLines(source: string, start: number, end: number, lineCount: number): SourceRange {
+  let expandedStart = Math.max(0, start);
+  let expandedEnd = Math.min(source.length, Math.max(end, start + 1));
+  for (let i = 0; i < lineCount; i++) {
+    const previousNewline = source.lastIndexOf('\n', Math.max(0, expandedStart - 2));
+    expandedStart = previousNewline === -1 ? 0 : previousNewline + 1;
+    const nextNewline = source.indexOf('\n', expandedEnd);
+    expandedEnd = nextNewline === -1 ? source.length : nextNewline + 1;
+  }
+  return { start: expandedStart, end: expandedEnd };
+}
+
+/**
+ * Find source scopes in which an error-triggered pre-parse transform is allowed
+ * to operate. Errors inside functions authorize the containing function (all
+ * control-macro lines in that already-damaged body may need masking). Type-body
+ * errors authorize that type. Otherwise only the nearest declaration is used;
+ * a root-level ERROR receives a two-line neighborhood. Preprocessor containers
+ * deliberately never become scopes because one #if commonly wraps a whole
+ * header and would recreate the old file-wide mutation behavior.
+ */
+function collectRecoveryScopes(
+  root: SyntaxNode,
+  source: string,
+  extractor: LanguageExtractor,
+  macroNames?: Set<string> | null,
+): SourceRange[] {
+  const macroArtifacts = findStatementMacroArtifacts(root, macroNames);
+  if (!root.hasError && macroArtifacts.length === 0) return [];
+
+  const functionTypes = new Set(extractor.functionTypes);
+  const typeContainerTypes = new Set([
+    ...extractor.classTypes,
+    ...extractor.structTypes,
+    ...extractor.enumTypes,
+  ]);
+  const declarationTypes = new Set([
+    ...extractor.typeAliasTypes,
+    ...extractor.variableTypes,
+    ...(extractor.fieldTypes ?? []),
+  ]);
+  const ranges: SourceRange[] = [];
+  const stack: SyntaxNode[] = [root];
+
+  const addContainingScope = (issue: SyntaxNode): void => {
+    let current = issue.parent;
+    let declarationScope: SyntaxNode | null = null;
+    let typeScope: SyntaxNode | null = null;
+    let functionScope: SyntaxNode | null = null;
+    while (current && current.type !== 'translation_unit') {
+      if (functionTypes.has(current.type)) functionScope = current;
+      else if (typeContainerTypes.has(current.type)) typeScope = current;
+      else if (!declarationScope && declarationTypes.has(current.type)) declarationScope = current;
+      current = current.parent;
+    }
+
+    const scope = functionScope ?? declarationScope ?? typeScope;
+    ranges.push(scope
+      ? { start: scope.startIndex, end: scope.endIndex }
+      : expandRangeByLines(source, issue.startIndex, issue.endIndex, 2));
+  };
+
+  for (const artifact of macroArtifacts) addContainingScope(artifact);
+
+  while (stack.length > 0) {
+    const issue = stack.pop()!;
+    const isIssue = issue.isError || issue.isMissing;
+    if (isIssue) addContainingScope(issue);
+
+    if (!issue.hasError && !isIssue) continue;
+    for (let i = 0; i < issue.childCount; i++) {
+      const child = issue.child(i);
+      if (child) stack.push(child);
+    }
+  }
+
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: SourceRange[] = [];
+  for (const range of ranges) {
+    const start = Math.max(0, Math.min(source.length, range.start));
+    const end = Math.max(start, Math.min(source.length, range.end));
+    const previous = merged[merged.length - 1];
+    if (previous && start <= previous.end) {
+      if (end > previous.end) previous.end = end;
+    } else if (end > start) {
+      merged.push({ start, end });
+    }
+  }
+  return merged;
+}
+
+/**
+ * Keep an offset-preserving transform only inside parser-damaged scopes.
+ * Returning the original source on a length mismatch enforces the preParse
+ * contract and avoids invalid source-position mappings.
+ */
+function restrictTransformToScopes(
+  source: string,
+  transformed: string,
+  scopes: SourceRange[],
+): string {
+  if (transformed.length !== source.length || transformed === source || scopes.length === 0) {
+    return source;
+  }
+
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const scope of scopes) {
+    parts.push(source.slice(cursor, scope.start));
+    parts.push(transformed.slice(scope.start, scope.end));
+    cursor = scope.end;
+  }
+  parts.push(source.slice(cursor));
+  return parts.join('');
+}
+
 /**
  * TreeSitterExtractor - Main extraction class
  */
@@ -438,15 +686,56 @@ export class TreeSitterExtractor {
         this.xMacroConstructs = xmacro.constructs;
       }
 
-      // Optional pre-parse source transform (offset-preserving) to work around
-      // grammar gaps — e.g. C# blanks conditional-compilation directive lines
-      // the grammar mis-parses inside enum bodies (#237). We reassign
-      // this.source so downstream getNodeText reads the same bytes the parser
-      // saw (identical outside the blanked directive lines).
-      if (this.extractor?.preParse) {
-        this.source = this.extractor.preParse(this.source, this.globalMacroNames ?? undefined, this.globalBodylessMacroNames ?? undefined);
+      // Optional offset-preserving source transform for grammar gaps. Most
+      // languages use the historical `always` strategy. C/C++ uses `on-error`:
+      // parse the original bytes first, leave a healthy tree completely
+      // untouched, and only try macro masking inside structurally damaged
+      // scopes. The retry is accepted only when ERROR/MISSING or proven silent
+      // macro-structure damage decreases.
+      const preParse = this.extractor?.preParse;
+      if (preParse && this.extractor?.preParseStrategy === 'on-error') {
+        const rawTree = parser.parse(this.source) ?? null;
+        if (!rawTree) throw new Error('Parser returned null tree');
+        this.tree = rawTree;
+
+        const originalDamage = measureParseDamage(rawTree.rootNode, this.globalMacroNames);
+        if (originalDamage.score > 0) {
+          const transformed = preParse(
+            this.source,
+            this.globalMacroNames ?? undefined,
+            this.globalBodylessMacroNames ?? undefined,
+          );
+          const scopes = collectRecoveryScopes(
+            rawTree.rootNode,
+            this.source,
+            this.extractor,
+            this.globalMacroNames,
+          );
+          const recoverySource = restrictTransformToScopes(this.source, transformed, scopes);
+          if (recoverySource !== this.source) {
+            const recoveryTree = parser.parse(recoverySource) ?? null;
+            if (recoveryTree) {
+              const recoveryDamage = measureParseDamage(recoveryTree.rootNode, this.globalMacroNames);
+              if (isParseDamageBetter(recoveryDamage, originalDamage)) {
+                rawTree.delete();
+                this.tree = recoveryTree;
+                this.source = recoverySource;
+              } else {
+                recoveryTree.delete();
+              }
+            }
+          }
+        }
+      } else {
+        if (preParse) {
+          this.source = preParse(
+            this.source,
+            this.globalMacroNames ?? undefined,
+            this.globalBodylessMacroNames ?? undefined,
+          );
+        }
+        this.tree = parser.parse(this.source) ?? null;
       }
-      this.tree = parser.parse(this.source) ?? null;
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }

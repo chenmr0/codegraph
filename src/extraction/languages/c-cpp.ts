@@ -1138,6 +1138,7 @@ export const cExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   preParse: preprocessStatementMacros,
+  preParseStrategy: 'on-error',
   getReturnType: extractCppReturnType,
   getSignature: extractCppSignature,
   isConst: (node) => {
@@ -1269,6 +1270,7 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   preParse: preprocessStatementMacros,
+  preParseStrategy: 'on-error',
   // Create a `namespace` node for each `namespace_definition` and scope its
   // declarations so their qualifiedName carries the namespace prefix (see
   // cppVisitNamespace above). Enables `codegraph node ns::symbol` lookups and
