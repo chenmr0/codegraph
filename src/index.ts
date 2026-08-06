@@ -784,6 +784,24 @@ export class CodeGraph {
           await this.resolveReferencesBatched((current, total) => {
             options.onProgress?.({ phase: 'resolving', current, total });
           });
+        } else if (result.changedFilePaths?.length) {
+          // The normal changed-file path resolves only scoped references and
+          // therefore does not enter the full dynamic-synthesis tail. Rebuild
+          // just the C/C++ declaration/definition, extern-variable, and
+          // override relationships invalidated by replacing these files.
+          // If an orphan sweep ran above, its full synthesis already did this.
+          try {
+            await this.resolver.synthesizeIncrementalCCpp(result.changedFilePaths);
+          } catch (error) {
+            // Match the full synthesis phase's best-effort contract: losing an
+            // optional heuristic edge must not discard an otherwise valid
+            // extraction/reference sync.
+            console.error(
+              `[CodeGraph] Incremental C/C++ synthesis failed: ` +
+                `${error instanceof Error ? error.message : String(error)}. ` +
+                `The base sync is still usable but heuristic coverage is incomplete.`
+            );
+          }
         }
 
         if (

@@ -501,14 +501,22 @@ function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
  * implementation(s). Over-approximation accepted (reachability-correct); capped
  * per class and gated to C++ to avoid touching other languages' dispatch.
  */
-function* cppOverrideEdges(queries: QueryBuilder): IterableIterator<Edge> {
+function* cppOverrideEdges(
+  queries: QueryBuilder,
+  subclassIds?: ReadonlySet<string>
+): IterableIterator<Edge> {
   const seen = new Set<string>();
   const methodsOf = (classId: string): Node[] =>
     queries
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
-  for (const cls of queries.iterateNodesByKind('class')) {
+  const classes: Iterable<Node> = subclassIds
+    ? [...subclassIds]
+        .map((id) => queries.getNodeById(id))
+        .filter((node): node is Node => !!node && node.kind === 'class')
+    : queries.iterateNodesByKind('class');
+  for (const cls of classes) {
     const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
     if (subMethods.length === 0) continue;
     for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
@@ -578,17 +586,34 @@ function cppLastTwoSegments(qn: string): string {
   return parts.slice(-2).join('::');
 }
 
-function* cppDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
+function* cppDeclDefEdges(
+  queries: QueryBuilder,
+  scopedMethods?: ReadonlyMap<string, string>
+): IterableIterator<Edge> {
   const seen = new Set<string>();
 
-  // Prefetch cpp class/struct names for receiver verification.
-  const classNames = new Set<string>();
-  for (const cls of queries.iterateNodesByKind('class')) {
-    if (cls.language === 'cpp') classNames.add(cls.name);
+  // Full initialization prefetches receiver names once. Incremental sync
+  // verifies only receivers touched by changed files using indexed name
+  // lookups, so a one-file save never scans every class/struct in the graph.
+  const classNames = scopedMethods ? null : new Set<string>();
+  if (classNames) {
+    for (const cls of queries.iterateNodesByKind('class')) {
+      if (cls.language === 'cpp') classNames.add(cls.name);
+    }
+    for (const cls of queries.iterateNodesByKind('struct')) {
+      if (cls.language === 'cpp') classNames.add(cls.name);
+    }
   }
-  for (const cls of queries.iterateNodesByKind('struct')) {
-    if (cls.language === 'cpp') classNames.add(cls.name);
-  }
+  const receiverExists = (receiver: string): boolean =>
+    classNames
+      ? classNames.has(receiver)
+      : queries
+          .getNodesByName(receiver)
+          .some(
+            (node) =>
+              node.language === 'cpp' &&
+              (node.kind === 'class' || node.kind === 'struct')
+          );
 
   // Group cpp method nodes by the last two qualifiedName segments
   // (`Class::method`). An in-class declaration builds qn `ns::Class::method`
@@ -603,13 +628,27 @@ function* cppDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
   // the class segment (everything before the last `::`) against the
   // simple-name class set.
   const methodsByQn = new Map<string, Node[]>();
-  for (const m of queries.iterateNodesByKind('method')) {
-    if (m.language !== 'cpp' || !m.qualifiedName || !m.qualifiedName.includes('::')) continue;
-    const key = cppLastTwoSegments(m.qualifiedName);
-    if (!key) continue;
-    const arr = methodsByQn.get(key);
-    if (arr) arr.push(m);
-    else methodsByQn.set(key, [m]);
+  if (scopedMethods) {
+    for (const [key, methodName] of scopedMethods) {
+      const nodes = queries
+        .getNodesByName(methodName)
+        .filter(
+          (node) =>
+            node.kind === 'method' &&
+            node.language === 'cpp' &&
+            cppLastTwoSegments(node.qualifiedName) === key
+        );
+      if (nodes.length > 0) methodsByQn.set(key, nodes);
+    }
+  } else {
+    for (const m of queries.iterateNodesByKind('method')) {
+      if (m.language !== 'cpp' || !m.qualifiedName || !m.qualifiedName.includes('::')) continue;
+      const key = cppLastTwoSegments(m.qualifiedName);
+      if (!key) continue;
+      const arr = methodsByQn.get(key);
+      if (arr) arr.push(m);
+      else methodsByQn.set(key, [m]);
+    }
   }
 
   for (const [qn, nodes] of methodsByQn) {
@@ -617,7 +656,7 @@ function* cppDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
     // the receiver is the class segment (everything before the last `::`).
     const sep = qn.lastIndexOf('::');
     const receiver = qn.slice(0, sep);
-    if (!classNames.has(receiver)) continue;
+    if (!receiverExists(receiver)) continue;
 
     // Use the explicit isDeclaration flag set at extraction time: a class
     // member function declaration (`void foo();` inside the class body, parsed
@@ -673,16 +712,28 @@ function* cppDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
  * mis-pairing a local forward declaration with an unrelated same-named
  * definition in another .c file).
  */
-function* cDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
+function* cDeclDefEdges(
+  queries: QueryBuilder,
+  scopedNames?: ReadonlySet<string>
+): IterableIterator<Edge> {
   const seen = new Set<string>();
 
   // Group c function nodes by name (bare name, no '::').
   const funcsByName = new Map<string, Node[]>();
-  for (const f of queries.iterateNodesByKind('function')) {
-    if (f.language !== 'c' || !f.name) continue;
-    const arr = funcsByName.get(f.name);
-    if (arr) arr.push(f);
-    else funcsByName.set(f.name, [f]);
+  if (scopedNames) {
+    for (const name of scopedNames) {
+      const nodes = queries
+        .getNodesByName(name)
+        .filter((node) => node.kind === 'function' && node.language === 'c');
+      if (nodes.length > 0) funcsByName.set(name, nodes);
+    }
+  } else {
+    for (const f of queries.iterateNodesByKind('function')) {
+      if (f.language !== 'c' || !f.name) continue;
+      const arr = funcsByName.get(f.name);
+      if (arr) arr.push(f);
+      else funcsByName.set(f.name, [f]);
+    }
   }
 
   for (const [, nodes] of funcsByName) {
@@ -740,7 +791,10 @@ function* cDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
  * function synthesizer: two unrelated same-named globals plus one header
  * extern → both defs link the decl; reachability-correct.
  */
-function* cCppVarDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
+function* cCppVarDeclDefEdges(
+  queries: QueryBuilder,
+  scopedNames?: ReadonlyMap<'variable' | 'constant', ReadonlySet<string>>
+): IterableIterator<Edge> {
   const seen = new Set<string>();
   const HEADER_EXTS = ['.h', '.hpp', '.hh', '.hxx', '.h++'];
   const isHeader = (p: string) => {
@@ -751,11 +805,25 @@ function* cCppVarDeclDefEdges(queries: QueryBuilder): IterableIterator<Edge> {
   for (const kind of ['variable', 'constant'] as const) {
     // Group variable/constant nodes by bare name.
     const byName = new Map<string, Node[]>();
-    for (const n of queries.iterateNodesByKind(kind)) {
-      if ((n.language !== 'c' && n.language !== 'cpp') || !n.name) continue;
-      const arr = byName.get(n.name);
-      if (arr) arr.push(n);
-      else byName.set(n.name, [n]);
+    const names = scopedNames?.get(kind);
+    if (scopedNames) {
+      for (const name of names ?? []) {
+        const nodes = queries
+          .getNodesByName(name)
+          .filter(
+            (node) =>
+              node.kind === kind &&
+              (node.language === 'c' || node.language === 'cpp')
+          );
+        if (nodes.length > 0) byName.set(name, nodes);
+      }
+    } else {
+      for (const n of queries.iterateNodesByKind(kind)) {
+        if ((n.language !== 'c' && n.language !== 'cpp') || !n.name) continue;
+        const arr = byName.get(n.name);
+        if (arr) arr.push(n);
+        else byName.set(n.name, [n]);
+      }
     }
 
     for (const [, nodes] of byName) {
@@ -1977,6 +2045,113 @@ function svelteKitLoadEdges(ctx: ResolutionContext): Edge[] {
     }
   }
   return edges;
+}
+
+/**
+ * Rebuild the C/C++ heuristic edges invalidated by re-extracting a bounded set
+ * of files during sync. `deleteFile()` already cascades every old edge touching
+ * a replaced node; this pass only has to recreate relationships whose current
+ * endpoint is in one of the changed files.
+ *
+ * Unlike the full synthesis phase, every lookup starts from current nodes in
+ * `filePaths` and expands through indexed exact-name/relationship queries. A
+ * one-file save therefore does not scan all functions, methods, variables, or
+ * classes in a kernel-sized graph.
+ */
+export async function synthesizeIncrementalCCppEdges(
+  queries: QueryBuilder,
+  filePaths: readonly string[]
+): Promise<number> {
+  if (filePaths.length === 0) return 0;
+
+  const cFunctionNames = new Set<string>();
+  const cppMethods = new Map<string, string>();
+  const variableNames = new Map<'variable' | 'constant', Set<string>>([
+    ['variable', new Set<string>()],
+    ['constant', new Set<string>()],
+  ]);
+  const affectedSubclassIds = new Set<string>();
+
+  const addCppMethod = (node: Node | null | undefined): void => {
+    if (!node || node.kind !== 'method' || node.language !== 'cpp') return;
+    const key = cppLastTwoSegments(node.qualifiedName);
+    if (key) cppMethods.set(key, node.name);
+  };
+
+  const addTypeImpact = (node: Node | null | undefined): void => {
+    if (
+      !node ||
+      node.language !== 'cpp' ||
+      (node.kind !== 'class' && node.kind !== 'struct')
+    ) {
+      return;
+    }
+    // Existing override synthesis treats only class nodes as concrete
+    // subclasses, but either a class or struct may be their changed base.
+    if (node.kind === 'class') affectedSubclassIds.add(node.id);
+    for (const edge of queries.getIncomingEdges(node.id, ['extends'])) {
+      const subclass = queries.getNodeById(edge.source);
+      if (subclass?.language === 'cpp' && subclass.kind === 'class') {
+        affectedSubclassIds.add(subclass.id);
+      }
+    }
+  };
+
+  let hasChangedCCppNode = false;
+  for (const filePath of new Set(filePaths)) {
+    // Process one file at a time instead of retaining every changed node. This
+    // keeps a large catch-up sync bounded by the current file plus small sets
+    // of affected symbol names and class IDs.
+    for (const node of queries.getNodesByFile(filePath)) {
+      if (node.language !== 'c' && node.language !== 'cpp') continue;
+      hasChangedCCppNode = true;
+
+      if (node.language === 'c' && node.kind === 'function') {
+        cFunctionNames.add(node.name);
+      }
+      if (node.kind === 'variable' || node.kind === 'constant') {
+        variableNames.get(node.kind)!.add(node.name);
+      }
+      if (node.language !== 'cpp') continue;
+
+      addCppMethod(node);
+      addTypeImpact(node);
+
+      if (node.kind === 'class' || node.kind === 'struct') {
+        for (const edge of queries.getOutgoingEdges(node.id, ['contains'])) {
+          addCppMethod(queries.getNodeById(edge.target));
+        }
+      } else if (node.kind === 'method') {
+        let ownerFound = false;
+        for (const edge of queries.getIncomingEdges(node.id, ['contains'])) {
+          const owner = queries.getNodeById(edge.source);
+          addTypeImpact(owner);
+          ownerFound = ownerFound || !!owner;
+        }
+        // Out-of-line definitions are not always attached by `contains`; use
+        // their verified receiver name to find the class and its subclasses.
+        if (!ownerFound) {
+          const key = cppLastTwoSegments(node.qualifiedName);
+          const receiver = key.slice(0, key.lastIndexOf('::'));
+          if (receiver) {
+            for (const candidate of queries.getNodesByName(receiver)) {
+              addTypeImpact(candidate);
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!hasChangedCCppNode) return 0;
+
+  function* scopedEdges(): IterableIterator<Edge> {
+    yield* cppOverrideEdges(queries, affectedSubclassIds);
+    yield* cppDeclDefEdges(queries, cppMethods);
+    yield* cDeclDefEdges(queries, cFunctionNames);
+    yield* cCppVarDeclDefEdges(queries, variableNames);
+  }
+
+  return persistSynthEdges(queries, scopedEdges());
 }
 
 /**

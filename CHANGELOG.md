@@ -11,10 +11,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Performance
 
+- Incremental sync now keeps watcher-triggered saves scoped to the actual changed paths, yields during fallback reconciliation, defers WAL checkpoint work until safe phase boundaries, and backs off repeated watcher failures. Small C/C++ edits avoid both an unnecessary repository walk and a full dynamic-synthesis pass.
 - Fresh full indexes now parse files through an adaptive multi-core worker pool and stream deterministic, batched writes through a dedicated SQLite writer. Bulk loads temporarily defer FTS maintenance and secondary-index construction, then rebuild them before reference resolution; interrupted runs self-heal missing triggers and indexes on the next open. Small repositories stay on one parser to avoid startup regressions, and each optimization has an environment-variable rollback switch for constrained systems.
+
+### Upgrade Notes
+
+- Existing indexes upgraded to database schema v8 can take longer on the first `codegraph sync`: legacy unresolved-reference rows are admitted once as pending work so an interrupted older run can recover missing edges. The pass is bounded and completed rows are removed or parked as failed; later healthy syncs return to changed-file scope.
 
 ### Fixes
 
+- C/C++ incremental sync now recreates synthesized function/method declaration-definition links, `extern` variable definition links, and virtual-override dispatch bridges invalidated when a changed file is re-extracted. The repair starts from nodes in the changed files and uses indexed exact-name and relationship lookups instead of scanning every C/C++ symbol.
 - C/C++ enum members no longer disappear during full indexing when an unrelated empty macro elsewhere in the repository has the same name; empty prefix, postfix, and initializer macros inside enums continue to parse correctly, and existing projects can use `codegraph index -f` to restore affected members.
 - `codegraph upgrade` now self-updates from the Huawei internal npm registry instead of GitHub. It configures npm to point at the `@sdd` registry, looks up the latest published version of `@sdd/codegraph-wx` via `npm view`, and installs it with `npm install -g`. After upgrading it reminds you that a running CodeGraph MCP daemon still holds the old version in memory and needs a restart to pick up the new build. Use `codegraph upgrade --check` to see whether an update is available without installing.
 - A C `typedef struct` whose field list contains macro members — `typedef struct { VOS_MSG_HEADER; BBRF_MSG_HEADER; ... } Name;`, where the all-caps lines are `#define` macros defined in another header — is no longer lost from `codegraph query` and `codegraph_explore`. CodeGraph's project-wide macro scan was treating an object-like macro on its own line inside a struct body as a statement to blank; that made the field list invalid syntax and the whole struct (name and all) vanished from the graph. The scan now recognizes such a macro as a field member and leaves it intact, so the struct survives and every macro member is findable as a field of that struct.

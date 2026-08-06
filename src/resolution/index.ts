@@ -27,7 +27,10 @@ import {
 } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
-import { synthesizeCallbackEdges } from './callback-synthesizer';
+import {
+  synthesizeCallbackEdges,
+  synthesizeIncrementalCCppEdges,
+} from './callback-synthesizer';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
@@ -1103,6 +1106,22 @@ export class ReferenceResolver {
     }
 
     return aggregate;
+  }
+
+  /**
+   * Rebuild only the C/C++ heuristic relationships invalidated by the files
+   * replaced during incremental sync. The synthesizer uses indexed, scoped
+   * lookups; it does not run the full callback/framework synthesis pipeline.
+   */
+  async synthesizeIncrementalCCpp(filePaths: readonly string[]): Promise<number> {
+    this.clearCaches();
+    try {
+      return await synthesizeIncrementalCCppEdges(this.queries, filePaths);
+    } finally {
+      // Heuristic inserts are immediately visible to subsequent conformance
+      // and impact queries; do not leave any pre-synthesis cache entries live.
+      this.clearCaches();
+    }
   }
 
   /**
