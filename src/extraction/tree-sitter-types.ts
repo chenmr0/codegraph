@@ -89,6 +89,16 @@ export interface LanguageExtractor {
   preParse?: (source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>) => string;
 
   /**
+   * Optional second-stage, offset-preserving transform used only to build a
+   * parser-recovery candidate. Unlike `preParse`, these changed bytes are not
+   * used for signatures or source text after the candidate is adopted. This
+   * is for syntax-only grammar workarounds where the original token must remain
+   * semantically visible to extraction (for example a C++ method's trailing
+   * `const`).
+   */
+  parseOnlyRecovery?: (source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>) => string;
+
+  /**
    * Controls when preParse is applied. The default is `always`, which is
    * appropriate for deterministic grammar workarounds such as blanking C#
    * conditional directives. `on-error` first parses the unmodified source and

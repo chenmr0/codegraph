@@ -743,43 +743,102 @@ export class TreeSitterExtractor {
       // macro-structure damage decreases.
       const preParse = this.extractor?.preParse;
       if (preParse && this.extractor?.preParseStrategy === 'on-error') {
-        const rawTree = parser.parse(this.source) ?? null;
+        const baseSource = this.source;
+        const rawTree = parser.parse(baseSource) ?? null;
         if (!rawTree) throw new Error('Parser returned null tree');
         this.tree = rawTree;
 
         const originalDamage = measureParseDamage(rawTree.rootNode, this.globalMacroNames);
         if (originalDamage.score > 0) {
           const transformed = preParse(
-            this.source,
+            baseSource,
             this.globalMacroNames ?? undefined,
             this.globalBodylessMacroNames ?? undefined,
           );
           const scopes = collectRecoveryScopes(
             rawTree.rootNode,
-            this.source,
+            baseSource,
             this.extractor,
             this.globalMacroNames,
           );
-          const recoverySource = restrictTransformToScopes(this.source, transformed, scopes);
-          if (recoverySource !== this.source) {
-            const recoveryTree = parser.parse(recoverySource) ?? null;
-            if (recoveryTree) {
-              const recoveryDamage = measureParseDamage(recoveryTree.rootNode, this.globalMacroNames);
-              if (
-                isParseDamageBetter(recoveryDamage, originalDamage) &&
-                preservesNamedTypeDefinitions(
-                  recoveryTree.rootNode,
-                  rawTree.rootNode,
-                  this.extractor,
-                )
-              ) {
-                rawTree.delete();
-                this.tree = recoveryTree;
-                this.source = recoverySource;
-              } else {
-                recoveryTree.delete();
-              }
+          const extractionRecoverySource = restrictTransformToScopes(
+            baseSource,
+            transformed,
+            scopes,
+          );
+          const candidates: Array<{ parseSource: string; extractionSource: string }> = [];
+
+          // Some C++ grammar workarounds are syntax-only. Parse their masked
+          // bytes, but keep the ordinary recovery source for getNodeText and
+          // signatures after adoption. Every transform is offset preserving,
+          // so one tree can safely address the other string.
+          const parseOnlyRecovery = this.extractor.parseOnlyRecovery;
+          if (parseOnlyRecovery) {
+            const parseOnlyTransformed = parseOnlyRecovery(
+              transformed,
+              this.globalMacroNames ?? undefined,
+              this.globalBodylessMacroNames ?? undefined,
+            );
+            const parseOnlySource = restrictTransformToScopes(
+              baseSource,
+              parseOnlyTransformed,
+              scopes,
+            );
+            if (
+              parseOnlySource !== baseSource &&
+              !candidates.some((candidate) => candidate.parseSource === parseOnlySource)
+            ) {
+              candidates.push({
+                parseSource: parseOnlySource,
+                extractionSource: extractionRecoverySource,
+              });
             }
+          }
+          // Try the combined syntax-only candidate first. When it reaches a
+          // clean score there is no need to pay for a second recovery parse;
+          // damaged files therefore normally remain at two parses total.
+          if (
+            extractionRecoverySource !== baseSource &&
+            !candidates.some((candidate) => candidate.parseSource === extractionRecoverySource)
+          ) {
+            candidates.push({
+              parseSource: extractionRecoverySource,
+              extractionSource: extractionRecoverySource,
+            });
+          }
+
+          let bestTree: Tree = rawTree;
+          let bestDamage = originalDamage;
+          let bestSource = baseSource;
+          for (const candidate of candidates) {
+            const candidateTree = parser.parse(candidate.parseSource) ?? null;
+            if (!candidateTree) continue;
+            const candidateDamage = measureParseDamage(
+              candidateTree.rootNode,
+              this.globalMacroNames,
+            );
+            if (
+              isParseDamageBetter(candidateDamage, bestDamage) &&
+              preservesNamedTypeDefinitions(
+                candidateTree.rootNode,
+                rawTree.rootNode,
+                this.extractor,
+              )
+            ) {
+              if (bestTree !== rawTree) bestTree.delete();
+              bestTree = candidateTree;
+              bestDamage = candidateDamage;
+              bestSource = candidate.extractionSource;
+              if (bestDamage.score === 0) break;
+            } else {
+              candidateTree.delete();
+            }
+          }
+
+          if (bestTree !== rawTree) {
+            rawTree.delete();
+            this.tree = bestTree;
+            this.source = bestSource;
           }
         }
       } else {

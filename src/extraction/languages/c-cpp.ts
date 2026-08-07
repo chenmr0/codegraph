@@ -420,9 +420,18 @@ function extractCppSignature(node: SyntaxNode, source: string): string | undefin
   // keeps its `*`/`&` — those live in the declarator wrapping the name, not
   // in the `type` field, so joining `type` + `function_declarator` text would
   // drop them. Constructors/destructors/conversion operators have no `type`.
+  // A parse-only recovery may blank a trailing member-function `const`, which
+  // makes the grammar end function_declarator at `)`. Recover that qualifier
+  // from the offset-aligned extraction source without pulling constructor
+  // initializer lists or the function body into the signature.
+  let signatureEnd = fd.endIndex;
+  const trailingText = source.slice(fd.endIndex, Math.min(node.endIndex, fd.endIndex + 256));
+  const trailingConst = trailingText.match(/^\s+const\b/);
+  if (trailingConst) signatureEnd += trailingConst[0].length;
+
   let sig = typeNode
-    ? source.substring(typeNode.startIndex, fd.endIndex)
-    : getNodeText(fd, source);
+    ? source.substring(typeNode.startIndex, signatureEnd)
+    : source.substring(fd.startIndex, signatureEnd);
   sig = sig.replace(/\s+/g, ' ').trim();
   if (sig.length > 200) sig = sig.slice(0, 200) + '...';
   return sig || undefined;
@@ -449,6 +458,54 @@ function replaceWithSemicolon(text: string): string {
     chars[0] = ';';
   }
   return chars.join('');
+}
+
+/**
+ * Hide only a C++ member function's trailing `const` from the parser. In a
+ * damaged class, tree-sitter-cpp can treat a run of otherwise valid
+ * `method() const { ... }` definitions as top-level functions and close the
+ * class early. Removing the cv-qualifier for parsing repairs that ambiguity.
+ *
+ * This is deliberately much narrower than treating a repository-wide
+ * `#define const` as active everywhere: prefix uses (`const T value`,
+ * `fn(const T&)`) remain untouched. The caller uses this output only for the
+ * parse tree and keeps the unmodified token for signatures/source extraction.
+ */
+function maskCppTrailingMethodConst(source: string): string {
+  const isIdentPart = (c: string): boolean => /[A-Za-z0-9_]/.test(c);
+  let chars: string[] | null = null;
+  let i = 0;
+  while (i <= source.length - 5) {
+    if (
+      source.startsWith('const', i) &&
+      (i === 0 || !isIdentPart(source[i - 1] ?? '')) &&
+      !isIdentPart(source[i + 5] ?? '')
+    ) {
+      let previous = i - 1;
+      while (previous >= 0 && /\s/.test(source[previous]!)) previous--;
+      if (source[previous] === ')') {
+        let next = i + 5;
+        while (next < source.length && /\s/.test(source[next]!)) next++;
+        const nextChar = source[next] ?? '';
+        const nextWordMatch = source.slice(next).match(/^[A-Za-z_]\w*/);
+        const nextWord = nextWordMatch?.[0] ?? '';
+        const followsMethodQualifier =
+          nextChar === '{' || nextChar === ';' || nextChar === '&' ||
+          nextChar === '=' || nextChar === '-' || nextChar === '[' ||
+          nextWord === 'noexcept' || nextWord === 'override' ||
+          nextWord === 'final' || nextWord === 'requires' ||
+          nextWord === 'volatile';
+        if (followsMethodQualifier) {
+          chars ??= source.split('');
+          for (let j = i; j < i + 5; j++) chars[j] = ' ';
+          i += 5;
+          continue;
+        }
+      }
+    }
+    i++;
+  }
+  return chars?.join('') ?? source;
 }
 
 /**
@@ -1302,6 +1359,7 @@ export const cppExtractor: LanguageExtractor = {
   paramsField: 'parameters',
   preParse: preprocessStatementMacros,
   preParseStrategy: 'on-error',
+  parseOnlyRecovery: maskCppTrailingMethodConst,
   // Create a `namespace` node for each `namespace_definition` and scope its
   // declarations so their qualifiedName carries the namespace prefix (see
   // cppVisitNamespace above). Enables `codegraph node ns::symbol` lookups and

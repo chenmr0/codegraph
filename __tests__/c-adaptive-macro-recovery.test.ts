@@ -105,6 +105,47 @@ struct Stable {
     ]));
   });
 
+  it('uses a parse-only trailing const mask without losing method ownership or signatures', () => {
+    const source = `
+class ObTableCtx {
+  TO_STRING_KV(K_(field));
+public:
+  OB_INLINE common::ObIAllocator& get_allocator() { return allocator_; }
+  OB_INLINE common::ObIAllocator& get_allocator() const { return allocator_; }
+  OB_INLINE uint64_t get_tenant_id() const { return tenant_id_; }
+  OB_INLINE common::ObTableID &get_table_id() { return index_table_id_; }
+  OB_INLINE common::ObTableID get_ref_table_id() const { return ref_table_id_; }
+  OB_INLINE common::ObTableID get_index_table_id() const { return index_table_id_; }
+  OB_INLINE common::ObTabletID get_tablet_id() const { return tablet_id_; }
+  OB_INLINE common::ObTabletID get_index_tablet_id() const { return index_tablet_id_; }
+  OB_INLINE common::ObString &get_table_name() { return table_name_; }
+  OB_INLINE const share::ObLSID& get_ls_id() const { return ls_id_; }
+  OB_INLINE int64_t get_timeout_ts() const { return timeout_ts_; }
+};
+`;
+    const result = extractFromSource(
+      'trailing_const_recovery.hpp',
+      source,
+      'cpp',
+      undefined,
+      new Set(['K_', 'OB_INLINE', 'TO_STRING_KV', 'const']),
+      new Set(['const']),
+    );
+
+    expect(result.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'class', name: 'ObTableCtx' }),
+      expect.objectContaining({ kind: 'method', name: 'get_tenant_id' }),
+      expect.objectContaining({
+        kind: 'method',
+        name: 'get_timeout_ts',
+        signature: expect.stringContaining('const'),
+      }),
+    ]));
+    expect(result.nodes).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'function', name: 'get_timeout_ts' }),
+    ]));
+  });
+
   it('rejects a cleaner recovery tree that erases a named type definition', () => {
     const source = `
 struct Stable {
