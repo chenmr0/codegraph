@@ -76,6 +76,60 @@ describe('C/C++ adaptive macro recovery', () => {
     ]));
   });
 
+  it('does not blank a C++ keyword from an unrelated bodyless macro during recovery', () => {
+    const source = `
+struct Stable {
+  int inspect() const {
+    SWITCH(value)
+    after_switch();
+    return 1;
+  }
+};
+`;
+    const result = extractFromSource(
+      'keyword_collision.hpp',
+      source,
+      'cpp',
+      undefined,
+      new Set(['SWITCH', 'const']),
+      new Set(['const']),
+    );
+
+    expect(result.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'struct', name: 'Stable' }),
+      expect.objectContaining({
+        kind: 'method',
+        name: 'inspect',
+        signature: expect.stringContaining('const'),
+      }),
+    ]));
+  });
+
+  it('rejects a cleaner recovery tree that erases a named type definition', () => {
+    const source = `
+struct Stable {
+  BAD()
+  int value;
+};
+`;
+    const result = extractFromSource(
+      'type_anchor_collision.hpp',
+      source,
+      'cpp',
+      undefined,
+      new Set(['BAD', 'Stable']),
+      new Set(['Stable']),
+    );
+
+    expect(result.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'struct', name: 'Stable' }),
+      expect.objectContaining({ kind: 'field', name: 'value' }),
+    ]));
+    expect(result.nodes).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'struct', name: '<anonymous>' }),
+    ]));
+  });
+
   it('recovers a silent statement-macro misparse with no ERROR node', () => {
     const source = `
 void handle(void) {

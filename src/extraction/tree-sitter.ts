@@ -424,6 +424,55 @@ function isParseDamageBetter(candidate: ParseDamage, original: ParseDamage): boo
   return candidate.score < original.score;
 }
 
+/**
+ * Capture named class/struct/enum definitions that the raw parser still
+ * recognized. A recovery retry is allowed to add definitions, but never to
+ * erase one that was already structurally present: ERROR-count improvement is
+ * not useful when the new tree folds a real type into a giant bogus function.
+ * Offsets are stable because every preParse transform is byte preserving.
+ */
+function collectNamedTypeDefinitionAnchors(
+  root: SyntaxNode,
+  extractor: LanguageExtractor,
+): Set<string> {
+  const typeContainerTypes = new Set([
+    ...extractor.classTypes,
+    ...extractor.structTypes,
+    ...extractor.enumTypes,
+  ]);
+  const anchors = new Set<string>();
+  const stack: SyntaxNode[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (typeContainerTypes.has(node.type)) {
+      const name = node.childForFieldName('name');
+      const body = node.childForFieldName(extractor.bodyField);
+      if (name && body) {
+        anchors.add(`${node.type}:${name.startIndex}:${name.endIndex}:${name.text}`);
+      }
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) stack.push(child);
+    }
+  }
+  return anchors;
+}
+
+function preservesNamedTypeDefinitions(
+  candidate: SyntaxNode,
+  original: SyntaxNode,
+  extractor: LanguageExtractor,
+): boolean {
+  const originalAnchors = collectNamedTypeDefinitionAnchors(original, extractor);
+  if (originalAnchors.size === 0) return true;
+  const candidateAnchors = collectNamedTypeDefinitionAnchors(candidate, extractor);
+  for (const anchor of originalAnchors) {
+    if (!candidateAnchors.has(anchor)) return false;
+  }
+  return true;
+}
+
 /** Expand a bare ERROR range by two source lines for root-level recovery. */
 function expandRangeByLines(source: string, start: number, end: number, lineCount: number): SourceRange {
   let expandedStart = Math.max(0, start);
@@ -716,7 +765,14 @@ export class TreeSitterExtractor {
             const recoveryTree = parser.parse(recoverySource) ?? null;
             if (recoveryTree) {
               const recoveryDamage = measureParseDamage(recoveryTree.rootNode, this.globalMacroNames);
-              if (isParseDamageBetter(recoveryDamage, originalDamage)) {
+              if (
+                isParseDamageBetter(recoveryDamage, originalDamage) &&
+                preservesNamedTypeDefinitions(
+                  recoveryTree.rootNode,
+                  rawTree.rootNode,
+                  this.extractor,
+                )
+              ) {
                 rawTree.delete();
                 this.tree = recoveryTree;
                 this.source = recoverySource;

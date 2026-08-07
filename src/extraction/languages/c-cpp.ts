@@ -58,6 +58,33 @@ const CPP_NON_CLASS_RETURN = new Set([
 ]);
 
 /**
+ * Language keywords can appear in a repository-wide macro union (legacy
+ * portability headers sometimes contain declarations such as `#define const`).
+ * They can never be statement-macro invocations in an already parseable C/C++
+ * token stream, so treating an unrelated definition as globally active only
+ * corrupts declarations in other translation units.
+ */
+const C_CPP_LANGUAGE_KEYWORDS: ReadonlySet<string> = new Set([
+  'alignas', 'alignof', 'and', 'and_eq', 'asm', 'atomic_cancel',
+  'atomic_commit', 'atomic_noexcept', 'auto', 'bitand', 'bitor', 'bool',
+  'break', 'case', 'catch', 'char', 'char8_t', 'char16_t', 'char32_t',
+  'class', 'compl', 'concept', 'const', 'consteval', 'constexpr',
+  'constinit', 'const_cast', 'continue', 'co_await', 'co_return',
+  'co_yield', 'decltype', 'default', 'delete', 'do', 'double',
+  'dynamic_cast', 'else', 'enum', 'explicit', 'export', 'extern', 'false',
+  'float', 'for', 'friend', 'goto', 'if', 'inline', 'int', 'long',
+  'mutable', 'namespace', 'new', 'noexcept', 'not', 'not_eq', 'nullptr',
+  'operator', 'or', 'or_eq', 'private', 'protected', 'public', 'reflexpr',
+  'register', 'reinterpret_cast', 'requires', 'return', 'short', 'signed',
+  'sizeof', 'static', 'static_assert', 'static_cast', 'struct', 'switch',
+  'synchronized', 'template', 'this', 'thread_local', 'throw', 'true',
+  'try', 'typedef', 'typeid', 'typename', 'union', 'unsigned', 'using',
+  'virtual', 'void', 'volatile', 'wchar_t', 'while', 'xor', 'xor_eq',
+  '_Alignas', '_Alignof', '_Atomic', '_Bool', '_Complex', '_Generic',
+  '_Imaginary', '_Noreturn', '_Static_assert', '_Thread_local',
+]);
+
+/**
  * Normalize a C++ return type to the bare class name a method could be called
  * on. Unwraps smart-pointer / optional wrappers to their element type
  * (`std::unique_ptr<Widget>` → `Widget`) so a factory's `->method()` resolves on
@@ -482,6 +509,10 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   // symbol `SYNCETH_TYPE_`.
   const isIdentTokenStart = (idx: number): boolean =>
     isIdentStart(at(idx)) && (idx === 0 || !isIdentPart(at(idx - 1)));
+  const isBodylessMacro = (name: string): boolean =>
+    !!bodylessMacroNames?.has(name) && !C_CPP_LANGUAGE_KEYWORDS.has(name);
+  const isStatementMacro = (name: string): boolean =>
+    !!macroNames?.has(name) && !C_CPP_LANGUAGE_KEYWORDS.has(name);
 
   const out: string[] = [];
   let i = 0;
@@ -644,7 +675,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       if (bodylessMacroNames && isIdentTokenStart(k)) {
         let end = k + 1;
         while (end < n && isIdentPart(at(end))) end++;
-        if (bodylessMacroNames.has(source.slice(k, end))) {
+        if (isBodylessMacro(source.slice(k, end))) {
           k = end;
           continue;
         }
@@ -770,7 +801,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
-      if (bodylessMacroNames.has(ident)) {
+      if (isBodylessMacro(ident)) {
         const frame = currentBraceFrame();
         if (isDirectEnumBody(frame) && !frame.enumMemberSeen && looksLikeEnumMemberName(j)) {
           frame.enumMemberSeen = true;
@@ -849,7 +880,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
 
-      if (macroNames && macroNames.has(ident)) {
+      if (isStatementMacro(ident)) {
         // Find the end of the invocation: function-like MACRO(...) includes
         // through the matching `)`; object-like MACRO is just the identifier.
         let invEnd = j;
