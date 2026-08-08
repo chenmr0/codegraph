@@ -547,6 +547,35 @@ function maskCppTrailingMethodConst(source: string): string {
  * input (replaced text is space-padded, newlines kept) so node positions
  * and getNodeText remain correct.
  */
+/**
+ * C/C++ keywords must never be rewritten merely because an unrelated file
+ * defines a same-named macro.  In particular a C helper that defines
+ * `final(a, b, c)` must not turn every C++ `class X final` into `class X 0;`.
+ * Contextual C++ keywords are included as well because they are legal tokens
+ * in declaration positions even though the preprocessor technically permits
+ * a macro with the same spelling.
+ */
+const C_CPP_RESERVED_MACRO_TOKENS: ReadonlySet<string> = new Set([
+  'alignas', 'alignof', 'and', 'and_eq', 'asm', 'auto', 'bitand', 'bitor',
+  'bool', 'break', 'case', 'catch', 'char', 'char8_t', 'char16_t', 'char32_t',
+  'class', 'compl', 'concept', 'const', 'consteval', 'constexpr', 'constinit',
+  'const_cast', 'continue', 'co_await', 'co_return', 'co_yield', 'decltype',
+  'default', 'delete', 'do', 'double', 'dynamic_cast', 'else', 'enum',
+  'explicit', 'export', 'extern', 'false', 'final', 'float', 'for', 'friend',
+  'goto', 'if', 'inline', 'int', 'long', 'mutable', 'namespace', 'new',
+  'noexcept', 'not', 'not_eq', 'nullptr', 'operator', 'or', 'or_eq', 'override',
+  'private', 'protected', 'public', 'register', 'reinterpret_cast', 'requires',
+  'return', 'short', 'signed', 'sizeof', 'static', 'static_assert',
+  'static_cast', 'struct', 'switch', 'template', 'this', 'thread_local',
+  'throw', 'true', 'try', 'typedef', 'typeid', 'typename', 'union', 'unsigned',
+  'using', 'virtual', 'void', 'volatile', 'wchar_t', 'while', 'xor', 'xor_eq',
+]);
+
+/** Declaration-only macro conventions used by common C/C++ toolchains. */
+function looksLikeDeclarationModifierMacro(name: string): boolean {
+  return /(?:API|ABI|DLL|EXPORT|IMPORT|PUBLIC|VISIBILITY|VISIBLE|DECLSPEC|ATTRIBUTE|ATTR|CALL|CDECL|STDCALL|FASTCALL|NODISCARD|NORETURN|DEPRECATED|UNUSED|INLINE)/.test(name);
+}
+
 function preprocessStatementMacros(source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>): string {
   if ((!macroNames || macroNames.size === 0) && (!bodylessMacroNames || bodylessMacroNames.size === 0)) return source;
 
@@ -602,6 +631,10 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     enumMemberSeen: boolean;
   }
   const braceStack: BraceFrame[] = [];
+  // Set after a C++ `class`/`struct` token until the actual type name is seen.
+  // Known macros in this narrow slot are declaration modifiers and must expand
+  // to whitespace, not to the statement placeholder `0;`.
+  let expectingCppTypeName = false;
 
   // Scan back over `out` to find the last non-whitespace character — used to
   // classify a `{` as function body (preceded by ')', ':', ';', '}') vs
@@ -665,6 +698,36 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   };
 
   const n = source.length;
+
+  const skipTrivia = (start: number): number => {
+    let k = start;
+    while (k < n) {
+      while (k < n && /\s/.test(at(k))) k++;
+      if (at(k) === '/' && at(k + 1) === '/') {
+        const end = source.indexOf('\n', k + 2);
+        return end === -1 ? n : skipTrivia(end + 1);
+      }
+      if (at(k) === '/' && at(k + 1) === '*') {
+        const end = source.indexOf('*/', k + 2);
+        k = end === -1 ? n : end + 2;
+        continue;
+      }
+      break;
+    }
+    return k;
+  };
+
+  const knownRewritableMacro = (name: string): boolean =>
+    !C_CPP_RESERVED_MACRO_TOKENS.has(name) &&
+    (!!macroNames?.has(name) || !!bodylessMacroNames?.has(name));
+
+  const followingIdentifier = (start: number): string | null => {
+    const k = skipTrivia(start);
+    if (!isIdentTokenStart(k)) return null;
+    let end = k + 1;
+    while (end < n && isIdentPart(at(end))) end++;
+    return source.slice(k, end);
+  };
 
   const currentBraceFrame = (): BraceFrame | undefined =>
     braceStack.length > 0 ? braceStack[braceStack.length - 1] : undefined;
@@ -840,6 +903,72 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       // Otherwise fall through (an inline `#` outside directives — rare).
     }
 
+    // An anonymous `class { ... }` / `struct { ... }` has no name slot. Do not
+    // let the pending state leak into its first field and erase a field macro.
+    if (expectingCppTypeName && (c === '{' || c === ';')) {
+      expectingCppTypeName = false;
+    }
+
+    // C++ class-head modifier macros.  `class VCL_DLLPUBLIC Widget final`
+    // needs to become `class               Widget final`; the old generic
+    // statement rewrite produced `class 0; Widget final` and lost the whole
+    // class body.  A colliding real class name is protected: it is blanked only
+    // when another non-keyword identifier follows and can therefore be the
+    // actual type name.
+    let preserveAsCppTypeName = false;
+    if (isIdentTokenStart(i)) {
+      let j = i + 1;
+      while (j < n && isIdentPart(at(j))) j++;
+      const ident = source.slice(i, j);
+      if (ident === 'class' || ident === 'struct') {
+        expectingCppTypeName = true;
+      } else if (expectingCppTypeName) {
+        if (knownRewritableMacro(ident)) {
+          let invEnd = j;
+          let k = skipTrivia(j);
+          if (at(k) === '(') {
+            let depth = 1;
+            invEnd = k + 1;
+            while (invEnd < n && depth > 0) {
+              if (at(invEnd) === '(') depth++;
+              else if (at(invEnd) === ')') depth--;
+              invEnd++;
+            }
+          }
+          const nextIdent = followingIdentifier(invEnd);
+          if (nextIdent && !C_CPP_RESERVED_MACRO_TOKENS.has(nextIdent)) {
+            out.push(source.slice(i, invEnd).replace(/[^\r\n]/g, ' '));
+            i = invEnd;
+            continue;
+          }
+        }
+        // No second identifier follows: this token is the actual type name,
+        // even if a same-named macro exists elsewhere in the project.
+        preserveAsCppTypeName = true;
+        expectingCppTypeName = false;
+      }
+    }
+
+    // Export/visibility/calling-convention macros in declaration scope expand
+    // to attributes or nothing. Blank them instead of treating them as
+    // statement macros. Function-like attributes are left to the class-head
+    // path above because erasing arbitrary `MACRO(...)` here could remove a
+    // legitimate expression.
+    if (!preserveAsCppTypeName && isIdentTokenStart(i)) {
+      let j = i + 1;
+      while (j < n && isIdentPart(at(j))) j++;
+      const ident = source.slice(i, j);
+      const frameKind = currentBraceFrame()?.kind;
+      const inDeclarationScope = !frameKind || frameKind === 'namespace' || frameKind === 'class' || frameKind === 'struct';
+      const next = skipTrivia(j);
+      if (inDeclarationScope && parenDepth === 0 && knownRewritableMacro(ident)
+        && looksLikeDeclarationModifierMacro(ident) && at(next) !== '(') {
+        out.push(' '.repeat(j - i));
+        i = j;
+        continue;
+      }
+    }
+
     // Bodyless object-like macro (`#define NAME` with empty body, NOT
     // function-like `NAME(...)`) expands to nothing, so blank the whole
     // identifier to spaces (byte-length preserved — keeps offsets/line
@@ -858,7 +987,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
-      if (isBodylessMacro(ident)) {
+      if (!preserveAsCppTypeName && isBodylessMacro(ident)) {
         const frame = currentBraceFrame();
         if (isDirectEnumBody(frame) && !frame.enumMemberSeen && looksLikeEnumMemberName(j)) {
           frame.enumMemberSeen = true;
@@ -937,7 +1066,7 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
 
-      if (isStatementMacro(ident)) {
+      if (!preserveAsCppTypeName && isStatementMacro(ident)) {
         // Find the end of the invocation: function-like MACRO(...) includes
         // through the matching `)`; object-like MACRO is just the identifier.
         let invEnd = j;

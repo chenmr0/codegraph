@@ -3186,6 +3186,69 @@ void k() {
     });
   });
 
+  describe('C++ parser recovery regressions', () => {
+    it('does not let project-wide macro collisions rewrite final or class bodies', () => {
+      const code = `
+class VCL_DLLPUBLIC Job final {
+public:
+  Job();
+  ~Job();
+  void SAL_CALL run();
+private:
+  int value_;
+};
+`;
+      // `final` simulates an unrelated lower-case macro from a C-only utility.
+      const projectMacros = new Set(['final', 'VCL_DLLPUBLIC', 'SAL_CALL']);
+      const result = extractFromSource('job.hpp', code, undefined, undefined, projectMacros);
+
+      const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Job');
+      expect(cls).toBeDefined();
+      expect(result.nodes.some((n) => n.name === 'final')).toBe(false);
+      expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'value_')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'run')).toBe(true);
+    });
+
+    it('extracts constructor and destructor declarations as methods', () => {
+      const result = extractFromSource(
+        'renderer.hpp',
+        'class GridTableRenderer {\npublic:\n  GridTableRenderer(int);\n  ~GridTableRenderer();\n};\n'
+      );
+      const ctor = result.nodes.find((n) => n.kind === 'method' && n.name === 'GridTableRenderer');
+      const dtor = result.nodes.find((n) => n.kind === 'method' && n.name === '~GridTableRenderer');
+      expect(ctor?.isDeclaration).toBe(true);
+      expect(dtor?.isDeclaration).toBe(true);
+      expect(ctor?.qualifiedName).toBe('GridTableRenderer::GridTableRenderer');
+      expect(dtor?.qualifiedName).toBe('GridTableRenderer::~GridTableRenderer');
+    });
+
+    it('preserves qualified nested type definitions and scopes their members', () => {
+      const result = extractFromSource(
+        'parser.cpp',
+        'class XSecParser { public: class Context; };\nclass XSecParser::Context { public: void parse(); int state_; };\n'
+      );
+      const contextDef = result.nodes.find(
+        (n) => n.kind === 'class' && n.name === 'Context' && !n.isDeclaration
+      );
+      expect(contextDef?.qualifiedName).toBe('XSecParser::Context');
+      expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'parse')?.qualifiedName)
+        .toBe('XSecParser::Context::parse');
+      expect(result.nodes.find((n) => n.kind === 'field' && n.name === 'state_')?.qualifiedName)
+        .toBe('XSecParser::Context::state_');
+    });
+
+    it('indexes explicit type forwards but not elaborated type uses', () => {
+      const result = extractFromSource(
+        'types.hpp',
+        'class Widget;\nstruct State;\nenum class IOErrorCode;\nvoid consume(struct Payload*);\n'
+      );
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Widget')?.isDeclaration).toBe(true);
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'State')?.isDeclaration).toBe(true);
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'IOErrorCode')?.isDeclaration).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'Payload' && (n.kind === 'struct' || n.kind === 'class'))).toBe(false);
+    });
+  });
+
   describe('C/C++ macro extraction', () => {
     it('extracts object-like macro (simple constant)', () => {
       const code = `#define FOO 42\n`;

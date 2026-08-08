@@ -38,12 +38,39 @@ import {
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
 
+interface CppDeclaredTypeName {
+  name: string;
+  qualifiedName?: string;
+}
+
+/** Resolve `class/struct/enum Outer::Inner` without treating it as anonymous. */
+function getCppDeclaredTypeName(node: SyntaxNode, source: string): CppDeclaredTypeName | null {
+  if (node.type !== 'class_specifier' && node.type !== 'struct_specifier' && node.type !== 'enum_specifier') {
+    return null;
+  }
+  const nameNode = getChildByField(node, 'name')
+    ?? node.namedChildren.find((child) =>
+      child.type === 'qualified_identifier' || child.type === 'type_identifier' || child.type === 'identifier');
+  if (!nameNode) return null;
+  const raw = getNodeText(nameNode, source).trim().replace(/^::/, '');
+  if (!raw) return null;
+  if (nameNode.type !== 'qualified_identifier' && !raw.includes('::')) {
+    return { name: raw };
+  }
+  const parts = raw.split('::').map((part) => part.trim()).filter(Boolean);
+  const tail = parts[parts.length - 1];
+  return tail ? { name: tail, qualifiedName: parts.join('::') } : null;
+}
+
 /**
  * Extract the name from a node based on language
  */
 function extractName(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
+
+  const cppTypeName = getCppDeclaredTypeName(node, source);
+  if (cppTypeName) return cppTypeName.name;
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
@@ -275,6 +302,15 @@ const C_CPP_KEYWORD_NAMES: ReadonlySet<string> = new Set([
   'for', 'while', 'do', 'break', 'continue', 'goto',
   'return', 'try', 'catch', 'throw',
   'new', 'delete',
+  // Declaration/type keywords. Besides filtering error-recovery artifacts,
+  // this list is used to keep project-wide macro discovery from poisoning
+  // valid C++ tokens such as `final` and `override` during pre-parse.
+  'class', 'struct', 'union', 'enum', 'namespace', 'template', 'typename',
+  'typedef', 'using', 'public', 'protected', 'private', 'virtual', 'friend',
+  'final', 'override', 'noexcept', 'constexpr', 'consteval', 'constinit',
+  'const', 'volatile', 'mutable', 'inline', 'static', 'extern', 'thread_local',
+  'auto', 'decltype', 'operator', 'explicit', 'export', 'requires', 'concept',
+  'true', 'false', 'nullptr', 'this',
   // Type keywords that tree-sitter-c may expose as field_identifier
   // inside misparsed field_declaration / function_declarator nodes.
   // These are never valid function names.
@@ -1016,9 +1052,26 @@ export class TreeSitterExtractor {
     else if (this.extractor.typeAliasTypes.includes(nodeType)) {
       skipChildren = this.extractTypeAlias(node);
     }
+    // C/C++ explicit type forward declarations (`class Foo;`, `struct S;`,
+    // `enum class E;`). Keep them as declaration nodes, but do not confuse an
+    // elaborated type use (`void f(struct S*)`) with a declaration.
+    else if (
+      (this.language === 'c' || this.language === 'cpp') &&
+      (nodeType === 'declaration' || nodeType === 'field_declaration') &&
+      this.extractExplicitForwardTypeDeclarations(node)
+    ) {
+      skipChildren = true;
+    }
     // Check for class properties (e.g. C# property_declaration)
     else if (this.extractor.propertyTypes?.includes(nodeType) && this.isInsideClassLikeNode()) {
       this.extractProperty(node);
+      skipChildren = true;
+    }
+    // Constructors, destructors, conversion operators and other no-return-type
+    // C++ member declarations are `declaration -> function_declarator`, not
+    // `field_declaration`. Route them through method extraction explicitly.
+    else if (this.isCppClassMemberFunctionDeclaration(node)) {
+      this.extractMethod(node, true);
       skipChildren = true;
     }
     // Check for class fields (e.g. Java field_declaration, C# field_declaration)
@@ -1714,15 +1767,17 @@ export class TreeSitterExtractor {
   private buildQualifiedName(name: string): string {
     // Build a qualified name from the semantic hierarchy only (no file path).
     // The file path is stored separately in filePath and pollutes FTS if included here.
-    const parts: string[] = [];
-    for (const nodeId of this.nodeStack) {
-      const node = this.nodes.find((n) => n.id === nodeId);
+    // The innermost semantic parent's qualifiedName already contains every
+    // outer scope. Reusing it also preserves an explicitly-qualified nested
+    // type definition such as `class Outer::Inner`, whose simple node name is
+    // only `Inner`.
+    for (let i = this.nodeStack.length - 1; i >= 0; i--) {
+      const node = this.nodes.find((n) => n.id === this.nodeStack[i]);
       if (node && node.kind !== 'file') {
-        parts.push(node.name);
+        return `${node.qualifiedName}::${name}`;
       }
     }
-    parts.push(name);
-    return parts.join('::');
+    return name;
   }
 
   /**
@@ -2131,6 +2186,63 @@ export class TreeSitterExtractor {
     this.nodeStack.pop();
   }
 
+  /** True only for a directly-written C/C++ forward declaration. */
+  private isExplicitCppForwardDeclaration(node: SyntaxNode): boolean {
+    if (this.language !== 'c' && this.language !== 'cpp') return false;
+    if (getChildByField(node, this.extractor?.bodyField ?? 'body')) return false;
+    const parent = node.parent;
+    if (!parent) return false;
+
+    // tree-sitter-cpp represents `class Foo;`, `struct S;`, and a forward enum
+    // as a bare specifier directly under the translation unit/class body; the
+    // terminating semicolon is an unnamed sibling rather than a declaration
+    // wrapper. Check the source byte immediately after the specifier.
+    if (parent.type === 'translation_unit' || parent.type === 'field_declaration_list') {
+      return /^\s*;/.test(this.source.slice(node.endIndex));
+    }
+    if (parent.type !== 'declaration' && parent.type !== 'field_declaration') {
+      return false;
+    }
+
+    // `struct S *value;` is an elaborated type use plus a declarator, not an
+    // explicit `struct S;` declaration. A direct declarator field is the most
+    // reliable discriminator; the named-child fallback covers grammar quirks.
+    if (getChildByField(parent, 'declarator')) return false;
+    const declaratorTypes = new Set([
+      'identifier', 'field_identifier', 'init_declarator', 'pointer_declarator',
+      'reference_declarator', 'array_declarator', 'function_declarator',
+      'parenthesized_declarator',
+    ]);
+    for (const child of parent.namedChildren) {
+      if (child.id !== node.id && declaratorTypes.has(child.type)) return false;
+    }
+    return getNodeText(parent, this.source).trimEnd().endsWith(';');
+  }
+
+  /** Extract forward type specifiers wrapped by a declaration node. */
+  private extractExplicitForwardTypeDeclarations(node: SyntaxNode): boolean {
+    let extracted = false;
+    for (const child of node.namedChildren) {
+      if ((child.type === 'class_specifier' || child.type === 'struct_specifier' || child.type === 'enum_specifier')
+        && this.isExplicitCppForwardDeclaration(child)) {
+        this.visitNode(child);
+        extracted = true;
+      }
+    }
+    return extracted;
+  }
+
+  /** Detect no-return-type function declarations inside a C++ class body. */
+  private isCppClassMemberFunctionDeclaration(node: SyntaxNode): boolean {
+    if (this.language !== 'cpp' || node.type !== 'declaration' || !this.isInsideClassLikeNode()) {
+      return false;
+    }
+    // Ordinary return-typed member prototypes are handled by extractField.
+    // Requiring the absence of a type also excludes function-pointer fields.
+    if (getChildByField(node, 'type')) return false;
+    return node.descendantsOfType('function_declarator').length > 0;
+  }
+
   /**
    * Extract a class
    */
@@ -2138,16 +2250,34 @@ export class TreeSitterExtractor {
     if (!this.extractor) return;
 
     const name = extractName(node, this.source, this.extractor);
+    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    const isCppLike = this.language === 'c' || this.language === 'cpp';
+    const isForwardDeclaration = isCppLike && !body && this.isExplicitCppForwardDeclaration(node);
+    if (isCppLike && !body && !isForwardDeclaration) return;
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const declaredTypeName = this.language === 'cpp'
+      ? getCppDeclaredTypeName(node, this.source)
+      : null;
+    const explicitQualifiedName = declaredTypeName?.qualifiedName
+      ? this.buildQualifiedName(declaredTypeName.qualifiedName)
+      : undefined;
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
+      isDeclaration: isForwardDeclaration || undefined,
+      ...(explicitQualifiedName ? { qualifiedName: explicitQualifiedName } : {}),
     });
     if (!classNode) return;
+
+    if (isForwardDeclaration) return;
+    // Several non-C++ grammars model body-less records/classes directly on the
+    // declaration node. Preserve the historical fallback for those languages.
+    if (!body) body = node;
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
@@ -2160,13 +2290,9 @@ export class TreeSitterExtractor {
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
-    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
-      ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) body = node;
-
     // Visit all children for methods and properties
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
+    for (let i = 0; i < body!.namedChildCount; i++) {
+      const child = body!.namedChild(i);
       if (child) {
         this.visitNode(child);
       }
@@ -2177,7 +2303,7 @@ export class TreeSitterExtractor {
   /**
    * Extract a method
    */
-  private extractMethod(node: SyntaxNode): void {
+  private extractMethod(node: SyntaxNode, isDeclaration = false): void {
     if (!this.extractor) return;
 
     // For languages with receiver types (Go, Rust), include receiver in qualified name
@@ -2229,6 +2355,7 @@ export class TreeSitterExtractor {
       isAsync,
       isStatic,
       returnType,
+      isDeclaration: isDeclaration || undefined,
     };
     if (receiverType) {
       extraProps.qualifiedName = `${receiverType}::${name}`;
@@ -2312,20 +2439,29 @@ export class TreeSitterExtractor {
   private extractStruct(node: SyntaxNode): void {
     if (!this.extractor) return;
 
-    // Skip forward declarations and type references (no body = not a definition)
     const body = getChildByField(node, this.extractor.bodyField);
-    if (!body) return;
+    const isForwardDeclaration = !body && this.isExplicitCppForwardDeclaration(node);
+    if (!body && !isForwardDeclaration) return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const declaredTypeName = (this.language === 'c' || this.language === 'cpp')
+      ? getCppDeclaredTypeName(node, this.source)
+      : null;
+    const explicitQualifiedName = declaredTypeName?.qualifiedName
+      ? this.buildQualifiedName(declaredTypeName.qualifiedName)
+      : undefined;
 
     const structNode = this.createNode('struct', name, node, {
       docstring,
       visibility,
       isExported,
+      isDeclaration: isForwardDeclaration || undefined,
+      ...(explicitQualifiedName ? { qualifiedName: explicitQualifiedName } : {}),
     });
+    if (isForwardDeclaration) return;
     // Anonymous struct (no name -> createNode returned null). Still walk the
     // body so the fields are extracted; their contains edge points to the
     // enclosing scope (C++ anonymous-struct fields inject into the outer
@@ -2341,8 +2477,8 @@ export class TreeSitterExtractor {
       // Push to stack for field extraction
       this.nodeStack.push(structNode.id);
     }
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
+    for (let i = 0; i < body!.namedChildCount; i++) {
+      const child = body!.namedChild(i);
       if (child) {
         this.visitNode(child);
       }
@@ -2356,21 +2492,30 @@ export class TreeSitterExtractor {
   private extractEnum(node: SyntaxNode, nameOverride?: string): void {
     if (!this.extractor) return;
 
-    // Skip forward declarations and type references (no body = not a definition)
     const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
       ?? getChildByField(node, this.extractor.bodyField);
-    if (!body) return;
+    const isForwardDeclaration = !body && this.isExplicitCppForwardDeclaration(node);
+    if (!body && !isForwardDeclaration) return;
 
     const name = nameOverride ?? extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const declaredTypeName = (this.language === 'c' || this.language === 'cpp')
+      ? getCppDeclaredTypeName(node, this.source)
+      : null;
+    const explicitQualifiedName = declaredTypeName?.qualifiedName
+      ? this.buildQualifiedName(declaredTypeName.qualifiedName)
+      : undefined;
 
     const enumNode = this.createNode('enum', name, node, {
       docstring,
       visibility,
       isExported,
+      isDeclaration: isForwardDeclaration || undefined,
+      ...(explicitQualifiedName ? { qualifiedName: explicitQualifiedName } : {}),
     });
+    if (isForwardDeclaration) return;
 
     // Anonymous enum (no name → createNode returned null). Still walk the body
     // so the enumerators are extracted; their contains edge points to the
@@ -2385,8 +2530,8 @@ export class TreeSitterExtractor {
     }
 
     const memberTypes = this.extractor.enumMemberTypes;
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
+    for (let i = 0; i < body!.namedChildCount; i++) {
+      const child = body!.namedChild(i);
       if (!child) continue;
 
       if (memberTypes?.includes(child.type)) {
@@ -2398,7 +2543,7 @@ export class TreeSitterExtractor {
 
     if (enumNode && this.xMacroConstructs.length > 0) {
       const constructs = this.xMacroConstructs.filter((construct) =>
-        construct.enumBodyStart === body.startIndex && construct.enumBodyEnd === body.endIndex);
+        construct.enumBodyStart === body!.startIndex && construct.enumBodyEnd === body!.endIndex);
       if (constructs.length > 0) {
         const existingMemberNames = new Set<string>();
         const childIds = new Set(
@@ -2539,8 +2684,7 @@ export class TreeSitterExtractor {
         const child = node.namedChild(i);
         if (!child) continue;
         const t = child.type;
-        if ((t === 'enum_specifier' || t === 'struct_specifier' || t === 'class_specifier')
-          && getChildByField(child, this.extractor.bodyField)) {
+        if (t === 'enum_specifier' || t === 'struct_specifier' || t === 'class_specifier') {
           this.visitNode(child);
         }
       }
