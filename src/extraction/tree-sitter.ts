@@ -995,6 +995,24 @@ export class TreeSitterExtractor {
     // Check for function declarations
     // For Python/Ruby, function_definition inside a class should be treated as method
     if (this.extractor.functionTypes.includes(nodeType)) {
+      // C/C++ error recovery can wrap a complete type definition as the
+      // `type` child of a later function_definition. This happens when
+      // conditionally compiled fragments prevent the grammar from recognizing
+      // the type's closing brace: the class/struct AST is still intact, but the
+      // normal function path skips every non-body child. Recover that direct,
+      // structural child before extracting the wrapper function. This also
+      // handles legal inline return-type definitions without relying on names,
+      // macros, paths, or project-specific conventions.
+      if (this.language === 'c' || this.language === 'cpp') {
+        const inlineType = getChildByField(node, 'type');
+        if (inlineType && this.extractor.classTypes.includes(inlineType.type)) {
+          this.extractClass(inlineType);
+        } else if (inlineType && this.extractor.structTypes.includes(inlineType.type)) {
+          this.extractStruct(inlineType);
+        } else if (inlineType && this.extractor.enumTypes.includes(inlineType.type)) {
+          this.extractEnum(inlineType);
+        }
+      }
       if (this.isInsideClassLikeNode() && this.extractor.methodTypes.includes(nodeType)) {
         // Inside a class - treat as method
         this.extractMethod(node);
@@ -2197,7 +2215,17 @@ export class TreeSitterExtractor {
     // as a bare specifier directly under the translation unit/class body; the
     // terminating semicolon is an unnamed sibling rather than a declaration
     // wrapper. Check the source byte immediately after the specifier.
-    if (parent.type === 'translation_unit' || parent.type === 'field_declaration_list') {
+    const isDirectDeclarationContainer = parent.type === 'translation_unit'
+      || parent.type === 'field_declaration_list'
+      || parent.type === 'declaration_list'
+      // Header guards and conditional-compilation branches are transparent
+      // declaration containers in C/C++. Their children are still directly
+      // written declarations, not elaborated type uses.
+      || parent.type === 'preproc_if'
+      || parent.type === 'preproc_ifdef'
+      || parent.type === 'preproc_else'
+      || parent.type === 'preproc_elif';
+    if (isDirectDeclarationContainer) {
       return /^\s*;/.test(this.source.slice(node.endIndex));
     }
     if (parent.type !== 'declaration' && parent.type !== 'field_declaration') {

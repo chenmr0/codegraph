@@ -573,11 +573,23 @@ const C_CPP_RESERVED_MACRO_TOKENS: ReadonlySet<string> = new Set([
 
 /** Declaration-only macro conventions used by common C/C++ toolchains. */
 function looksLikeDeclarationModifierMacro(name: string): boolean {
-  return /(?:API|ABI|DLL|EXPORT|IMPORT|PUBLIC|VISIBILITY|VISIBLE|DECLSPEC|ATTRIBUTE|ATTR|CALL|CDECL|STDCALL|FASTCALL|NODISCARD|NORETURN|DEPRECATED|UNUSED|INLINE)/.test(name);
+  return /(?:API|ABI|DLL|EXPORT|IMPORT|PUBLIC|VISIBILITY|VISIBLE|DECLSPEC|ATTRIBUTE|ATTR|CALL|CDECL|STDCALL|FASTCALL|NODISCARD|NORETURN|NOEXCEPT|VTABLE|DEPRECATED|UNUSED|INLINE)/.test(name);
 }
 
 function preprocessStatementMacros(source: string, macroNames?: Set<string>, bodylessMacroNames?: Set<string>): string {
-  if ((!macroNames || macroNames.size === 0) && (!bodylessMacroNames || bodylessMacroNames.size === 0)) return source;
+  const hasKnownMacros = !!macroNames?.size || !!bodylessMacroNames?.size;
+  if (!hasKnownMacros) {
+    // Most C/C++ files need no source rewrite. Keep the zero-macro fast path,
+    // but still run the scanner for the three grammar-recovery shapes that do
+    // not depend on a locally visible #define: a macro-shaped class head, a
+    // conditional inside a real type body, or an operator< definition.
+    const hasUnknownClassHeadModifier = /\b(?:class|struct)\s+(?:[A-Z_][A-Z0-9_]*\b|[A-Za-z_]\w*\s*\()/m.test(source);
+    const hasConditionalTypeBody = /\b(?:class|struct)\s+[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*(?:\s+final)?(?:\s*:[^{;]+)?\s*\{[\s\S]*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b/m.test(source);
+    const hasLessThanOperator = /\boperator\s*<\s*\(/m.test(source);
+    if (!hasUnknownClassHeadModifier && !hasConditionalTypeBody && !hasLessThanOperator) {
+      return source;
+    }
+  }
 
   const isIdentStart = (c: string) => /[A-Za-z_]/.test(c);
   const isIdentPart = (c: string) => /[A-Za-z0-9_]/.test(c);
@@ -624,6 +636,17 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     kind: BraceKind;
     parenDepthAtOpen: number;
     bracketDepthAtOpen: number;
+    // tree-sitter-cpp can parse `operator<` itself, but confuses a member
+    // comparison in its body (`a.value < b.value`) with a template-method
+    // suffix. Keep this flag scoped to that operator body (and nested blocks)
+    // so the offset-preserving recovery cannot affect ordinary functions.
+    rewriteMemberLessThan: boolean;
+    // A conditional that contributes only a declaration modifier can split a
+    // member declaration in a way the grammar cannot represent. Once that
+    // shape is proven for a class, nested conditional directives in the same
+    // class are flattened as well so partial if/else statements do not make
+    // error recovery discard the enclosing type.
+    flattenConditionalDirectives: boolean;
     // Directly-written enum members need one narrow exception to project-wide
     // bodyless-macro blanking: an unrelated `#define MEMBER` must not erase the
     // declaration's name. This flag stays true through the initializer and is
@@ -632,9 +655,23 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
   }
   const braceStack: BraceFrame[] = [];
   // Set after a C++ `class`/`struct` token until the actual type name is seen.
-  // Known macros in this narrow slot are declaration modifiers and must expand
-  // to whitespace, not to the statement placeholder `0;`.
+  // Modifier macros in this narrow slot must expand to whitespace, not to the
+  // statement placeholder `0;`.
   let expectingCppTypeName = false;
+  // Keep the class/struct body classification from the declaration keyword to
+  // its opening brace. A fixed-size backward scan cannot cover generated class
+  // heads with very long inheritance lists.
+  let pendingCppTypeBodyKind: 'class' | 'struct' | null = null;
+  let pendingCppTypeNameSeen = false;
+  let pendingCppTypeAllowsIdentifiers = false;
+  // `class` inside `template<class T>` introduces a template parameter, not a
+  // class body. Track only angle brackets opened by the `template` keyword so
+  // those tokens do not arm pendingCppTypeBodyKind.
+  let awaitingTemplateParameterList = false;
+  let templateParameterDepth = 0;
+  // Armed by an `operator<(` declarator and consumed by its definition body.
+  // A declaration ending in `;` clears it without changing any source.
+  let pendingLessThanOperatorBody = false;
 
   // Scan back over `out` to find the last non-whitespace character — used to
   // classify a `{` as function body (preceded by ')', ':', ';', '}') vs
@@ -653,12 +690,9 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     while (k >= 0 && isIdentPart(out[k]!)) k--;
     return out.slice(k + 1, end).join('');
   };
-  // Scan back from the pending `{` to find the nearest `class`/`struct`/
-  // `enum`/`namespace` keyword, skipping type names, inheritance (`: public
-  // Base`), and template parameters (`<T, U>`).  Stops at statement boundaries
-  // (`;`, `}`, `{`, `)`).  Used to classify `{` after a type name: a class/
-  // struct/namespace body needs macro replacement (contains method bodies
-  // with statement-level macros), while an enum body does not.
+  // Scan back from the pending `{` to find the nearest type/namespace keyword.
+  // Class/struct bodies use the structural pending state below; this fallback
+  // remains necessary for enum (including `enum class`) and namespace bodies.
   const findTypeKeyword = (): string => {
     let k = out.length - 1;
     while (k >= 0 && /\s/.test(out[k]!)) k--;
@@ -729,8 +763,87 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     return source.slice(k, end);
   };
 
+  // Look past a run of declaration modifiers for the identifier that is
+  // structurally followed by a class body/inheritance clause. This lets an
+  // indexer recover common multi-token heads such as
+  // `class WARN_UNUSED DLL_PUBLIC Name {` even when included macro definitions
+  // are unavailable. The terminating class-head punctuation is required, so
+  // an elaborated use like `class APIClient value;` is not rewritten.
+  const hasLaterCppClassHead = (start: number): boolean => {
+    let k = skipTrivia(start);
+    while (k < n && isIdentTokenStart(k)) {
+      let end = k + 1;
+      while (end < n && isIdentPart(at(end))) end++;
+      let after = skipTrivia(end);
+      if (at(after) === '(') {
+        let depth = 1;
+        after++;
+        while (after < n && depth > 0) {
+          if (at(after) === '(') depth++;
+          else if (at(after) === ')') depth--;
+          after++;
+        }
+        after = skipTrivia(after);
+      }
+      if (at(after) === '{' || (at(after) === ':' && at(after + 1) !== ':')) return true;
+      const continuation = followingIdentifier(after);
+      if (continuation === 'final') return true;
+      if (!isIdentTokenStart(after)) return false;
+      k = after;
+    }
+    return false;
+  };
+
+  const isFirstNonWhitespaceOnLine = (idx: number): boolean => {
+    let k = idx - 1;
+    while (k >= 0 && at(k) !== '\n' && at(k) !== '\r') {
+      if (at(k) !== ' ' && at(k) !== '\t') return false;
+      k--;
+    }
+    return true;
+  };
+
   const currentBraceFrame = (): BraceFrame | undefined =>
     braceStack.length > 0 ? braceStack[braceStack.length - 1] : undefined;
+
+  const hasMemberAccessOnLeft = (operatorIndex: number): boolean => {
+    let k = operatorIndex - 1;
+    while (k >= 0 && /\s/.test(at(k))) k--;
+    if (!isIdentPart(at(k))) return false;
+    while (k >= 0 && isIdentPart(at(k))) k--;
+    while (k >= 0 && /\s/.test(at(k))) k--;
+    return at(k) === '.' || (at(k) === '>' && at(k - 1) === '-');
+  };
+
+  const isLikelyMemberTemplateSuffix = (openIndex: number): boolean => {
+    let depth = 1;
+    let k = openIndex + 1;
+    while (k < n) {
+      if (at(k) === '<') depth++;
+      else if (at(k) === '>') {
+        depth--;
+        if (depth === 0) {
+          const next = skipTrivia(k + 1);
+          return at(next) === '(' || at(next) === '{'
+            || (at(next) === ':' && at(next + 1) === ':');
+        }
+      } else if (depth === 1 && (at(k) === ';' || at(k) === '{' || at(k) === '}')) {
+        return false;
+      }
+      k++;
+    }
+    return false;
+  };
+
+  const startsSplitModifierConditional = (directiveIndex: number): boolean => {
+    const rest = source.slice(directiveIndex);
+    const match = rest.match(
+      /^#\s*(?:if|ifdef|ifndef)\b[^\r\n]*(?:\r?\n)[ \t]*(?:(?:constexpr|consteval|constinit|explicit|inline|virtual|static|friend)|[A-Z_][A-Z0-9_]*(?:[ \t]*\([^\r\n]*\))?)(?:[ \t]+(?:(?:constexpr|consteval|constinit|explicit|inline|virtual|static|friend)|[A-Z_][A-Z0-9_]*(?:[ \t]*\([^\r\n]*\))?))*[ \t]*(?:\r?\n)[ \t]*#\s*endif\b/
+    );
+    if (!match) return false;
+    const next = skipTrivia(directiveIndex + match[0].length);
+    return isIdentTokenStart(next) || at(next) === '~';
+  };
 
   const isDirectEnumBody = (frame: BraceFrame | undefined): frame is BraceFrame =>
     frame?.kind === 'enum' &&
@@ -884,8 +997,24 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
         if (!/\s/.test(at(k))) { onlyWs = false; break; }
       }
       if (onlyWs) {
+        // At direct class/struct scope, conditional-compilation branches are
+        // alternative declarations. Blank only the directive bytes so both
+        // branches remain indexable and split declarations such as
+        // `#if X constexpr #endif Constructor()` stay inside their class.
+        // Directives inside functions or declarators remain verbatim.
+        const frame = currentBraceFrame();
+        const isDirectTypeBody = (frame?.kind === 'class' || frame?.kind === 'struct')
+          && parenDepth === frame.parenDepthAtOpen
+          && bracketDepth === frame.bracketDepthAtOpen;
+        const conditionalDirective = /^#\s*(?:if|ifdef|ifndef|elif|else|endif)\b/.test(source.slice(i));
+        if (isDirectTypeBody && startsSplitModifierConditional(i) && frame) {
+          frame.flattenConditionalDirectives = true;
+        }
+        const blankDirective = conditionalDirective
+          && (isDirectTypeBody || !!frame?.flattenConditionalDirectives);
         while (i < n) {
-          out.push(at(i));
+          const directiveChar = at(i);
+          out.push(blankDirective && directiveChar !== '\r' && directiveChar !== '\n' ? ' ' : directiveChar);
           if (at(i) === '\n') {
             // Honor line continuation: a backslash immediately before the
             // newline keeps the directive alive on the next line.  On CRLF
@@ -904,7 +1033,8 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
     }
 
     // An anonymous `class { ... }` / `struct { ... }` has no name slot. Do not
-    // let the pending state leak into its first field and erase a field macro.
+    // let the pending name state leak into its first field and erase a field
+    // macro. pendingCppTypeBodyKind intentionally remains armed for the brace.
     if (expectingCppTypeName && (c === '{' || c === ';')) {
       expectingCppTypeName = false;
     }
@@ -920,32 +1050,81 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       let j = i + 1;
       while (j < n && isIdentPart(at(j))) j++;
       const ident = source.slice(i, j);
-      if (ident === 'class' || ident === 'struct') {
+      if (ident !== 'template' && awaitingTemplateParameterList) {
+        // Explicit instantiation uses `template class Foo;` without `<...>`.
+        // Do not let that `template` token arm an unrelated later `<`.
+        awaitingTemplateParameterList = false;
+      }
+      if (ident === 'template') {
+        awaitingTemplateParameterList = true;
+      } else if (ident === 'operator') {
+        const operatorToken = skipTrivia(j);
+        const afterOperatorToken = skipTrivia(operatorToken + 1);
+        const operatorFrameKind = currentBraceFrame()?.kind;
+        const inOperatorDeclarationScope = !operatorFrameKind || operatorFrameKind === 'namespace'
+          || operatorFrameKind === 'class' || operatorFrameKind === 'struct';
+        if (inOperatorDeclarationScope && at(operatorToken) === '<' && at(operatorToken + 1) !== '<'
+          && at(operatorToken + 1) !== '=' && at(afterOperatorToken) === '(') {
+          pendingLessThanOperatorBody = true;
+        }
+      } else if ((ident === 'class' || ident === 'struct')
+        && templateParameterDepth === 0 && prevWord() !== 'enum') {
         expectingCppTypeName = true;
-      } else if (expectingCppTypeName) {
-        if (knownRewritableMacro(ident)) {
-          let invEnd = j;
-          let k = skipTrivia(j);
-          if (at(k) === '(') {
-            let depth = 1;
-            invEnd = k + 1;
-            while (invEnd < n && depth > 0) {
-              if (at(invEnd) === '(') depth++;
-              else if (at(invEnd) === ')') depth--;
-              invEnd++;
-            }
+        pendingCppTypeBodyKind = ident;
+        pendingCppTypeNameSeen = false;
+        pendingCppTypeAllowsIdentifiers = false;
+      } else if (expectingCppTypeName && bracketDepth === 0) {
+        let invEnd = j;
+        const k = skipTrivia(j);
+        if (at(k) === '(') {
+          let depth = 1;
+          invEnd = k + 1;
+          while (invEnd < n && depth > 0) {
+            if (at(invEnd) === '(') depth++;
+            else if (at(invEnd) === ')') depth--;
+            invEnd++;
           }
-          const nextIdent = followingIdentifier(invEnd);
-          if (nextIdent && !C_CPP_RESERVED_MACRO_TOKENS.has(nextIdent)) {
-            out.push(source.slice(i, invEnd).replace(/[^\r\n]/g, ' '));
-            i = invEnd;
-            continue;
-          }
+        }
+        const nextIdentStart = skipTrivia(invEnd);
+        const nextIdent = followingIdentifier(invEnd);
+        let nextIdentEnd = nextIdentStart;
+        while (nextIdentEnd < n && isIdentPart(at(nextIdentEnd))) nextIdentEnd++;
+        const afterNextIdent = skipTrivia(nextIdentEnd);
+        const continuationWord = followingIdentifier(afterNextIdent);
+        const hasClassHeadContinuation = at(afterNextIdent) === '{'
+          || (at(afterNextIdent) === ':' && at(afterNextIdent + 1) !== ':')
+          || continuationWord === 'final';
+        const hasModifierEvidence = invEnd > j || hasClassHeadContinuation
+          || (knownRewritableMacro(ident) && looksLikeDeclarationModifierMacro(ident))
+          || (looksLikeDeclarationModifierMacro(ident) && hasLaterCppClassHead(invEnd));
+        // A function-like token or a second identifier followed by a class-head
+        // continuation is a modifier macro even when its definition was not
+        // indexed. Requiring that evidence preserves elaborated declarations
+        // such as `struct Type variable = {...}`.
+        if (nextIdent && !C_CPP_RESERVED_MACRO_TOKENS.has(nextIdent) && hasModifierEvidence) {
+          out.push(source.slice(i, invEnd).replace(/[^\r\n]/g, ' '));
+          i = invEnd;
+          continue;
         }
         // No second identifier follows: this token is the actual type name,
         // even if a same-named macro exists elsewhere in the project.
         preserveAsCppTypeName = true;
         expectingCppTypeName = false;
+        pendingCppTypeNameSeen = true;
+      } else if (pendingCppTypeBodyKind && pendingCppTypeNameSeen && bracketDepth === 0
+        && !pendingCppTypeAllowsIdentifiers && ident !== 'final'
+        && ident !== 'alignas' && ident !== 'requires'
+        && !knownRewritableMacro(ident) && !looksLikeDeclarationModifierMacro(ident)) {
+        let previous = i - 1;
+        while (previous >= 0 && /\s/.test(at(previous))) previous--;
+        const continuesQualifiedName = at(previous) === ':' && at(previous - 1) === ':';
+        if (!continuesQualifiedName) {
+          // `struct Type variable = {...}` and `struct Type function()` are
+          // elaborated type uses. Their later brace is an initializer/function
+          // body, not the body of Type itself.
+          pendingCppTypeBodyKind = null;
+          pendingCppTypeNameSeen = false;
+        }
       }
     }
 
@@ -1013,23 +1192,67 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
 
     // Track paren depth.
     if (c === '(') { parenDepth++; out.push(c); i++; continue; }
-    if (c === ')') { parenDepth--; out.push(c); i++; continue; }
+    if (c === ')') {
+      parenDepth--;
+      if (pendingCppTypeBodyKind && pendingCppTypeNameSeen) {
+        pendingCppTypeBodyKind = null;
+        pendingCppTypeNameSeen = false;
+      }
+      out.push(c);
+      i++;
+      continue;
+    }
     if (c === '[') { bracketDepth++; out.push(c); i++; continue; }
     if (c === ']') { bracketDepth--; out.push(c); i++; continue; }
+    if (c === '<' && currentBraceFrame()?.rewriteMemberLessThan
+      && hasMemberAccessOnLeft(i) && !isLikelyMemberTemplateSuffix(i)) {
+      // Parsing-only substitution for a tree-sitter-cpp ambiguity. `>` has the
+      // same byte width and precedence family, so expression/call structure and
+      // every source location are retained. The operator-body and member-access
+      // guards keep ordinary templates and relational expressions untouched.
+      out.push('>');
+      i++;
+      continue;
+    }
+    if (c === '<') {
+      if (awaitingTemplateParameterList) {
+        templateParameterDepth++;
+        awaitingTemplateParameterList = false;
+      } else if (templateParameterDepth > 0) {
+        templateParameterDepth++;
+      }
+      out.push(c);
+      i++;
+      continue;
+    }
+    if (c === '>') {
+      if (templateParameterDepth > 0) templateParameterDepth--;
+      out.push(c);
+      i++;
+      continue;
+    }
+    if (c === ':' && pendingCppTypeBodyKind && pendingCppTypeNameSeen && at(i + 1) !== ':') {
+      pendingCppTypeAllowsIdentifiers = true;
+    }
+    if ((c === '=' || c === '*' || c === '&') && pendingCppTypeBodyKind && pendingCppTypeNameSeen
+      && !pendingCppTypeAllowsIdentifiers) {
+      pendingCppTypeBodyKind = null;
+      pendingCppTypeNameSeen = false;
+    }
 
     // Track brace context — classify each `{` by kind (see braceStack decl).
     if (c === '{') {
       const pc = prevNonSpaceChar();
       const pw = prevWord();
       const tk = findTypeKeyword();
-      // Type keywords win over the `)`/`:`/`;` heuristics: `class Foo : Base {`
-      // has pc=':' but is a class body; `typedef struct {` has pc=identifier-char
-      // but is a struct body.
+      // The pending state is authoritative for class/struct bodies. A backward
+      // scan alone cannot distinguish `struct S {` from the initializer in
+      // `struct S value = {`, because both still have a nearby `struct` token.
+      // The scan remains useful for enum/namespace bodies.
       let kind: BraceKind;
-      if (tk === 'namespace') kind = 'namespace';
+      if (pendingCppTypeBodyKind) kind = pendingCppTypeBodyKind;
+      else if (tk === 'namespace') kind = 'namespace';
       else if (tk === 'enum') kind = 'enum';
-      else if (tk === 'class') kind = 'class';
-      else if (tk === 'struct') kind = 'struct';
       else if (pc === ')' || pc === ':' || pc === ';' || pc === '}' ||
                pw === 'do' || pw === 'else' || pw === 'try' || pw === 'finally') kind = 'stmt';
       else kind = 'init';
@@ -1037,8 +1260,16 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
         kind,
         parenDepthAtOpen: parenDepth,
         bracketDepthAtOpen: bracketDepth,
+        rewriteMemberLessThan: pendingLessThanOperatorBody
+          || !!currentBraceFrame()?.rewriteMemberLessThan,
+        flattenConditionalDirectives: !!currentBraceFrame()?.flattenConditionalDirectives,
         enumMemberSeen: false,
       });
+      pendingLessThanOperatorBody = false;
+      pendingCppTypeBodyKind = null;
+      expectingCppTypeName = false;
+      pendingCppTypeNameSeen = false;
+      pendingCppTypeAllowsIdentifiers = false;
       out.push(c);
       i++;
       continue;
@@ -1048,6 +1279,13 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
       out.push(c);
       i++;
       continue;
+    }
+    if (c === ';') {
+      pendingLessThanOperatorBody = false;
+      pendingCppTypeBodyKind = null;
+      expectingCppTypeName = false;
+      pendingCppTypeNameSeen = false;
+      pendingCppTypeAllowsIdentifiers = false;
     }
 
     // Only a direct enum-list comma starts the next member. Commas inside
@@ -1128,6 +1366,13 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
         if (nextTok === ';' || nextTok === '{') {
           // Regular call (tree-sitter handles it) or the
           // MACRO(params) { body } pattern (handled by isMisparsedFunction).
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+        if (nextTok === '-' && at(nextIdx + 1) === '>') {
+          // A project-global macro may collide with a real C++ method name in
+          // a trailing-return declaration: `auto PUT(...) -> void`.
           out.push(source.slice(i, invEnd));
           i = invEnd;
           continue;
@@ -1263,6 +1508,19 @@ function preprocessStatementMacros(source: string, macroNames?: Set<string>, bod
         // replaced below, which C++ class-body debug macros like TO_STRING_KV
         // require to avoid swallowing the class.
         if ((braceTop === 'struct' || braceTop === 'class') && invEnd === j) {
+          out.push(source.slice(i, invEnd));
+          i = invEnd;
+          continue;
+        }
+
+        // Cross-file macro unions are only weak evidence in declaration
+        // scopes. If the token is embedded in a declaration instead of being
+        // the first token on its line (`virtual auto PUT(...)`), preserve it.
+        // Function-body statement macros and line-leading class recovery
+        // macros remain eligible for replacement.
+        const inDeclarationScope = braceTop === '' || braceTop === 'namespace'
+          || braceTop === 'struct' || braceTop === 'class';
+        if (inDeclarationScope && !isFirstNonWhitespaceOnLine(i)) {
           out.push(source.slice(i, invEnd));
           i = invEnd;
           continue;

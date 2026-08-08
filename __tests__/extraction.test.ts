@@ -11,6 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { cppExtractor } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -3246,6 +3247,190 @@ private:
       expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'State')?.isDeclaration).toBe(true);
       expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'IOErrorCode')?.isDeclaration).toBe(true);
       expect(result.nodes.some((n) => n.name === 'Payload' && (n.kind === 'struct' || n.kind === 'class'))).toBe(false);
+    });
+
+    it('indexes forward declarations inside nested namespaces', () => {
+      const result = extractFromSource(
+        'namespaced-types.hpp',
+        'namespace com::sun::star::ucb { enum class IOErrorCode; }\n' +
+        'namespace com::sun::star { namespace uno { class Any; } }\n'
+      );
+      const error = result.nodes.find((n) => n.kind === 'enum' && n.name === 'IOErrorCode');
+      const any = result.nodes.find((n) => n.kind === 'class' && n.name === 'Any');
+      expect(error?.isDeclaration).toBe(true);
+      expect(error?.qualifiedName).toBe('com::sun::star::ucb::IOErrorCode');
+      expect(any?.isDeclaration).toBe(true);
+      expect(any?.qualifiedName).toBe('com::sun::star::uno::Any');
+    });
+
+    it('indexes explicit type forwards inside preprocessor conditionals', () => {
+      const code = `
+#ifndef PROJECT_TYPES_HPP
+#define PROJECT_TYPES_HPP
+class GuardedClass;
+struct GuardedStruct;
+enum class GuardedEnum : unsigned int;
+#if FEATURE_ENABLED
+class FeatureClass;
+#else
+struct FallbackStruct;
+#endif
+void consume(struct ElaboratedOnly* value);
+#endif
+`;
+      const result = extractFromSource('guarded-types.hpp', code);
+      for (const [kind, name] of [
+        ['class', 'GuardedClass'],
+        ['struct', 'GuardedStruct'],
+        ['enum', 'GuardedEnum'],
+        ['class', 'FeatureClass'],
+        ['struct', 'FallbackStruct'],
+      ] as const) {
+        expect(result.nodes.find((n) => n.kind === kind && n.name === name)?.isDeclaration).toBe(true);
+      }
+      expect(result.nodes.some((n) => n.name === 'ElaboratedOnly'
+        && (n.kind === 'class' || n.kind === 'struct'))).toBe(false);
+    });
+
+    it('recovers unknown function-like modifier macros in class heads', () => {
+      const code = `
+class UNLESS_MERGELIBS(API_EXPORT) Widget final {
+public:
+  Widget();
+  int value_;
+};
+class [[nodiscard]] AttributedWidget {
+  int attributedValue_;
+};
+`;
+      // The modifier itself is deliberately absent: generated macro definitions
+      // are not always available to the project-wide macro scan.
+      const result = extractFromSource('widget.hpp', code, undefined, undefined, new Set(['UNRELATED_MACRO']));
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'Widget')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'value_')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'AttributedWidget')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'attributedValue_')).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'final')).toBe(false);
+    });
+
+    it('treats SAL_NOEXCEPT as a declaration modifier', () => {
+      const code = `
+template<typename... Ifc>
+class SAL_NO_VTABLE SAL_DLLPUBLIC_TEMPLATE Impl : public Ifc... {
+public:
+  void SAL_CALL acquire() SAL_NOEXCEPT override {}
+};
+`;
+      const macros = new Set(['SAL_CALL', 'SAL_NOEXCEPT', 'SAL_NO_VTABLE', 'SAL_DLLPUBLIC_TEMPLATE']);
+      const result = extractFromSource('impl.hpp', code, undefined, undefined, macros);
+      expect(result.nodes.filter((n) => n.kind === 'method' && n.name === 'acquire')).toHaveLength(1);
+      expect(result.nodes.some((n) => n.name === 'override')).toBe(false);
+    });
+
+    it('preserves a trailing-return method that collides with a macro elsewhere', () => {
+      const code = `
+class Session {
+public:
+  virtual auto PUT(int value) -> void override;
+};
+`;
+      const result = extractFromSource('session.hpp', code, undefined, undefined, new Set(['PUT']));
+      const put = result.nodes.find((n) => n.kind === 'method' && n.name === 'PUT');
+      expect(put?.isDeclaration).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'override')).toBe(false);
+    });
+
+    it('keeps declaration scope through class heads longer than the look-behind window', () => {
+      const bases = Array.from({ length: 60 }, (_, i) => `public VeryLongGeneratedBaseName${i}`).join(',\n');
+      const code = `
+class Model :
+${bases}
+{
+public:
+  void SAL_CALL acquire() SAL_NOEXCEPT override {}
+};
+`;
+      expect(code.indexOf('{') - code.indexOf('class')).toBeGreaterThan(512);
+      const macros = new Set(['SAL_CALL', 'SAL_NOEXCEPT']);
+      const result = extractFromSource('model.hpp', code, undefined, undefined, macros);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Model')).toBe(true);
+      expect(result.nodes.filter((n) => n.kind === 'method' && n.name === 'acquire')).toHaveLength(1);
+      expect(result.nodes.some((n) => n.name === 'override')).toBe(false);
+    });
+
+    it('keeps split conditional declarations inside their class', () => {
+      const code = `
+class WARN_UNUSED DLL_PUBLIC ConditionalValue {
+public:
+#if HAVE_CONSTEXPR
+  constexpr
+#endif
+  ConditionalValue() {
+#if HAVE_RUNTIME_CHECK
+    if (value_ > 0) {}
+    else
+#endif
+      value_ = 1;
+  }
+#if HAVE_EXTRA_MEMBER
+  void extra();
+#else
+  void fallback();
+#endif
+  int value_;
+};
+class FollowingType {};
+`;
+      const result = extractFromSource('conditional-value.hpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'ConditionalValue')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'ConditionalValue')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'extra')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'fallback')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'field' && n.name === 'value_')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'FollowingType')).toBe(true);
+    });
+
+    it('recovers following declarations after member comparisons in operator less-than', () => {
+      const code = `
+struct Position { int row; int column; };
+inline bool operator<(const Position& left, const Position& right) {
+  return (left.row < right.row)
+      || ((left.row == right.row) && (left.column < right.column));
+}
+class FirstFollowingType {};
+class SecondFollowingType {};
+`;
+      const result = extractFromSource('ordered-position.hpp', code);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name.includes('operator'))).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'FirstFollowingType')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'SecondFollowingType')).toBe(true);
+    });
+
+    it('does not rewrite a member template call inside operator less-than', () => {
+      const code = `
+struct Value {
+  template<typename T> T convert() const;
+};
+inline bool operator<(const Value& left, const Value& right) {
+  return left.convert<int>() < right.convert<int>();
+}
+class TypeAfterTemplateComparison {};
+`;
+      const result = extractFromSource('templated-order.hpp', code);
+      const transformed = cppExtractor.preParse!(code);
+      expect(transformed).toContain('left.convert<int>()');
+      expect(transformed).toContain('right.convert<int>()');
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'TypeAfterTemplateComparison')).toBe(true);
+    });
+
+    it('extracts a type definition used directly as a function return type', () => {
+      const code = `
+struct InlineRecord { int value; } makeRecord() { return {}; }
+`;
+      const result = extractFromSource('inline-record.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'struct' && n.name === 'InlineRecord')).toBe(true);
+      expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'makeRecord')).toBe(true);
     });
   });
 
