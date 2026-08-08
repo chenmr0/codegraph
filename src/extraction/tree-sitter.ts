@@ -522,6 +522,15 @@ function expandRangeByLines(source: string, start: number, end: number, lineCoun
   return { start: expandedStart, end: expandedEnd };
 }
 
+/** Expand a declaration recovery range to the complete source lines it touches. */
+function expandRangeToFullLines(source: string, start: number, end: number): SourceRange {
+  const previousNewline = source.lastIndexOf('\n', Math.max(0, start - 1));
+  const lineStart = previousNewline === -1 ? 0 : previousNewline + 1;
+  const nextNewline = source.indexOf('\n', Math.max(end, start + 1));
+  const lineEnd = nextNewline === -1 ? source.length : nextNewline + 1;
+  return { start: lineStart, end: lineEnd };
+}
+
 /**
  * Find source scopes in which an error-triggered pre-parse transform is allowed
  * to operate. Errors inside functions authorize the containing function (all
@@ -566,10 +575,24 @@ function collectRecoveryScopes(
       current = current.parent;
     }
 
-    const scope = functionScope ?? declarationScope ?? typeScope;
-    ranges.push(scope
-      ? { start: scope.startIndex, end: scope.endIndex }
-      : expandRangeByLines(source, issue.startIndex, issue.endIndex, 2));
+    if (functionScope) {
+      ranges.push({ start: functionScope.startIndex, end: functionScope.endIndex });
+    } else if (declarationScope) {
+      // Error recovery often splits one physical declaration into adjacent AST
+      // nodes (`void MACRO method() POSTFIX_MACRO override {}`). Masking only
+      // the broken node leaves the postfix fragment untouched and can produce
+      // a cleaner-but-still-wrong tree. The complete declaration lines are the
+      // narrowest source-owned scope that keeps those fragments together.
+      ranges.push(expandRangeToFullLines(
+        source,
+        declarationScope.startIndex,
+        declarationScope.endIndex,
+      ));
+    } else if (typeScope) {
+      ranges.push({ start: typeScope.startIndex, end: typeScope.endIndex });
+    } else {
+      ranges.push(expandRangeByLines(source, issue.startIndex, issue.endIndex, 2));
+    }
   };
 
   for (const artifact of macroArtifacts) addContainingScope(artifact);
