@@ -1144,6 +1144,15 @@ export class CodeGraph {
   }
 
   /**
+   * Get every exact candidate for a bare or qualified symbol. Qualification
+   * is applied before any result cap, so overloaded tail names cannot hide
+   * the requested namespace/module candidate.
+   */
+  getNodesBySymbolExact(symbol: string): Node[] {
+    return this.queries.getNodesBySymbolExact(symbol);
+  }
+
+  /**
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {

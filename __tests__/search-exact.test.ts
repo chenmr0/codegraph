@@ -39,6 +39,30 @@ export function getUserById(id: number): { id: number } { return { id }; }
 export function getUserProfile(id: number): string { return 'p' + id; }
 `
     );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'qualified.ts'),
+      `export class UserService {
+  lookupUser(): void {}
+}
+`
+    );
+    // Put the path-filter target after more than the requested limit in the
+    // deterministic unfiltered order. Filtering after LIMIT used to miss it.
+    for (let i = 0; i < 12; i++) {
+      fs.writeFileSync(
+        path.join(tempDir, 'src', `duplicate-${String(i).padStart(2, '0')}.ts`),
+        `export class SharedThing { value = ${i}; }\n`
+      );
+    }
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'zzz-target.ts'),
+      `export class SharedThing { target = true; }\n`
+    );
+    fs.mkdirSync(path.join(tempDir, 'src', 'nested', 'deeper'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'nested', 'deeper', 'deep-target.ts'),
+      `export class DeepThing { target = true; }\n`
+    );
     cg = CodeGraph.initSync(tempDir);
     await cg.indexAll();
   });
@@ -97,6 +121,154 @@ export function getUserProfile(id: number): string { return 'p' + id; }
     expect(hit[0]!.node.name).toBe('getUser');
     const miss = cg.searchNodes('getUser path:elsewhere_xyz', { exact: true });
     expect(miss).toEqual([]);
+  });
+
+  it('applies path filters before LIMIT for heavily duplicated exact names', () => {
+    const hit = cg.searchNodes('SharedThing path:zzz-target', {
+      exact: true,
+      kinds: ['class'],
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
+  });
+
+  it('honors SearchOptions includePatterns before exact-result LIMIT', () => {
+    const hit = cg.searchNodes('SharedThing', {
+      exact: true,
+      kinds: ['class'],
+      includePatterns: ['**/zzz-target.ts'],
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
+  });
+
+  it('matches slash-free includePatterns against the file basename', () => {
+    const hit = cg.searchNodes('SharedThing', {
+      exact: true,
+      kinds: ['class'],
+      includePatterns: ['ZZZ-TARGET.ts'],
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
+  });
+
+  it('preserves literal path prefixes with globstar patterns', () => {
+    const patterns = [
+      'src/nested/deeper/deep-target.ts',
+      '**/deep-target.ts',
+      '**/*.ts',
+      'src/**/deep-target.ts',
+      'src/nested/**',
+      'src/nested/**/*',
+    ];
+    for (const includePattern of patterns) {
+      const hit = cg.searchNodes('DeepThing', {
+        exact: true,
+        includePatterns: [includePattern],
+        limit: 1,
+      });
+      expect(hit, includePattern).toHaveLength(1);
+      expect(hit[0]!.node.filePath).toContain('deep-target.ts');
+    }
+
+    // A single `*` remains segment-scoped; it must not cross nested folders.
+    expect(cg.searchNodes('DeepThing', {
+      exact: true,
+      includePatterns: ['src/*'],
+    })).toEqual([]);
+  });
+
+  it('honors SearchOptions excludePatterns for exact symbols', () => {
+    const results = cg.searchNodes('SharedThing', {
+      exact: true,
+      kinds: ['class'],
+      includePatterns: ['**/*.ts'],
+      excludePatterns: ['duplicate-*.ts'],
+      limit: 50,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.node.filePath).toContain('zzz-target.ts');
+  });
+
+  it('uses source line to disambiguate more than 100 identical qualified names', () => {
+    const queries = (cg as unknown as {
+      queries: { insertNode(node: Record<string, unknown>): void };
+    }).queries;
+    for (let line = 1; line <= 150; line++) {
+      queries.insertNode({
+        id: `function:repeated-qualified-${line}`,
+        kind: 'function',
+        name: 'TEST_F',
+        qualifiedName: 'tests::TEST_F',
+        filePath: 'src/repeated.cpp',
+        language: 'cpp',
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 1,
+        updatedAt: Date.now(),
+      });
+    }
+
+    const hit = cg.searchNodes('tests::TEST_F', {
+      exact: true,
+      includePatterns: ['src/repeated.cpp'],
+      line: 149,
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.startLine).toBe(149);
+  });
+
+  it('applies path filters inside FTS before its candidate LIMIT', () => {
+    const hit = cg.searchNodes('Shared path:zzz-target', {
+      kinds: ['class'],
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
+  });
+
+  it('resolves C++-style and dotted qualified names without FTS', () => {
+    const cpp = cg.searchNodes('UserService::lookupUser', { exact: true });
+    const dotted = cg.searchNodes('UserService.lookupUser', { exact: true });
+    for (const results of [cpp, dotted]) {
+      expect(results).toHaveLength(1);
+      expect(results[0]!.node.kind).toBe('method');
+      expect(results[0]!.node.qualifiedName).toContain('UserService::lookupUser');
+    }
+  });
+
+  it('preserves whitespace and ellipses in an exact C++ template qualified name', () => {
+    const qualifiedName = 'ns::Tuple <typename T...>\n  ::type, U...>';
+    const queries = (cg as unknown as {
+      queries: { insertNode(node: Record<string, unknown>): void };
+    }).queries;
+    queries.insertNode({
+      id: 'class:complex-template-query',
+      kind: 'class',
+      name: 'type, U...>',
+      qualifiedName,
+      filePath: 'src/complex-template.hpp',
+      language: 'cpp',
+      startLine: 1,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 1,
+      updatedAt: Date.now(),
+    });
+
+    const results = cg.searchNodes(qualifiedName, { exact: true, kinds: ['class'] });
+    expect(results.some((result) => result.node.qualifiedName === qualifiedName)).toBe(true);
+  });
+
+  it('intersects inline kind filters with SearchOptions kinds', () => {
+    expect(
+      cg.searchNodes('getUser kind:class', { exact: true, kinds: ['function'] })
+    ).toEqual([]);
   });
 
   it('falls back to the filter-only path when only fields are given', () => {

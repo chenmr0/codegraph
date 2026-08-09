@@ -106,11 +106,63 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(text).toContain('HelperUtils');
   });
 
-  it('does not crash on a qualified input (falls through to the fuzzy path)', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'Foo.bar' });
-    // Qualified names are discouraged in the tool description (use codegraph_node
-    // to resolve them), but the handler must not throw — it falls through to
-    // the FTS fuzzy path and returns either candidates or "No results found".
+  it('resolves a qualified input exactly and exposes the qualified name', async () => {
+    const result = await handler.execute('codegraph_search', { query: 'Widget.helper' });
     expect(result.isError).toBeFalsy();
+    const text = result.content[0]!.text;
+    expect(text).toContain('### helper (method)');
+    expect(text).toContain('Qualified: `Widget::helper`');
+    expect(text).not.toContain('### helper (function)');
+    expect(text).not.toMatch(/closest matches/i);
+  });
+
+  it('uses path to disambiguate same-named exact symbols before limiting', async () => {
+    const result = await handler.execute('codegraph_search', {
+      query: 'helper',
+      path: 'src/b.ts',
+      limit: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0]!.text;
+    expect(text).toContain('src/b.ts');
+    expect(text).not.toContain('src/a.ts');
+  });
+
+  it('uses path and line to pin one physical node among repeated qualified names', async () => {
+    const queries = (cg as unknown as {
+      queries: { insertNode(node: Record<string, unknown>): void };
+    }).queries;
+    for (let line = 1; line <= 120; line++) {
+      queries.insertNode({
+        id: `function:mcp-test-f-${line}`,
+        kind: 'function',
+        name: 'TEST_F',
+        qualifiedName: 'tests::TEST_F',
+        filePath: 'src/repeated.cpp',
+        language: 'cpp',
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 1,
+        updatedAt: Date.now(),
+      });
+    }
+
+    const result = await handler.execute('codegraph_search', {
+      query: 'tests::TEST_F',
+      path: 'src/repeated.cpp',
+      line: 119,
+      limit: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0]!.text;
+    expect(text).toContain('src/repeated.cpp:119');
+    expect(text).not.toContain('src/repeated.cpp:118');
+  });
+
+  it('does not fuzzy-fallback for an unknown qualified input', async () => {
+    const result = await handler.execute('codegraph_search', { query: 'Foo.bar' });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0]!.text).toContain('No results found');
   });
 });

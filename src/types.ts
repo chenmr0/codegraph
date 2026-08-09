@@ -412,11 +412,21 @@ export interface SearchOptions {
   /** Languages to include */
   languages?: Language[];
 
-  /** File path patterns to include */
+  /**
+   * Case-insensitive file-path globs to include. Slash-free patterns match a
+   * basename in any directory; patterns containing `/` match the full path.
+   * This is glob matching, not arbitrary substring matching.
+   */
   includePatterns?: string[];
 
-  /** File path patterns to exclude */
+  /**
+   * Case-insensitive file-path globs to exclude. Slash-free patterns match a
+   * basename in any directory; patterns containing `/` match the full path.
+   */
   excludePatterns?: string[];
+
+  /** Only return symbols whose source span contains this 1-based line */
+  line?: number;
 
   /** Maximum results to return */
   limit?: number;
@@ -428,11 +438,11 @@ export interface SearchOptions {
   caseSensitive?: boolean;
 
   /**
-   * Strict exact-match lookup: return only nodes whose `name` is byte-equal
-   * to the query — case-sensitive, with no prefix / substring / edit-distance
-   * fallback. The CLI `query` command enables this so a symbol lookup isn't
-   * buried under prefix or case-folded matches. When false (default) the
-   * FTS → LIKE → fuzzy chain is used.
+   * Strict exact-match lookup. Bare queries match `name` byte-for-byte;
+   * qualified queries (`A::B::name`, `A.B.name`, `module/name`) match the
+   * semantic qualified name or module path. Case-sensitive, with no prefix /
+   * substring / edit-distance fallback. When false (default) the FTS → LIKE →
+   * fuzzy chain is used.
    */
   exact?: boolean;
 }

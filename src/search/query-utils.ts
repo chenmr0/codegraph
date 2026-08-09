@@ -482,9 +482,9 @@ export function isNaturalLanguageQuery(query: string): { isNatural: boolean; rea
     return { isNatural: true, reason: '查询包含问号，疑似自然语言问题。请提取关键符号名搜索' };
   }
 
-  // Whitespace — symbol names never contain spaces.  "ADD TRMDBG",
-  // "how does auth work", "RepAlloc.Rsp" (dot gets FTS-stripped into two
-  // terms) — all rejected.  The agent should pass a single symbol name.
+  // Whitespace — symbol names never contain spaces. "ADD TRMDBG" and
+  // "how does auth work" are rejected. Qualified symbols such as
+  // `RepAlloc.Rsp` contain no whitespace and are accepted.
   if (/\s/.test(trimmed)) {
     return {
       isNatural: true,

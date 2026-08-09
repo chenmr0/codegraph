@@ -207,6 +207,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     fs.writeFileSync(
       path.join(src, 'session.ts'),
       `export class Session {\n  request(): void { fetch('x'); }\n}\nexport function request(): void {}\n`
+      + `export class OtherSession {\n  request(): void {}\n}\n`
     );
 
     const CodeGraph = (await import('../src/index')).default;
@@ -230,6 +231,9 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect(matches.length).toBeGreaterThan(0);
     expect(matches[0]!.kind).toBe('method');
     expect(matches[0]!.qualifiedName).toContain('Session::request');
+    for (const match of matches) {
+      expect(match.qualifiedName).not.toContain('OtherSession::request');
+    }
   });
 
   it('codegraph_node on an ambiguous bare name returns ALL overloads with bodies (no guess)', async () => {
@@ -238,10 +242,10 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     // the other overload; now both bodies come back in one call.
     const res = await handler.execute('codegraph_node', { symbol: 'request', includeCode: true });
     const text = res.content?.[0]?.text ?? '';
-    expect(text).toContain('2 definitions named "request"');
-    // Both definitions are rendered (method + function), each with a Location.
+    expect(text).toContain('3 definitions named "request"');
+    // All definitions are rendered (two methods + function), each with a Location.
     expect(text).toMatch(/\(method\)/);
     expect(text).toMatch(/\(function\)/);
-    expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
+    expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(3);
   });
 });

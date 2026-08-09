@@ -33,9 +33,7 @@ import { resolve as resolvePath } from 'path';
 import {
   CONTAINER_NODE_KINDS,
   displaySymbol,
-  lastQualifierPart,
   numberSourceLines,
-  matchesSymbol,
   synthEdgeNote,
 } from './node-helpers';
 
@@ -366,9 +364,9 @@ export const tools: ToolDefinition[] = [
     name: 'codegraph_search',
     description:
       '按符号名搜索：精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
-      '只接受符号名或符号名片段。' +
+      '支持裸名称和限定名（如 rtl::OString、Session.request），重名时可用 path/line 消歧。' +
       '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
-      '"RepAlloc.Rsp"（点号分隔的 proto 引用）、"how does auth work?"（自然语言问题）。' +
+      '"how does auth work?"（自然语言问题）。' +
       '正面示例："signIn"、"UserService"、"handleAuth"、"TRMDBG"',
     inputSchema: {
       type: 'object',
@@ -376,8 +374,8 @@ export const tools: ToolDefinition[] = [
         query: {
           type: 'string',
           description:
-            '符号名（例如 "auth"、"signIn"、"UserService"）。' +
-            '禁止传入：十六进制值(0x...)、自然语言问题、空格分隔的命令/描述、点号分隔的引用',
+            '符号名或限定名（例如 "signIn"、"rtl::OString"、"Session.request"）。' +
+            '禁止传入：十六进制值(0x...)、自然语言问题、空格分隔的命令/描述',
         },
         kind: {
           type: 'string',
@@ -388,6 +386,14 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum results (default: 10)',
           default: 10,
+        },
+        path: {
+          type: 'string',
+          description: 'Optional case-insensitive file-path substring used to disambiguate same-named symbols',
+        },
+        line: {
+          type: 'number',
+          description: 'Optional 1-based source line used with path to disambiguate repeated qualified names or overloads',
         },
         projectPath: projectPathProperty,
       },
@@ -1086,6 +1092,12 @@ export class ToolHandler {
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const validatedPath = this.validateOptionalPath(args.path, 'path');
+    if (validatedPath !== undefined && typeof validatedPath !== 'string') return validatedPath;
+    const pathHint = validatedPath?.replace(/\\/g, '/').toLowerCase();
+    const lineHint = typeof args.line === 'number' && Number.isInteger(args.line) && args.line > 0
+      ? args.line
+      : undefined;
     const kind = args.kind as string | undefined;
     const rawLimit = Number(args.limit) || 10;
     const limit = clamp(rawLimit, 1, 100);
@@ -1102,48 +1114,50 @@ export class ToolHandler {
     // chain, flagged with a warning so the agent knows the candidates are
     // closest matches, not the queried name (no silent wrong-symbol surfacing).
     const isQualified = /[.\/]|::/.test(query);
-
-    if (!isQualified) {
-      const exactAll = cg.getNodesByName(query);
-      const exact = kinds ? exactAll.filter((n) => kinds.includes(n.kind)) : exactAll;
-      if (exact.length > 0) {
-        const ranked = [...exact].sort((a, b) => {
-          const aGen = isGeneratedFile(a.filePath) ? 1 : 0;
-          const bGen = isGeneratedFile(b.filePath) ? 1 : 0;
-          if (aGen !== bGen) return aGen - bGen;
-          const aDecl = a.isDeclaration === true ? 1 : 0;
-          const bDecl = b.isDeclaration === true ? 1 : 0;
-          return aDecl - bDecl;
-        });
-        const total = ranked.length;
-        const capped = ranked.slice(0, limit);
-        const note = total > limit
-          ? `\n\n> Showing ${capped.length} of ${total} exact matches named "${query}". Raise \`limit\` to see the rest.`
-          : '';
-        const formatted = this.formatSearchResults(capped.map((n) => ({ node: n, score: 1.0 })));
-        return this.textResult(this.truncateOutput(formatted + note));
-      }
-      // No exact match — fuzzy fallback, flagged so the agent doesn't treat
-      // closest matches as the queried name (no silent wrong-feature surfacing).
-      const fuzzy = cg.searchNodes(query, { limit, kinds });
-      if (fuzzy.length === 0) {
-        return this.textResult(`No results found for "${query}"`);
-      }
-      const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:`;
-      const formatted = this.formatSearchResults(this.rankSearchResults(fuzzy));
-      return this.textResult(this.truncateOutput(note + '\n' + formatted));
+    // Backward-compatible with small embedders/test doubles that implement
+    // the pre-qualified-lookup CodeGraph surface only.
+    const exactAll = typeof cg.getNodesBySymbolExact === 'function'
+      ? cg.getNodesBySymbolExact(query)
+      : isQualified
+        ? []
+        : cg.getNodesByName(query);
+    const exact = exactAll.filter((node) =>
+      (!kinds || kinds.includes(node.kind)) &&
+      (!pathHint || node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint)) &&
+      (lineHint === undefined ||
+        (node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint))
+    );
+    if (exact.length > 0) {
+      const ranked = this.rankExactSymbolNodes(exact);
+      const total = ranked.length;
+      const capped = ranked.slice(0, limit);
+      const qualifier = isQualified ? 'qualified ' : '';
+      const pathNote = pathHint ? ` in paths containing "${validatedPath}"` : '';
+      const lineNote = lineHint !== undefined ? ` at line ${lineHint}` : '';
+      const note = total > limit
+        ? `\n\n> Showing ${capped.length} of ${total} exact ${qualifier}matches${pathNote}${lineNote}. Raise \`limit\` or narrow \`path\`/\`line\` to see the intended symbol.`
+        : '';
+      const formatted = this.formatSearchResults(capped.map((node) => ({ node, score: 1.0 })));
+      return this.textResult(this.truncateOutput(formatted + note));
     }
 
-    // Qualified input (`Session.request`, `stage_apply::run`): the tool
-    // description discourages点号/:: 分隔的引用 (use codegraph_node to
-    // resolve a qualified symbol), but don't crash — run the existing FTS
-    // fuzzy path so a partial qualified fragment still surfaces candidates.
-    const results = cg.searchNodes(query, { limit, kinds });
-    if (results.length === 0) {
+    // A qualified query is already an explicit disambiguation request. Never
+    // silently degrade it to an unrelated fuzzy symbol.
+    if (isQualified) {
       return this.textResult(`No results found for "${query}"`);
     }
-    const formatted = this.formatSearchResults(this.rankSearchResults(results));
-    return this.textResult(this.truncateOutput(formatted));
+
+    // No exact bare-name match — fuzzy fallback, visibly labelled.
+    const fuzzyQuery = pathHint
+      ? `${query} path:"${validatedPath!.replace(/"/g, '')}"`
+      : query;
+    const fuzzy = cg.searchNodes(fuzzyQuery, { limit, kinds, line: lineHint });
+    if (fuzzy.length === 0) {
+      return this.textResult(`No results found for "${query}"`);
+    }
+    const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:`;
+    const formatted = this.formatSearchResults(this.rankSearchResults(fuzzy));
+    return this.textResult(this.truncateOutput(note + '\n' + formatted));
   }
 
   /**
@@ -3248,41 +3262,16 @@ export class ToolHandler {
     // and the agent Read it. With the full set, the multi-overload render + the
     // file/line filter can both reach it.
     if (!isQualified) {
-      const exact = cg.getNodesByName(symbol);
+      const exact = cg.getNodesBySymbolExact(symbol);
       if (exact.length > 0) {
-        return [...exact].sort((a, b) => (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0));
+        return this.rankExactSymbolNodes(exact);
       }
       // No exact match — use the single top fuzzy result (e.g. a file basename).
       const fuzzy = cg.searchNodes(symbol, { limit: 10 });
       return fuzzy[0] ? [fuzzy[0].node] : [];
     }
 
-    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
-    const limit = 50;
-    let results = cg.searchNodes(symbol, { limit });
-
-    // FTS strips colons, so `stage_apply::run` searches the literal
-    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
-    // let `matchesSymbol` filter by qualifier.
-    if (isQualified && results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
-    }
-
-    if (results.length === 0) return [];
-
-    const exactMatches = results.filter((r) => matchesSymbol(r.node, symbol));
-    if (exactMatches.length === 0) {
-      // No exact match — a qualified lookup must not fall back to a fuzzy file
-      // hit (#173); a bare name may use the single top fuzzy result.
-      return isQualified ? [] : results[0] ? [results[0].node] : [];
-    }
-
-    // Down-rank generated files (.pb.go, .pulsar.go, _grpc.pb.go, …) so a flow
-    // query prefers the keeper implementation over the protobuf-generated stub.
-    return [...exactMatches]
-      .sort((a, b) => (isGeneratedFile(a.node.filePath) ? 1 : 0) - (isGeneratedFile(b.node.filePath) ? 1 : 0))
-      .map((r) => r.node);
+    return this.rankExactSymbolNodes(cg.getNodesBySymbolExact(symbol));
   }
 
   /**
@@ -3294,8 +3283,8 @@ export class ToolHandler {
    * another symbol's name resolves correctly. When no exact match exists, the single
    * top fuzzy result is returned with a `⚠️ No exact match` warning note so the caller
    * knows the returned neighborhood belongs to a closest match, not the queried name.
-   * Qualified names use FTS + `matchesSymbol`; a qualified lookup with no exact match
-   * returns empty (no silent fuzzy fallback, per #173).
+   * Qualified names use the uncapped exact-symbol path; a qualified lookup
+   * with no exact match returns empty (no silent fuzzy fallback, per #173).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
     const isQualified = /[.\/]|::/.test(symbol);
@@ -3305,11 +3294,9 @@ export class ToolHandler {
     // overloaded name (>50 FTS hits) or a name that is a prefix of another
     // symbol's name must not silently fall back to the first FTS prefix hit.
     if (!isQualified) {
-      const exact = cg.getNodesByName(symbol);
+      const exact = cg.getNodesBySymbolExact(symbol);
       if (exact.length > 0) {
-        const ranked = [...exact].sort((a, b) =>
-          (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0)
-        );
+        const ranked = this.rankExactSymbolNodes(exact);
         if (ranked.length === 1) {
           return { nodes: [ranked[0]!], note: '' };
         }
@@ -3329,46 +3316,23 @@ export class ToolHandler {
       return { nodes: [node], note };
     }
 
-    // Qualified lookup (`Session.request`, `stage_apply::run`): FTS + matchesSymbol.
-    let results = cg.searchNodes(symbol, { limit: 50 });
-
-    // FTS strips colons, so `stage_apply::run` searches the literal
-    // `stage_applyrun` and finds nothing. Re-search by the bare last part and
-    // let `matchesSymbol` filter by qualifier.
-    if (results.length === 0) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
-    }
-
-    if (results.length === 0) return { nodes: [], note: '' };
-
-    const exactMatches = results.filter(r => matchesSymbol(r.node, symbol));
-
-    if (exactMatches.length === 0) {
-      // No exact match — a qualified lookup must not fall back to a fuzzy file
-      // hit (#173); return empty so the caller sees "not found" rather than
-      // the wrong symbol's callers/callees/impact.
-      return { nodes: [], note: '' };
-    }
+    const exactMatches = this.rankExactSymbolNodes(cg.getNodesBySymbolExact(symbol));
+    if (exactMatches.length === 0) return { nodes: [], note: '' };
 
     if (exactMatches.length === 1) {
-      return { nodes: [exactMatches[0]!.node], note: '' };
+      return { nodes: [exactMatches[0]!], note: '' };
     }
 
     // Same generated-file down-rank as findSymbol — keeps callers/callees
     // /impact aggregation aligned (a query against "Send" returns the
     // hand-written implementations before the protobuf scaffold).
-    const ranked = [...exactMatches].sort((a, b) => {
-      const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-      const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
-      return aGen - bGen;
-    });
+    const ranked = exactMatches;
 
     const locations = ranked.map(r =>
-      `${r.node.kind} at ${r.node.filePath}:${r.node.startLine}`
+      `${r.kind} at ${r.filePath}:${r.startLine}`
     );
     const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
-    return { nodes: ranked.map(r => r.node), note };
+    return { nodes: ranked, note };
   }
 
   /**
@@ -3403,6 +3367,23 @@ export class ToolHandler {
     });
   }
 
+  /** Stable exact-symbol ranking shared by search/node/callers helpers. */
+  private rankExactSymbolNodes(nodes: Node[]): Node[] {
+    return [...nodes].sort((a, b) => {
+      const declarationOrder = Number(a.isDeclaration === true) - Number(b.isDeclaration === true);
+      if (declarationOrder !== 0) return declarationOrder;
+      const generatedOrder = Number(isGeneratedFile(a.filePath)) - Number(isGeneratedFile(b.filePath));
+      if (generatedOrder !== 0) return generatedOrder;
+      const qualifiedOrder = a.qualifiedName.localeCompare(b.qualifiedName);
+      if (qualifiedOrder !== 0) return qualifiedOrder;
+      const kindOrder = a.kind.localeCompare(b.kind);
+      if (kindOrder !== 0) return kindOrder;
+      const pathOrder = a.filePath.localeCompare(b.filePath);
+      if (pathOrder !== 0) return pathOrder;
+      return a.startLine - b.startLine;
+    });
+  }
+
   private formatSearchResults(results: SearchResult[]): string {
     const lines: string[] = [`## Search Results (${results.length} found)`, ''];
 
@@ -3414,6 +3395,9 @@ export class ToolHandler {
       // the definition for the real body/callees rather than dead-ending.
       const declTag = node.isDeclaration === true ? ' [declaration]' : '';
       lines.push(`### ${node.name} (${node.kind})${declTag}`);
+      if (node.qualifiedName && node.qualifiedName !== node.name) {
+        lines.push(`Qualified: \`${node.qualifiedName}\``);
+      }
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');

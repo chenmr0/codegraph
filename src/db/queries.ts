@@ -5,6 +5,7 @@
  */
 
 import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
+import picomatch from 'picomatch';
 import {
   Node,
   Edge,
@@ -21,6 +22,12 @@ import {
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import {
+  canonicalQualifiedName,
+  isQualifiedSymbol,
+  lastQualifierPart,
+  matchesSymbol,
+} from '../search/symbol-match';
 import { isGeneratedFile } from '../extraction/generated-detection';
 
 /**
@@ -216,6 +223,45 @@ function compareSearchResultsDeterministically(a: SearchResult, b: SearchResult)
   if (a.node.id < b.node.id) return -1;
   if (a.node.id > b.node.id) return 1;
   return 0;
+}
+
+function compareNodesDeterministically(a: Node, b: Node): number {
+  return compareSearchResultsDeterministically(
+    { node: a, score: 0 },
+    { node: b, score: 0 }
+  );
+}
+
+/** Compile the public SearchOptions path globs once per query. */
+function createSearchPathMatcher(
+  includePatterns: string[] = [],
+  excludePatterns: string[] = []
+): ((filePath: string) => boolean) | undefined {
+  const normalizePattern = (pattern: string) => pattern.trim().replace(/\\/g, '/');
+  const compilePattern = (pattern: string) => picomatch(
+    pattern.includes('/') ? pattern : `**/${pattern}`,
+    { dot: true, nocase: true }
+  );
+  const includes = includePatterns
+    .map(normalizePattern)
+    .filter(Boolean)
+    .map(compilePattern);
+  const excludes = excludePatterns
+    .map(normalizePattern)
+    .filter(Boolean)
+    .map(compilePattern);
+  if (includes.length === 0 && excludes.length === 0) return undefined;
+
+  return (filePath: string): boolean => {
+    const normalized = filePath.replace(/\\/g, '/');
+    if (includes.length > 0 && !includes.some((matches) => matches(normalized))) return false;
+    return !excludes.some((matches) => matches(normalized));
+  };
+}
+
+function nodeContainsLine(node: Node, line: number | undefined): boolean {
+  if (line === undefined) return true;
+  return node.startLine <= line && (node.endLine ?? node.startLine) >= line;
 }
 
 function deterministicNodeOrderSql(tableAlias = ''): string {
@@ -938,6 +984,50 @@ export class QueryBuilder {
   }
 
   /**
+   * Enumerate every exact candidate for a bare or qualified symbol.
+   *
+   * Qualified lookups never go through FTS and therefore cannot lose the
+   * wanted overload behind an arbitrary FTS/limit cut. Semantic qualified
+   * names (`A::B::name`, `A.B.name`) use `qualified_name`; module-qualified
+   * languages whose hierarchy lives in the path use exact tail-name
+   * candidates followed by the shared path matcher.
+   */
+  getNodesBySymbolExact(symbol: string): Node[] {
+    if (!isQualifiedSymbol(symbol)) return this.getNodesByName(symbol);
+
+    const candidates = new Map<string, Node>();
+    const directQualifiedIds = new Set<string>();
+    const add = (nodes: Node[]) => {
+      for (const node of nodes) candidates.set(node.id, node);
+    };
+    const addDirectQualified = (nodes: Node[]) => {
+      for (const node of nodes) {
+        candidates.set(node.id, node);
+        directQualifiedIds.add(node.id);
+      }
+    };
+
+    addDirectQualified(this.getNodesByQualifiedNameExact(symbol));
+    const canonical = canonicalQualifiedName(symbol);
+    if (canonical && canonical !== symbol) {
+      addDirectQualified(this.getNodesByQualifiedNameExact(canonical));
+    }
+
+    // Namespace nodes produced from `namespace A::B` can retain the complete
+    // qualifier in `name`; ordinary symbols use the final segment.
+    add(this.getNodesByName(symbol));
+    const tail = lastQualifierPart(symbol);
+    if (tail && tail !== symbol) add(this.getNodesByName(tail));
+
+    return [...candidates.values()]
+      // An indexed byte-exact qualified name is authoritative. This also
+      // covers C++ template spellings containing `...`, where the dots are
+      // syntax rather than qualification separators.
+      .filter((node) => directQualifiedIds.has(node.id) || matchesSymbol(node, symbol))
+      .sort(compareNodesDeterministically);
+  }
+
+  /**
    * Search nodes by name using FTS with fallback to LIKE for better matching
    *
    * Search strategy:
@@ -947,52 +1037,112 @@ export class QueryBuilder {
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
     const { limit = 100, offset = 0 } = options;
+    const pathPatternMatcher = createSearchPathMatcher(
+      options.includePatterns,
+      options.excludePatterns
+    );
+    const line = Number.isInteger(options.line) && options.line! > 0
+      ? options.line
+      : undefined;
 
     // Parse field-qualified bits out of the raw query (kind:, lang:,
     // path:, name:). Anything not recognised stays in `text` and goes
     // to FTS unchanged. Filters compose with the SearchOptions arg —
     // both are applied (intersection-style).
     const parsed = parseQuery(query);
-    const mergedKinds =
-      parsed.kinds.length > 0
-        ? Array.from(new Set([...(options.kinds ?? []), ...parsed.kinds]))
-        : options.kinds;
-    const mergedLanguages =
-      parsed.languages.length > 0
-        ? Array.from(new Set([...(options.languages ?? []), ...parsed.languages]))
-        : options.languages;
+    const mergedKinds = parsed.kinds.length > 0
+      ? options.kinds && options.kinds.length > 0
+        ? parsed.kinds.filter((kind) => options.kinds!.includes(kind))
+        : parsed.kinds
+      : options.kinds;
+    const mergedLanguages = parsed.languages.length > 0
+      ? options.languages && options.languages.length > 0
+        ? parsed.languages.filter((language) => options.languages!.includes(language))
+        : parsed.languages
+      : options.languages;
+    // Structured options and inline filters compose by intersection. An empty
+    // intersection is a real conflict, not "no filter".
+    if (
+      (parsed.kinds.length > 0 && options.kinds?.length && mergedKinds?.length === 0) ||
+      (parsed.languages.length > 0 && options.languages?.length && mergedLanguages?.length === 0)
+    ) {
+      return [];
+    }
     const pathFilters = parsed.pathFilters;
     const nameFilters = parsed.nameFilters;
     // The text portion drives FTS/LIKE; if all the user typed was
     // filters (`kind:function`), we still need *some* candidate set,
     // so synthesise an empty-text path that returns everything matching
     // the filters.
-    const text = parsed.text;
+    // With no inline fields, exact mode must preserve the query byte-for-byte
+    // (apart from outer whitespace). C++ template qualified names can contain
+    // spaces/newlines and `...`; tokenizing and joining them changes the
+    // indexed qualified name and makes an otherwise exact lookup fail.
+    const hasInlineFilters =
+      parsed.kinds.length > 0 ||
+      parsed.languages.length > 0 ||
+      pathFilters.length > 0 ||
+      nameFilters.length > 0;
+    const text = options.exact && !hasInlineFilters ? query.trim() : parsed.text;
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
-    // Strict exact-match mode: skip the FTS/LIKE/fuzzy chain entirely and
-    // return only nodes whose name is byte-equal to the text portion. Used by
-    // the CLI `query` command so a symbol lookup is case-sensitive and isn't
-    // buried under prefix / case-folded / fuzzy matches. Path: filters still
-    // apply as a hard gate; the field-only (no text) case falls through to
-    // the filter-only path below.
+    // Strict exact-match mode: skip the FTS/LIKE/fuzzy chain entirely. Bare
+    // names are byte-equal; qualified names use semantic/path qualification.
+    // Used by the CLI `query` command so a symbol lookup is case-sensitive and
+    // isn't buried under prefix / case-folded / fuzzy matches.
     if (options.exact) {
-      return this.searchNodesExact(text, { kinds, languages, limit, offset, pathFilters });
+      return this.searchNodesExact(text, {
+        kinds,
+        languages,
+        limit,
+        offset,
+        pathFilters,
+        nameFilters,
+        pathPatternMatcher,
+        line,
+      });
     }
+
+    // Globs and source-span checks are evaluated in JavaScript so they behave
+    // identically on better-sqlite3 and sql.js. Pull a wider window and apply
+    // caller-visible pagination only after these hard gates.
+    const hasPostQueryFilters = pathPatternMatcher !== undefined || line !== undefined;
+    const candidateLimit = hasPostQueryFilters
+      ? Math.max((limit + offset) * 5, 100)
+      : limit;
+    const candidateOffset = hasPostQueryFilters ? 0 : offset;
+    const candidateOptions: SearchOptions = {
+      kinds,
+      languages,
+      limit: candidateLimit,
+      offset: candidateOffset,
+    };
 
     // First try FTS5 with prefix matching
     let results = text
-      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      ? this.searchNodesFTS(text, candidateOptions, pathFilters, nameFilters)
       // Over-fetch by 5× when running filter-only (no text). The
       // post-scoring path: + name: filters can be very selective, so
       // a smaller multiplier risks returning fewer than `limit`
       // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      : this.searchAllByFilters({
+          kinds,
+          languages,
+          pathFilters,
+          nameFilters,
+          limit: hasPostQueryFilters ? candidateLimit : limit * 5,
+          offset: candidateOffset,
+        });
 
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      results = this.searchNodesLike(
+        text,
+        candidateOptions,
+        pathFilters,
+        nameFilters
+      );
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -1000,7 +1150,12 @@ export class QueryBuilder {
     // returned nothing AND there's a text portion long enough to be
     // worth fuzzing (1-char queries would match too much).
     if (results.length === 0 && text.length >= 3) {
-      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+      results = this.searchNodesFuzzy(
+        text,
+        { kinds, languages, limit: candidateLimit },
+        pathFilters,
+        nameFilters
+      );
     }
 
     // Supplement: ensure exact name matches are always candidates.
@@ -1024,6 +1179,14 @@ export class QueryBuilder {
           sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
+        if (pathFilters.length > 0) {
+          sql += ` AND (${pathFilters.map(() => 'instr(lower(file_path), ?) > 0').join(' OR ')})`;
+          params.push(...pathFilters.map((path) => path.toLowerCase()));
+        }
+        if (nameFilters.length > 0) {
+          sql += ` AND (${nameFilters.map(() => 'instr(lower(name), ?) > 0').join(' OR ')})`;
+          params.push(...nameFilters.map((name) => name.toLowerCase()));
+        }
         sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT 20`;
         const rows = this.db.prepare(sql).all(...params) as NodeRow[];
         for (const row of rows) {
@@ -1046,10 +1209,6 @@ export class QueryBuilder {
           + nameMatchBonus(r.node.name, scoringQuery),
       }));
       results.sort(compareSearchResultsDeterministically);
-      // Trim to requested limit after rescoring
-      if (results.length > limit) {
-        results = results.slice(0, limit);
-      }
     }
 
     // Apply path: + name: filters AFTER scoring. Scoring already uses
@@ -1071,19 +1230,27 @@ export class QueryBuilder {
       });
     }
 
+    if (pathPatternMatcher) {
+      results = results.filter((result) => pathPatternMatcher(result.node.filePath));
+    }
+    if (line !== undefined) {
+      results = results.filter((result) => nodeContainsLine(result.node, line));
+    }
+
+    results = hasPostQueryFilters
+      ? results.slice(offset, offset + limit)
+      : results.slice(0, limit);
+
     return results;
   }
 
   /**
    * Strict exact-match lookup used when `SearchOptions.exact` is set.
    *
-   * Returns only nodes whose `name` is byte-equal to `text` — SQLite's
-   * default BINARY collation is case-sensitive, and `idx_nodes_name` covers
-   * the equality probe, so this is O(log n) with no FTS / LIKE / edit-distance
-   * fallback. `kind`/`language` narrow the set; `path:` filters apply as a
-   * hard gate after the SQL fetch. When `text` is empty (a field-only query
-   * like `kind:function`), it falls back to the filter-only path so those
-   * queries still work in exact mode.
+   * Bare names use the case-sensitive `idx_nodes_name` equality probe.
+   * Qualified names enumerate exact tail candidates and apply semantic/path
+   * qualification before pagination. `kind`/`language`/`path:`/`name:` narrow
+   * the set before LIMIT so selective filters cannot hide a valid result.
    */
   private searchNodesExact(
     text: string,
@@ -1093,40 +1260,78 @@ export class QueryBuilder {
       limit: number;
       offset: number;
       pathFilters: string[];
+      nameFilters: string[];
+      pathPatternMatcher?: (filePath: string) => boolean;
+      line?: number;
     }
   ): SearchResult[] {
-    const { kinds, languages, limit, offset, pathFilters } = options;
+    const {
+      kinds,
+      languages,
+      limit,
+      offset,
+      pathFilters,
+      nameFilters,
+      pathPatternMatcher,
+      line,
+    } = options;
 
-    const applyPathGate = (results: SearchResult[]): SearchResult[] => {
-      if (pathFilters.length === 0) return results;
-      const lowered = pathFilters.map((p) => p.toLowerCase());
-      return results.filter((r) => {
-        const fp = r.node.filePath.toLowerCase();
-        return lowered.some((p) => fp.includes(p));
-      });
+    const filterNodes = (input: Node[]): Node[] => {
+      let nodes = input;
+      if (kinds && kinds.length > 0) nodes = nodes.filter((node) => kinds.includes(node.kind));
+      if (languages && languages.length > 0) {
+        nodes = nodes.filter((node) => languages.includes(node.language));
+      }
+      if (pathFilters.length > 0) {
+        const lowered = pathFilters.map((path) => path.toLowerCase());
+        nodes = nodes.filter((node) => {
+          const filePath = node.filePath.toLowerCase();
+          return lowered.some((path) => filePath.includes(path));
+        });
+      }
+      if (nameFilters.length > 0) {
+        const lowered = nameFilters.map((name) => name.toLowerCase());
+        nodes = nodes.filter((node) => {
+          const name = node.name.toLowerCase();
+          return lowered.some((filter) => name.includes(filter));
+        });
+      }
+      if (pathPatternMatcher) {
+        nodes = nodes.filter((node) => pathPatternMatcher(node.filePath));
+      }
+      if (line !== undefined) nodes = nodes.filter((node) => nodeContainsLine(node, line));
+      return nodes.sort(compareNodesDeterministically);
     };
 
     // No text (e.g. `kind:function` alone) — reuse the filter-only path.
     if (!text) {
-      const filtered = this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
-      return applyPathGate(filtered).slice(0, limit);
+      const needsPostFilter = pathPatternMatcher !== undefined || line !== undefined;
+      let results = this.searchAllByFilters({
+        kinds,
+        languages,
+        pathFilters,
+        nameFilters,
+        limit: needsPostFilter ? Math.max((limit + offset) * 5, 100) : limit,
+        offset: needsPostFilter ? 0 : offset,
+      });
+      if (pathPatternMatcher) {
+        results = results.filter((result) => pathPatternMatcher(result.node.filePath));
+      }
+      if (line !== undefined) {
+        results = results.filter((result) => nodeContainsLine(result.node, line));
+      }
+      return needsPostFilter ? results.slice(offset, offset + limit) : results;
     }
 
-    let sql = 'SELECT * FROM nodes WHERE name = ?';
-    const params: (string | number)[] = [text];
-    if (kinds && kinds.length > 0) {
-      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-      params.push(...kinds);
-    }
-    if (languages && languages.length > 0) {
-      sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
-      params.push(...languages);
-    }
-    sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
-
-    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
-    return applyPathGate(rows.map((row) => ({ node: rowToNode(row), score: 1 })));
+    // Enumerate every same-name candidate before hard filters and pagination.
+    // This keeps a target reachable even for TEST_F-style names with thousands
+    // of physical occurrences.
+    const candidates = isQualifiedSymbol(text)
+      ? this.getNodesBySymbolExact(text)
+      : this.getNodesByName(text);
+    return filterNodes(candidates)
+      .slice(offset, offset + limit)
+      .map((node) => ({ node, score: 1 }));
   }
 
   /**
@@ -1138,9 +1343,19 @@ export class QueryBuilder {
   private searchAllByFilters(options: {
     kinds?: NodeKind[];
     languages?: Language[];
+    pathFilters?: string[];
+    nameFilters?: string[];
     limit: number;
+    offset?: number;
   }): SearchResult[] {
-    const { kinds, languages, limit } = options;
+    const {
+      kinds,
+      languages,
+      pathFilters = [],
+      nameFilters = [],
+      limit,
+      offset = 0,
+    } = options;
     let sql = 'SELECT * FROM nodes WHERE 1=1';
     const params: (string | number)[] = [];
     if (kinds && kinds.length > 0) {
@@ -1151,8 +1366,16 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT ?`;
-    params.push(limit);
+    if (pathFilters.length > 0) {
+      sql += ` AND (${pathFilters.map(() => 'instr(lower(file_path), ?) > 0').join(' OR ')})`;
+      params.push(...pathFilters.map((path) => path.toLowerCase()));
+    }
+    if (nameFilters.length > 0) {
+      sql += ` AND (${nameFilters.map(() => 'instr(lower(name), ?) > 0').join(' OR ')})`;
+      params.push(...nameFilters.map((name) => name.toLowerCase()));
+    }
+    sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
     const rows = this.db.prepare(sql).all(...params) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
   }
@@ -1167,7 +1390,9 @@ export class QueryBuilder {
    */
   private searchNodesFuzzy(
     text: string,
-    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number },
+    pathFilters: string[] = [],
+    nameFilters: string[] = []
   ): SearchResult[] {
     const { kinds, languages, limit } = options;
     const lowered = text.toLowerCase();
@@ -1213,6 +1438,14 @@ export class QueryBuilder {
         sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
         params.push(...languages);
       }
+      if (pathFilters.length > 0) {
+        sql += ` AND (${pathFilters.map(() => 'instr(lower(file_path), ?) > 0').join(' OR ')})`;
+        params.push(...pathFilters.map((path) => path.toLowerCase()));
+      }
+      if (nameFilters.length > 0) {
+        sql += ` AND (${nameFilters.map(() => 'instr(lower(name), ?) > 0').join(' OR ')})`;
+        params.push(...nameFilters.map((name) => name.toLowerCase()));
+      }
       sql += ` ORDER BY ${deterministicNodeOrderSql()} LIMIT 5`;
       const rows = this.db.prepare(sql).all(...params) as NodeRow[];
       for (const row of rows) {
@@ -1230,7 +1463,12 @@ export class QueryBuilder {
   /**
    * FTS5 search with prefix matching
    */
-  private searchNodesFTS(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesFTS(
+    query: string,
+    options: SearchOptions,
+    pathFilters: string[] = [],
+    nameFilters: string[] = []
+  ): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
@@ -1279,6 +1517,14 @@ export class QueryBuilder {
       sql += ` AND nodes.language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
+    if (pathFilters.length > 0) {
+      sql += ` AND (${pathFilters.map(() => 'instr(lower(nodes.file_path), ?) > 0').join(' OR ')})`;
+      params.push(...pathFilters.map((path) => path.toLowerCase()));
+    }
+    if (nameFilters.length > 0) {
+      sql += ` AND (${nameFilters.map(() => 'instr(lower(nodes.name), ?) > 0').join(' OR ')})`;
+      params.push(...nameFilters.map((name) => name.toLowerCase()));
+    }
 
     sql += ` ORDER BY score, ${deterministicNodeOrderSql('nodes.')} LIMIT ? OFFSET ?`;
     params.push(ftsLimit, offset);
@@ -1299,7 +1545,12 @@ export class QueryBuilder {
    * LIKE-based substring search for cases where FTS doesn't match
    * Useful for camelCase matching (e.g., "signIn" finds "signInWithGoogle")
    */
-  private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesLike(
+    query: string,
+    options: SearchOptions,
+    pathFilters: string[] = [],
+    nameFilters: string[] = []
+  ): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     let sql = `
@@ -1342,6 +1593,14 @@ export class QueryBuilder {
     if (languages && languages.length > 0) {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
+    }
+    if (pathFilters.length > 0) {
+      sql += ` AND (${pathFilters.map(() => 'instr(lower(file_path), ?) > 0').join(' OR ')})`;
+      params.push(...pathFilters.map((path) => path.toLowerCase()));
+    }
+    if (nameFilters.length > 0) {
+      sql += ` AND (${nameFilters.map(() => 'instr(lower(name), ?) > 0').join(' OR ')})`;
+      params.push(...nameFilters.map((name) => name.toLowerCase()));
     }
 
     sql += ` ORDER BY score DESC, ${deterministicNodeOrderSql()} LIMIT ? OFFSET ?`;

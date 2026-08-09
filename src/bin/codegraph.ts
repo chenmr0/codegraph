@@ -957,7 +957,7 @@ program
  */
 program
   .command('query <search>')
-  .description('Search for symbols by exact, case-sensitive name match (use --fuzzy for the old prefix/substring/edit-distance behavior)')
+  .description('Search for bare or qualified symbols by exact, case-sensitive match (use --fuzzy for prefix/substring/edit-distance behavior)')
   .option('-p, --path <path>', 'Project path')
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
@@ -1016,6 +1016,9 @@ program
               ' ' + score
             );
             console.log(chalk.dim(`  ${location}`));
+            if (node.qualifiedName && node.qualifiedName !== node.name) {
+              console.log(chalk.dim(`  ${node.qualifiedName}`));
+            }
             if (node.signature) {
               console.log(chalk.dim(`  ${node.signature}`));
             }

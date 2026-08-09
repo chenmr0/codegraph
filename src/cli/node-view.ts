@@ -29,9 +29,7 @@ import { readFileSync } from 'fs';
 import {
   CONTAINER_NODE_KINDS,
   displaySymbol,
-  lastQualifierPart,
   numberSourceLines,
-  matchesSymbol,
   synthEdgeNote,
 } from '../mcp/node-helpers';
 
@@ -334,29 +332,24 @@ function findSymbolMatches(cg: CodeGraph, symbol: string): Node[] {
   const isQualified = /[.\/]|::/.test(symbol);
 
   if (!isQualified) {
-    const exact = cg.getNodesByName(symbol);
+    const exact = cg.getNodesBySymbolExact(symbol);
     if (exact.length > 0) {
-      return [...exact].sort((a, b) => (isGeneratedFile(a.filePath) ? 1 : 0) - (isGeneratedFile(b.filePath) ? 1 : 0));
+      return [...exact].sort((a, b) => {
+        const declarationOrder = Number(a.isDeclaration === true) - Number(b.isDeclaration === true);
+        if (declarationOrder !== 0) return declarationOrder;
+        return Number(isGeneratedFile(a.filePath)) - Number(isGeneratedFile(b.filePath));
+      });
     }
     const fuzzy = cg.searchNodes(symbol, { limit: 10 });
     return fuzzy[0] ? [fuzzy[0].node] : [];
   }
 
-  const limit = 50;
-  let results = cg.searchNodes(symbol, { limit });
-  if (results.length === 0) {
-    const tail = lastQualifierPart(symbol);
-    if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit });
-  }
-  if (results.length === 0) return [];
-
-  const exactMatches = results.filter((r) => matchesSymbol(r.node, symbol));
-  if (exactMatches.length === 0) {
-    return isQualified ? [] : results[0] ? [results[0].node] : [];
-  }
-  return [...exactMatches]
-    .sort((a, b) => (isGeneratedFile(a.node.filePath) ? 1 : 0) - (isGeneratedFile(b.node.filePath) ? 1 : 0))
-    .map((r) => r.node);
+  return cg.getNodesBySymbolExact(symbol)
+    .sort((a, b) => {
+      const declarationOrder = Number(a.isDeclaration === true) - Number(b.isDeclaration === true);
+      if (declarationOrder !== 0) return declarationOrder;
+      return Number(isGeneratedFile(a.filePath)) - Number(isGeneratedFile(b.filePath));
+    });
 }
 
 /**
