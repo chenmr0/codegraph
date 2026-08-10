@@ -34,6 +34,10 @@ import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
 } from '../resolution/frameworks';
+import {
+  expandDeclarationMacros,
+  type CppMacroDefinition,
+} from './declaration-macros';
 
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
@@ -43,9 +47,10 @@ interface CppDeclaredTypeName {
   qualifiedName?: string;
 }
 
-/** Resolve `class/struct/enum Outer::Inner` without treating it as anonymous. */
+/** Resolve `class/struct/union/enum Outer::Inner` without treating it as anonymous. */
 function getCppDeclaredTypeName(node: SyntaxNode, source: string): CppDeclaredTypeName | null {
-  if (node.type !== 'class_specifier' && node.type !== 'struct_specifier' && node.type !== 'enum_specifier') {
+  if (node.type !== 'class_specifier' && node.type !== 'struct_specifier'
+    && node.type !== 'union_specifier' && node.type !== 'enum_specifier') {
     return null;
   }
   const nameNode = getChildByField(node, 'name')
@@ -522,6 +527,56 @@ function expandRangeByLines(source: string, start: number, end: number, lineCoun
   return { start: expandedStart, end: expandedEnd };
 }
 
+/** Match clang tooling's symbol spelling for callable template-ids/operators. */
+function normalizeCppCallableName(name: string, receiverType?: string): string {
+  const templateId = name.trim().match(/^(~?[A-Za-z_]\w*)\s*<[\s\S]+>$/);
+  if (templateId && receiverType) {
+    const receiverTail = receiverType.split('::').pop()?.trim() ?? '';
+    const receiverBase = receiverTail.replace(/<[^<>]*>\s*$/, '');
+    if (receiverBase === templateId[1]!.replace(/^~/, '')) return templateId[1]!;
+  }
+  // Only symbolic operators are compacted. Conversion operators (`operator
+  // const char *`) retain their meaningful type whitespace.
+  const symbolicOperator = name.trim().match(/^operator\s*([^\w\s][\s\S]*)$/);
+  return symbolicOperator ? `operator${symbolicOperator[1]!.replace(/\s+/g, '')}` : name;
+}
+
+function anonymousCppTypeName(node: SyntaxNode): string | null {
+  if (getChildByField(node, 'name')) return null;
+  if (node.type === 'enum_specifier') return '(anonymous enum)';
+  if (node.type === 'union_specifier') return '(anonymous union)';
+  if (node.type === 'struct_specifier') return '(anonymous struct)';
+  return null;
+}
+
+/** Read the callable declarator without wandering into template/parameter types. */
+function cppCallableDeclaratorName(node: SyntaxNode, source: string): string | null {
+  const fn = node.type === 'function_declarator'
+    ? node
+    : node.descendantsOfType('function_declarator')[0];
+  if (!fn) return null;
+  let declarator = getChildByField(fn, 'declarator') ?? fn.namedChild(0);
+  while (declarator && (declarator.type === 'pointer_declarator'
+    || declarator.type === 'reference_declarator'
+    || declarator.type === 'parenthesized_declarator')) {
+    declarator = getChildByField(declarator, 'declarator') ?? declarator.namedChild(0);
+  }
+  if (!declarator) return null;
+  const raw = getNodeText(declarator, source).trim();
+  if (!raw) return null;
+  const operatorScope = raw.lastIndexOf('::operator');
+  if (operatorScope >= 0) return raw.slice(operatorScope + 2);
+  let angleDepth = 0;
+  for (let i = raw.length - 1; i > 0; i--) {
+    if (raw[i] === '>') angleDepth++;
+    else if (raw[i] === '<' && angleDepth > 0) angleDepth--;
+    else if (angleDepth === 0 && raw[i] === ':' && raw[i - 1] === ':') {
+      return raw.slice(i + 1);
+    }
+  }
+  return raw;
+}
+
 /** Expand a declaration recovery range to the complete source lines it touches. */
 function expandRangeToFullLines(source: string, start: number, end: number): SourceRange {
   const previousNewline = source.lastIndexOf('\n', Math.max(0, start - 1));
@@ -687,19 +742,35 @@ export class TreeSitterExtractor {
   // turning `typedef SAFE VOS_BOOL (*FnPtr)(...)` into the clean shape
   // tree-sitter parses correctly. See c-cpp.ts preprocessStatementMacros.
   private globalBodylessMacroNames: Set<string> | null = null;
+  /** Unambiguous project-wide definitions for declaration-macro recovery. */
+  private globalMacroDefinitions: readonly CppMacroDefinition[] | null = null;
   /** Original source bytes, retained for X-macro analysis before pre-parse transforms. */
   private originalSource: string;
+  private originalLineStarts: number[] = [0];
+  private lexicalCompoundEnds: Map<number, number> = new Map();
+  private lexicalExecutableRanges: SourceRange[] | null = null;
   /** Proven self-including X-macro enum constructs found before parsing. */
   private xMacroConstructs: XMacroConstruct[] = [];
 
-  constructor(filePath: string, source: string, language?: Language, globalMacroNames?: Set<string>, bodylessMacroNames?: Set<string>) {
+  constructor(
+    filePath: string,
+    source: string,
+    language?: Language,
+    globalMacroNames?: Set<string>,
+    bodylessMacroNames?: Set<string>,
+    macroDefinitions?: readonly CppMacroDefinition[],
+  ) {
     this.filePath = filePath;
     this.originalSource = source;
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] === '\n') this.originalLineStarts.push(i + 1);
+    }
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
     this.globalMacroNames = globalMacroNames ?? null;
     this.globalBodylessMacroNames = bodylessMacroNames ?? null;
+    this.globalMacroDefinitions = macroDefinitions ?? null;
   }
 
   /**
@@ -955,8 +1026,15 @@ export class TreeSitterExtractor {
 
       this.visitNode(this.tree.rootNode);
 
+      // A single malformed macro can make tree-sitter fold all later
+      // out-of-line C++ methods into ERROR nodes. Recover only source-spelled,
+      // qualified definitions whose body delimiter is still unambiguous.
+      this.recoverSourceSpelledCppMethodDefinitions();
+
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
+
+      this.recoverDeclarationMacroNodes();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
 
@@ -991,6 +1069,348 @@ export class TreeSitterExtractor {
       errors: this.errors,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /**
+   * A declaration-generating macro at file/namespace/class scope is worth an
+   * auxiliary expansion parse. Ordinary statement macros inside a compound
+   * statement are not: expanding them adds parse cost and can surface local
+   * implementation details as symbols. The raw tree is sufficient for this
+   * boundary check even when the invocation itself is an ERROR node.
+   */
+  private isDeclarationMacroScope(line: number, column: number): boolean {
+    if (!this.tree) return false;
+    const sourceOffset = (this.originalLineStarts[Math.max(0, line - 1)] ?? 0) + column;
+    if ((this.language === 'c' || this.language === 'cpp')
+      && this.isInsideLexicalExecutableBody(sourceOffset)) return false;
+    let current = this.tree.rootNode.descendantForPosition({
+      row: Math.max(0, line - 1),
+      column: Math.max(0, column),
+    });
+    let depth = 0;
+    while (current && depth++ < 128) {
+      if (current.type === 'compound_statement') {
+        // Error recovery sometimes extends a function's compound_statement far
+        // beyond its real closing brace. Ignore that stale AST ancestor only
+        // when a lexical, balanced close proves the invocation lies after it.
+        if (sourceOffset <= this.lexicalCompoundEnd(current.startIndex)) return false;
+      }
+      current = current.parent;
+    }
+    return true;
+  }
+
+  /** Lexically identify balanced function/lambda bodies even in a damaged AST. */
+  private isInsideLexicalExecutableBody(offset: number): boolean {
+    if (this.lexicalExecutableRanges === null) {
+      const source = this.originalSource;
+      const ranges: SourceRange[] = [];
+      const stack: Array<{ executable: boolean; start: number }> = [];
+      let segmentStart = 0;
+      let parenDepth = 0;
+      let bracketDepth = 0;
+      for (let i = 0; i < source.length; i++) {
+        const char = source[i]!;
+        if (char === '"' || char === "'") {
+          const quote = char;
+          for (i++; i < source.length; i++) {
+            if (source[i] === '\\') i++;
+            else if (source[i] === quote) break;
+          }
+        } else if (char === '/' && source[i + 1] === '/') {
+          const end = source.indexOf('\n', i + 2);
+          i = (end === -1 ? source.length : end) - 1;
+        } else if (char === '/' && source[i + 1] === '*') {
+          const end = source.indexOf('*/', i + 2);
+          i = (end === -1 ? source.length : end + 2) - 1;
+        } else if (char === '#' && /^\s*$/.test(source.slice(source.lastIndexOf('\n', i - 1) + 1, i))) {
+          // Braces inside a multi-line macro definition are preprocessing
+          // tokens, not lexical C/C++ scopes.
+          let end = source.indexOf('\n', i + 1);
+          while (end !== -1 && source[end - 1] === '\\') end = source.indexOf('\n', end + 1);
+          i = end === -1 ? source.length : end;
+          segmentStart = i + 1;
+        } else if (char === '(') parenDepth++;
+        else if (char === ')' && parenDepth > 0) parenDepth--;
+        else if (char === '[') bracketDepth++;
+        else if (char === ']' && bracketDepth > 0) bracketDepth--;
+        else if (char === '{' && parenDepth === 0 && bracketDepth === 0) {
+          const parentExecutable = stack.some(entry => entry.executable);
+          const context = source.slice(segmentStart, i).trim();
+          const declarationContainer = /\b(?:namespace|class|struct|union|enum)\b[\s\S]*$/.test(context);
+          const callableHeader = /\)[\s\S]*(?:const|volatile|noexcept|override|final|requires|->|:)?\s*$/.test(context)
+            || /\][\s\S]*(?:\([^)]*\))?\s*$/.test(context);
+          stack.push({ executable: parentExecutable || (!declarationContainer && callableHeader), start: i });
+          segmentStart = i + 1;
+        } else if (char === '}' && parenDepth === 0 && bracketDepth === 0) {
+          const entry = stack.pop();
+          if (entry?.executable && !stack.some(parent => parent.executable)) {
+            ranges.push({ start: entry.start + 1, end: i });
+          }
+          segmentStart = i + 1;
+        } else if (char === ';' && parenDepth === 0 && bracketDepth === 0) {
+          segmentStart = i + 1;
+        }
+      }
+      this.lexicalExecutableRanges = ranges;
+    }
+    return this.lexicalExecutableRanges.some(range => offset >= range.start && offset < range.end);
+  }
+
+  private lexicalCompoundEnd(start: number): number {
+    const cached = this.lexicalCompoundEnds.get(start);
+    if (cached !== undefined) return cached;
+    const source = this.originalSource;
+    let braceDepth = 0;
+    for (let i = start; i < source.length; i++) {
+      const char = source[i]!;
+      if (char === '"' || char === "'") {
+        const quote = char;
+        for (i++; i < source.length; i++) {
+          if (source[i] === '\\') i++;
+          else if (source[i] === quote) break;
+        }
+      } else if (char === '/' && source[i + 1] === '/') {
+        const end = source.indexOf('\n', i + 2);
+        i = (end === -1 ? source.length : end) - 1;
+      } else if (char === '/' && source[i + 1] === '*') {
+        const end = source.indexOf('*/', i + 2);
+        i = (end === -1 ? source.length : end + 2) - 1;
+      } else if (char === '{') {
+        braceDepth++;
+      } else if (char === '}' && --braceDepth === 0) {
+        this.lexicalCompoundEnds.set(start, i);
+        return i;
+      }
+    }
+    this.lexicalCompoundEnds.set(start, source.length);
+    return source.length;
+  }
+
+  /**
+   * Recover source-spelled `Return Owner::method(...) {` definitions from a
+   * damaged C++ tree. This is intentionally narrower than a regex function
+   * extractor: it only runs on erroneous trees, requires a qualified name and
+   * a balanced parameter list followed by a body, and deduplicates normal AST
+   * results. Calls such as `ns::fn(...)` are rejected unless a return-type
+   * prefix is present; the prefix-free exception is a real ctor/dtor.
+   */
+  private recoverSourceSpelledCppMethodDefinitions(): void {
+    if (this.language !== 'cpp' || !this.tree?.rootNode.hasError || !this.originalSource.includes('::')) {
+      return;
+    }
+    const source = this.originalSource;
+    const lineStarts = [0];
+    for (let i = 0; i < source.length; i++) {
+      if (source[i] === '\n') lineStarts.push(i + 1);
+    }
+    const lineForOffset = (offset: number): number => {
+      let low = 0;
+      let high = lineStarts.length;
+      while (low + 1 < high) {
+        const mid = (low + high) >>> 1;
+        if (lineStarts[mid]! <= offset) low = mid;
+        else high = mid;
+      }
+      return low + 1;
+    };
+    const skipQuoted = (offset: number): number => {
+      const quote = source[offset]!;
+      let i = offset + 1;
+      while (i < source.length) {
+        if (source[i] === '\\') i += 2;
+        else if (source[i] === quote) return i + 1;
+        else i++;
+      }
+      return i;
+    };
+    const closeParameterList = (open: number): number => {
+      let depth = 0;
+      for (let i = open; i < source.length; i++) {
+        const char = source[i]!;
+        if (char === '"' || char === "'") {
+          i = skipQuoted(i) - 1;
+        } else if (char === '/' && source[i + 1] === '/') {
+          const end = source.indexOf('\n', i + 2);
+          i = (end === -1 ? source.length : end) - 1;
+        } else if (char === '/' && source[i + 1] === '*') {
+          const end = source.indexOf('*/', i + 2);
+          i = (end === -1 ? source.length : end + 2) - 1;
+        } else if (char === '(') {
+          depth++;
+        } else if (char === ')' && --depth === 0) {
+          return i;
+        }
+      }
+      return -1;
+    };
+    const bodyDelimiter = (start: number): { offset: number; char: string } | null => {
+      const limit = Math.min(source.length, start + 4096);
+      for (let i = start; i < limit; i++) {
+        const char = source[i]!;
+        if (char === '"' || char === "'") i = skipQuoted(i) - 1;
+        else if (char === '/' && source[i + 1] === '/') {
+          const end = source.indexOf('\n', i + 2);
+          i = (end === -1 ? source.length : end) - 1;
+        } else if (char === '/' && source[i + 1] === '*') {
+          const end = source.indexOf('*/', i + 2);
+          i = (end === -1 ? source.length : end + 2) - 1;
+        } else if (char === '{' || char === ';') return { offset: i, char };
+      }
+      return null;
+    };
+
+    const candidate = /^[ \t]*([^#\/\n;{}]*?)((?:[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?\s*::)+(?:~?[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?|operator\s*(?:\[\]|\(\)|[^\s(]+)))\s*\(/gm;
+    let match: RegExpExecArray | null;
+    while ((match = candidate.exec(source)) !== null) {
+      const prefix = match[1]!.trim();
+      const rawQualifiedName = match[2]!.trim().replace(/\s*::\s*/g, '::');
+      const open = candidate.lastIndex - 1;
+      const close = closeParameterList(open);
+      if (close < 0) continue;
+      const delimiter = bodyDelimiter(close + 1);
+      if (!delimiter || delimiter.char !== '{') continue;
+
+      const parts = rawQualifiedName.replace(/^::/, '').split('::');
+      if (parts.length < 2) continue;
+      const rawName = parts[parts.length - 1]!;
+      const receiver = parts[parts.length - 2]!.replace(/<[^<>]*>\s*$/, '');
+      const callableBase = rawName.replace(/^~/, '').replace(/<[^<>]*>\s*$/, '');
+      if (!prefix && receiver !== callableBase) continue;
+      if (/^(?:return|if|for|while|switch|case|throw)\b/.test(prefix)) continue;
+
+      const name = normalizeCppCallableName(rawName, parts.slice(0, -1).join('::'));
+      parts[parts.length - 1] = name;
+      const qualifiedName = parts.join('::');
+      const line = lineForOffset(match.index);
+      if (this.nodes.some(node =>
+        node.name === name && node.qualifiedName === qualifiedName
+        && Math.abs(node.startLine - line) <= 2)) {
+        continue;
+      }
+      const lineStart = lineStarts[line - 1]!;
+      const signature = source.slice(match.index, delimiter.offset).trim();
+      this.createSyntheticNode('method', name, line, match.index - lineStart, name.length, {
+        qualifiedName,
+        signature,
+        isDeclaration: false,
+        isExported: true,
+      }, 'cpp-qualified-definition-recovery');
+    }
+  }
+
+  /**
+   * Recover declarations created by macros. The expanded source is parsed as a
+   * complete translation unit so namespaces, enclosing classes, templates, and
+   * access sections retain their normal tree-sitter semantics. Only new symbol
+   * nodes anchored to an expanded invocation line are merged; references/calls
+   * remain owned by the primary source parse.
+   */
+  private recoverDeclarationMacroNodes(): void {
+    if (
+      (this.language !== 'c' && this.language !== 'cpp') ||
+      !this.globalMacroDefinitions ||
+      this.globalMacroDefinitions.length === 0 ||
+      !this.tree
+    ) {
+      return;
+    }
+
+    const expanded = expandDeclarationMacros(
+      this.originalSource,
+      this.globalMacroDefinitions,
+      (line, column) => this.isDeclarationMacroScope(line, column),
+    );
+    if (expanded.source === this.originalSource || expanded.invocationLines.size === 0) return;
+
+    // Deliberately omit macroDefinitions to prevent recursive auxiliary parses.
+    const recovered = extractFromSource(
+      this.filePath,
+      expanded.source,
+      this.language,
+      undefined,
+      this.globalMacroNames ?? undefined,
+      this.globalBodylessMacroNames ?? undefined,
+      undefined,
+    );
+    // If the primary file tree was already damaged before the declaration
+    // macro, it may swallow even the correctly expanded declaration. Parse all
+    // invocation lines once more in isolation (line numbers preserved) and use
+    // it only as a supplemental symbol source.
+    const isolatedSource = expanded.source.split('\n')
+      .map((text, index) => expanded.invocationLines.has(index + 1) ? text : '')
+      .join('\n');
+    const isolated = extractFromSource(
+      this.filePath,
+      isolatedSource,
+      this.language,
+      undefined,
+      this.globalMacroNames ?? undefined,
+      this.globalBodylessMacroNames ?? undefined,
+      undefined,
+    );
+    const fullSymbolKeys = new Set(recovered.nodes.map(node => `${node.name}\0${node.startLine}`));
+    const isolatedNodes = isolated.nodes.filter(node =>
+      !fullSymbolKeys.has(`${node.name}\0${node.startLine}`)
+      && (node.kind === 'variable'
+        || (node.kind === 'method' && Boolean(node.qualifiedName?.includes('::')))));
+    const isolatedIds = new Set(isolatedNodes.map(node => node.id));
+    const recoveredNodes = [...recovered.nodes, ...isolatedNodes];
+    const recoveredEdges = [
+      ...recovered.edges,
+      ...isolated.edges.filter(edge => isolatedIds.has(edge.target)),
+    ];
+
+    const recoverableKinds = new Set<NodeKind>([
+      'class', 'struct', 'enum', 'enum_member', 'interface', 'trait',
+      'type_alias', 'function', 'method', 'field', 'property',
+      'variable', 'constant',
+    ]);
+    const existingIds = new Set(this.nodes.map(node => node.id));
+    const generatedIds = new Set<string>();
+    const recoveredById = new Map(recoveredNodes.map(node => [node.id, node]));
+    const recoveredParent = new Map<string, string>();
+    for (const edge of recoveredEdges) {
+      if (edge.kind === 'contains') recoveredParent.set(edge.target, edge.source);
+    }
+    const isTemplateParameterArtifact = (node: Node): boolean => {
+      if (node.kind !== 'field' && node.kind !== 'property' && node.kind !== 'variable') return false;
+      let parentId = recoveredParent.get(node.id);
+      for (let depth = 0; parentId && depth < 32; depth++) {
+        const parent = recoveredById.get(parentId);
+        if (!parent) break;
+        if (parent.typeParameters?.includes(node.name)) return true;
+        parentId = recoveredParent.get(parentId);
+      }
+      return false;
+    };
+    for (const node of recoveredNodes) {
+      if (
+        !recoverableKinds.has(node.kind) ||
+        !expanded.invocationLines.has(node.startLine) ||
+        existingIds.has(node.id) ||
+        expanded.expandedMacroNames.has(node.name) ||
+        isTemplateParameterArtifact(node)
+      ) {
+        continue;
+      }
+      this.nodes.push(node);
+      existingIds.add(node.id);
+      generatedIds.add(node.id);
+    }
+    if (generatedIds.size === 0) return;
+
+    const existingEdgeKeys = new Set(
+      this.edges.map(edge => `${edge.kind}\0${edge.source}\0${edge.target}`),
+    );
+    for (const edge of recoveredEdges) {
+      if (edge.kind !== 'contains' || !generatedIds.has(edge.target)) continue;
+      if (!existingIds.has(edge.source) && !generatedIds.has(edge.source)) continue;
+      const key = `${edge.kind}\0${edge.source}\0${edge.target}`;
+      if (existingEdgeKeys.has(key)) continue;
+      this.edges.push(edge);
+      existingEdgeKeys.add(key);
+    }
   }
 
   /**
@@ -1071,6 +1491,11 @@ export class TreeSitterExtractor {
     else if (this.extractor.methodTypes.includes(nodeType)) {
       this.extractMethod(node);
       skipChildren = true; // extractMethod visits children via visitFunctionBody
+    }
+    // C++ explicit template instantiations (`template class Box<int>;`) use a
+    // dedicated wrapper whose body-less type child is not a forward declaration.
+    else if (this.language === 'cpp' && nodeType === 'template_instantiation') {
+      skipChildren = this.extractCppTemplateInstantiation(node);
     }
     // Check for interface/protocol/trait declarations
     else if (this.extractor.interfaceTypes.includes(nodeType)) {
@@ -2089,6 +2514,7 @@ export class TreeSitterExtractor {
         }
       }
     }
+    if (this.language === 'cpp') name = normalizeCppCallableName(name);
     if (name === '<anonymous>') {
       // Don't emit a node for the anonymous wrapper itself, but still visit its
       // body: AMD/RequireJS and CommonJS module wrappers (`define([], function(){…})`,
@@ -2241,6 +2667,7 @@ export class TreeSitterExtractor {
     const isDirectDeclarationContainer = parent.type === 'translation_unit'
       || parent.type === 'field_declaration_list'
       || parent.type === 'declaration_list'
+      || parent.type === 'template_declaration'
       // Header guards and conditional-compilation branches are transparent
       // declaration containers in C/C++. Their children are still directly
       // written declarations, not elaborated type uses.
@@ -2270,6 +2697,29 @@ export class TreeSitterExtractor {
     return getNodeText(parent, this.source).trimEnd().endsWith(';');
   }
 
+  /** Extract `template class/struct Type<Args>;` and `extern template ...`. */
+  private extractCppTemplateInstantiation(node: SyntaxNode): boolean {
+    const typeNode = node.namedChildren.find(child =>
+      child.type === 'class_specifier' || child.type === 'struct_specifier' || child.type === 'union_specifier');
+    if (!typeNode) return false;
+    const declared = getCppDeclaredTypeName(typeNode, this.source);
+    if (!declared) return false;
+    const name = declared.name;
+    const kind: NodeKind = typeNode.type === 'class_specifier' ? 'class' : 'struct';
+    const sourceText = getNodeText(node, this.source).trimStart();
+    let qualifiedName: string | undefined;
+    if (declared.qualifiedName) {
+      const parts = declared.qualifiedName.split('::');
+      parts[parts.length - 1] = name;
+      qualifiedName = this.buildQualifiedName(parts.join('::'));
+    }
+    this.createNode(kind, name, node, {
+      isDeclaration: sourceText.startsWith('extern template') || undefined,
+      ...(qualifiedName ? { qualifiedName } : {}),
+    });
+    return true;
+  }
+
   /** Extract forward type specifiers wrapped by a declaration node. */
   private extractExplicitForwardTypeDeclarations(node: SyntaxNode): boolean {
     let extracted = false;
@@ -2283,14 +2733,14 @@ export class TreeSitterExtractor {
     return extracted;
   }
 
-  /** Detect no-return-type function declarations inside a C++ class body. */
+  /** Detect function declarations inside a C++ class body. */
   private isCppClassMemberFunctionDeclaration(node: SyntaxNode): boolean {
     if (this.language !== 'cpp' || node.type !== 'declaration' || !this.isInsideClassLikeNode()) {
       return false;
     }
-    // Ordinary return-typed member prototypes are handled by extractField.
-    // Requiring the absence of a type also excludes function-pointer fields.
-    if (getChildByField(node, 'type')) return false;
+    // Ordinary fields (including function pointers) use field_declaration.
+    // Return-typed member templates instead use declaration below a
+    // template_declaration and must be handled here as methods.
     return node.descendantsOfType('function_declarator').length > 0;
   }
 
@@ -2381,7 +2831,14 @@ export class TreeSitterExtractor {
       return;
     }
 
-    const name = extractName(node, this.source, this.extractor);
+    let name = extractName(node, this.source, this.extractor);
+    if (this.language === 'cpp') {
+      name = cppCallableDeclaratorName(node, this.source) ?? name;
+      const enclosingNode = this.nodeStack.length > 0
+        ? this.nodes.find(candidate => candidate.id === this.nodeStack[this.nodeStack.length - 1])
+        : undefined;
+      name = normalizeCppCallableName(name, receiverType ?? enclosingNode?.name);
+    }
 
     // Check for misparse artifacts (e.g. C++ "switch" inside macro-confused class body)
     if (this.extractor.isMisparsedFunction?.(name, node, this.fileMacroNames)) {
@@ -2494,7 +2951,11 @@ export class TreeSitterExtractor {
     const isForwardDeclaration = !body && this.isExplicitCppForwardDeclaration(node);
     if (!body && !isForwardDeclaration) return;
 
-    const name = extractName(node, this.source, this.extractor);
+    const rawName = extractName(node, this.source, this.extractor);
+    const anonymousName = (this.language === 'c' || this.language === 'cpp')
+      ? anonymousCppTypeName(node)
+      : null;
+    const name = anonymousName ?? rawName;
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
@@ -2517,7 +2978,7 @@ export class TreeSitterExtractor {
     // body so the fields are extracted; their contains edge points to the
     // enclosing scope (C++ anonymous-struct fields inject into the outer
     // scope), so we deliberately do NOT push onto nodeStack here.
-    if (structNode) {
+    if (structNode && !anonymousName) {
       // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
       this.extractInheritance(node, structNode.id);
 
@@ -2534,7 +2995,7 @@ export class TreeSitterExtractor {
         this.visitNode(child);
       }
     }
-    if (structNode) this.nodeStack.pop();
+    if (structNode && !anonymousName) this.nodeStack.pop();
   }
 
   /**
@@ -2548,7 +3009,10 @@ export class TreeSitterExtractor {
     const isForwardDeclaration = !body && this.isExplicitCppForwardDeclaration(node);
     if (!body && !isForwardDeclaration) return;
 
-    const name = nameOverride ?? extractName(node, this.source, this.extractor);
+    const anonymousName = !nameOverride && (this.language === 'c' || this.language === 'cpp')
+      ? anonymousCppTypeName(node)
+      : null;
+    const name = nameOverride ?? anonymousName ?? extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
@@ -2572,7 +3036,7 @@ export class TreeSitterExtractor {
     // so the enumerators are extracted; their contains edge points to the
     // enclosing scope (C++ anonymous-enum members inject into the outer
     // scope), so we deliberately do NOT push onto nodeStack here.
-    if (enumNode) {
+    if (enumNode && !anonymousName) {
       // Extract inheritance (e.g. Swift: enum AFError: Error)
       this.extractInheritance(node, enumNode.id);
 
@@ -2592,7 +3056,7 @@ export class TreeSitterExtractor {
       }
     }
 
-    if (enumNode && this.xMacroConstructs.length > 0) {
+    if (enumNode && !anonymousName && this.xMacroConstructs.length > 0) {
       const constructs = this.xMacroConstructs.filter((construct) =>
         construct.enumBodyStart === body!.startIndex && construct.enumBodyEnd === body!.endIndex);
       if (constructs.length > 0) {
@@ -2628,7 +3092,7 @@ export class TreeSitterExtractor {
         }
       }
     }
-    if (enumNode) this.nodeStack.pop();
+    if (enumNode && !anonymousName) this.nodeStack.pop();
   }
 
   /**
@@ -2735,7 +3199,8 @@ export class TreeSitterExtractor {
         const child = node.namedChild(i);
         if (!child) continue;
         const t = child.type;
-        if (t === 'enum_specifier' || t === 'struct_specifier' || t === 'class_specifier') {
+        if (t === 'enum_specifier' || t === 'struct_specifier'
+          || t === 'union_specifier' || t === 'class_specifier') {
           this.visitNode(child);
         }
       }
@@ -2802,6 +3267,30 @@ export class TreeSitterExtractor {
         fnDecl = getChildByField(fnDecl, 'declarator') || fnDecl.namedChild(0) || null;
       }
       if (fnDecl && fnDecl.type === 'function_declarator') {
+        // A function/member-function pointer field has the same outer
+        // function_declarator as a method prototype, but its identifier is
+        // nested below pointer_declarator: `R (*cb)(A)` / `R (C::*cb)(A)`.
+        // Keep it a field instead of emitting a bogus method.
+        const pointerField = fnDecl.descendantsOfType('field_identifier').find(field => {
+          let current = field.parent;
+          while (current && current.id !== fnDecl!.id) {
+            if (current.type === 'pointer_declarator') return true;
+            current = current.parent;
+          }
+          return false;
+        });
+        if (pointerField) {
+          const name = getNodeText(pointerField, this.source);
+          const typeNode = getChildByField(node, 'type');
+          const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+          this.createNode('field', name, pointerField, {
+            docstring,
+            signature: typeText ? `${typeText} ${name}` : name,
+            visibility,
+            isStatic,
+          });
+          return;
+        }
         let innerDecl = getChildByField(fnDecl, 'declarator');
         if (!innerDecl) {
           innerDecl = fnDecl.namedChildren.find(c => c.type === 'field_identifier') ?? null;
@@ -2816,7 +3305,10 @@ export class TreeSitterExtractor {
             idNode = getChildByField(idNode, 'declarator') || idNode.namedChild(0) || null;
           }
           if (idNode) {
-            const fnName = getNodeText(idNode, this.source);
+            const rawFnName = getNodeText(idNode, this.source);
+            const fnName = this.language === 'cpp'
+              ? normalizeCppCallableName(rawFnName)
+              : rawFnName;
             if (fnName) {
               const returnType = this.extractor.getReturnType?.(node, this.source);
               const signature = this.extractor.getSignature?.(node, this.source);
@@ -2872,9 +3364,16 @@ export class TreeSitterExtractor {
         const typeNode = getChildByField(node, 'type');
         const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
 
+        const inlineTypeDefinition = node.namedChildren.find(child =>
+          (child.type === 'class_specifier' || child.type === 'struct_specifier'
+            || child.type === 'union_specifier' || child.type === 'enum_specifier')
+          && Boolean(getChildByField(child, this.extractor!.bodyField)));
         for (const { name, posNode } of fieldEntries) {
           const signature = typeText ? `${typeText} ${name}` : name;
-          this.createNode('field', name, posNode, {
+          // clang tooling anchors `class Inline { ... } value;` at the start of
+          // the whole declaration. Preserve that range while the name remains
+          // queryable at its trailing identifier line via endLine containment.
+          this.createNode('field', name, inlineTypeDefinition ? node : posNode, {
             docstring,
             signature,
             visibility,
@@ -3628,7 +4127,14 @@ export class TreeSitterExtractor {
           if (innerDecl) {
             const idNode = unwrapDeclarator(innerDecl);
             if (idNode && (idNode.type === 'identifier' || idNode.type === 'field_identifier')) {
-              const fnName = getNodeText(idNode, this.source);
+              const rawFnName = cppCallableDeclaratorName(node, this.source)
+                ?? getNodeText(idNode, this.source);
+              const fnName = this.language === 'cpp'
+                ? normalizeCppCallableName(
+                  rawFnName,
+                  this.extractor.getReceiverType?.(node, this.source),
+                )
+                : rawFnName;
               if (fnName && !C_CPP_KEYWORD_NAMES.has(fnName)
                 && !this.extractor.isMisparsedFunction?.(fnName, node, this.fileMacroNames)) {
                 // Guard against tree-sitter error-recovery `declaration` nodes
@@ -3781,6 +4287,10 @@ export class TreeSitterExtractor {
       const typeChild = getChildByField(node, 'type')
         || this.findChildByTypes(node, this.extractor.structTypes);
       if (typeChild) {
+        const anonymousName = (this.language === 'c' || this.language === 'cpp')
+          ? anonymousCppTypeName(typeChild)
+          : null;
+        if (anonymousName) this.createNode('struct', anonymousName, typeChild);
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, structNode.id);
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
@@ -3801,6 +4311,10 @@ export class TreeSitterExtractor {
       // Find the inner enum type child (e.g. C: typedef enum { ... } name)
       const innerEnum = this.findChildByTypes(node, this.extractor.enumTypes);
       if (innerEnum) {
+        const anonymousName = (this.language === 'c' || this.language === 'cpp')
+          ? anonymousCppTypeName(innerEnum)
+          : null;
+        if (anonymousName) this.createNode('enum', anonymousName, innerEnum);
         this.extractInheritance(innerEnum, enumNode.id);
         const body = this.extractor.resolveBody?.(innerEnum, this.extractor.bodyField)
           ?? getChildByField(innerEnum, this.extractor.bodyField);
@@ -6836,7 +7350,8 @@ export function extractFromSource(
   language?: Language,
   frameworkNames?: string[],
   globalMacroNames?: Set<string>,
-  bodylessMacroNames?: Set<string>
+  bodylessMacroNames?: Set<string>,
+  macroDefinitions?: readonly CppMacroDefinition[],
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -6878,7 +7393,14 @@ export function extractFromSource(
     const extractor = new DfmExtractor(filePath, source);
     result = extractor.extract();
   } else {
-    const extractor = new TreeSitterExtractor(filePath, source, detectedLanguage, globalMacroNames, bodylessMacroNames);
+    const extractor = new TreeSitterExtractor(
+      filePath,
+      source,
+      detectedLanguage,
+      globalMacroNames,
+      bodylessMacroNames,
+      macroDefinitions,
+    );
     result = extractor.extract();
   }
 

@@ -60,10 +60,10 @@ typedef VOS_BOOL V6_PlainFunc(VOS_VOID);`,
   VOS_UINT32 (*g_TR_FnLtlmMtnTlvInit)(VOS_VOID);
 } TLM_MODE_FUNC_LIST_LTLM_OSPF_MTN_STRUCT;`,
     );
-    const methods = namesOf(result, 'method');
-    expect(methods).toContain('g_TR_FnltlmOspfMsgInit');
-    expect(methods).toContain('g_TR_FnLtlmMtnTlvInit');
-    expect(methods.some((n) => n.startsWith('(*'))).toBe(false);
+    const fields = namesOf(result, 'field');
+    expect(fields).toContain('g_TR_FnltlmOspfMsgInit');
+    expect(fields).toContain('g_TR_FnLtlmMtnTlvInit');
+    expect(fields.some((n) => n.startsWith('(*'))).toBe(false);
     expect(namesOf(result, 'struct')).toContain('TLM_MODE_FUNC_LIST_LTLM_OSPF_MTN_STRUCT');
   });
 });
@@ -139,9 +139,9 @@ describe('Fix C — full-build macro pollution does not炸 TYPE (*name)(params)'
       bodyless,
     );
     expect(namesOf(result, 'struct')).toContain('TLM_MODE_FUNC_LIST_LTLM_OSPF_MTN_STRUCT');
-    const methods = namesOf(result, 'method');
-    expect(methods).toContain('g_TR_FnltlmOspfMsgInit');
-    expect(methods).toContain('g_TR_FnLtlmMtnTlvInit');
+    const fields = namesOf(result, 'field');
+    expect(fields).toContain('g_TR_FnltlmOspfMsgInit');
+    expect(fields).toContain('g_TR_FnLtlmMtnTlvInit');
   });
 
   it('function-pointer typedef survives a same-named global #define', () => {

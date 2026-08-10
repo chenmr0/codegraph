@@ -75,8 +75,8 @@ describe('根因 A 修复 - 类内 type 定义边界', () => {
 
   it('类内匿名 enum: enum { A, B };', () => {
     const code = `class C {\npublic:\n  enum { A, B };\n  int x;\n};`;
-    // 匿名 enum 被提取为名为 "<anonymous>" 的 enum 节点（extractName 现有行为）
-    expect(names(code, 'enum')).toContain('<anonymous>');
+    // 匿名 enum 使用与 clangd 一致的稳定名称，便于按位置精确查询。
+    expect(names(code, 'enum')).toContain('(anonymous enum)');
     // 成员必须被提取
     expect(names(code, 'enum_member').sort()).toEqual(['A', 'B']);
     expect(names(code, 'field')).toContain('x');
@@ -84,8 +84,8 @@ describe('根因 A 修复 - 类内 type 定义边界', () => {
 
   it('类内匿名 struct: struct { int a; int b; };', () => {
     const code = `class C {\npublic:\n  struct { int a; int b; };\n  int x;\n};`;
-    // 匿名 struct 被提取为名为 "<anonymous>" 的 struct 节点（extractName 现有行为）
-    expect(names(code, 'struct')).toContain('<anonymous>');
+    // 匿名 struct 使用与 clangd 一致的稳定名称，便于按位置精确查询。
+    expect(names(code, 'struct')).toContain('(anonymous struct)');
     expect(names(code, 'field')).toContain('a');
     expect(names(code, 'field')).toContain('b');
     expect(names(code, 'field')).toContain('x');

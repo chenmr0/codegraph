@@ -7,6 +7,7 @@
 
 import { Worker } from 'worker_threads';
 import type { ExtractionResult, Language } from '../types';
+import type { CppMacroDefinition } from './declaration-macros';
 
 export interface ParsePoolWorker {
   postMessage(message: unknown): void;
@@ -84,6 +85,7 @@ export interface ParseWorkerPoolOptions {
   /** Fork-specific C/C++ macro context, initialized on every worker. */
   macroNames?: string[];
   bodylessMacroNames?: string[];
+  macroDefinitions?: CppMacroDefinition[];
 }
 
 export class ParseWorkerPool {
@@ -106,6 +108,7 @@ export class ParseWorkerPool {
   private readonly grammarBuffers?: Record<string, Uint8Array>;
   private readonly macroNames: string[];
   private readonly bodylessMacroNames: string[];
+  private readonly macroDefinitions: CppMacroDefinition[];
 
   constructor(options: ParseWorkerPoolOptions) {
     this.languages = options.languages;
@@ -116,6 +119,7 @@ export class ParseWorkerPool {
     this.grammarBuffers = options.grammarBuffers;
     this.macroNames = options.macroNames ?? [];
     this.bodylessMacroNames = options.bodylessMacroNames ?? [];
+    this.macroDefinitions = options.macroDefinitions ?? [];
 
     if (options.createWorker) {
       this.createWorker = options.createWorker;
@@ -204,6 +208,7 @@ export class ParseWorkerPool {
       grammarBuffers: this.grammarBuffers,
       macroNames: this.macroNames,
       bodylessMacroNames: this.bodylessMacroNames,
+      macroDefinitions: this.macroDefinitions,
     });
   }
 

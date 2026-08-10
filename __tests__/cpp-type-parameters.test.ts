@@ -115,6 +115,11 @@ describe('C++ template typeParameters extraction', () => {
     expect(rows.length, `expected exactly one ${kind ?? ''} '${name}'`).toBe(1);
     return rows[0];
   };
+  const oneDefinition = (name: string, kind?: string) => {
+    const rows = find(name, kind).filter((row) => !row.is_declaration);
+    expect(rows.length, `expected exactly one ${kind ?? ''} definition '${name}'`).toBe(1);
+    return rows[0];
+  };
   /** Parse the raw type_parameters JSON column (NULL → undefined). */
   const tpOf = (row: any): string[] | undefined =>
     row.type_parameters ? (JSON.parse(row.type_parameters) as string[]) : undefined;
@@ -156,7 +161,7 @@ describe('C++ template typeParameters extraction', () => {
     // `template <typename T> template <typename U> U TClass<T>::mtemp(U x) {}`
     // is represented as a method (receiver TClass<T>) wrapped by two consecutive
     // template_declarations — source order T then U → [T, U].
-    expect(tpOf(one('mtemp', 'method'))).toEqual(['T', 'U']);
+    expect(tpOf(oneDefinition('mtemp', 'method'))).toEqual(['T', 'U']);
   });
 
   it('a constrained parameter stores only its name, not the constraint', () => {
@@ -201,7 +206,7 @@ describe('C++ template typeParameters extraction', () => {
     expect(tpOf(one('identfn', 'function'))).toEqual(['T']);
     expect(tpOf(one('TAlias', 'type_alias'))).toEqual(['T']);
     expect(tpOf(one('inline_mtemp', 'method'))).toEqual(['U']);
-    expect(tpOf(one('mtemp', 'method'))).toEqual(['T', 'U']);
+    expect(tpOf(oneDefinition('mtemp', 'method'))).toEqual(['T', 'U']);
     expect(tpOf(one('plain', 'method'))).toBeUndefined();
     expect(tpOf(one('PlainStruct', 'struct'))).toBeUndefined();
 

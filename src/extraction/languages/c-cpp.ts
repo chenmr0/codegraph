@@ -19,7 +19,8 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
       const child = current.namedChild(i);
       // Don't descend into parameters or the trailing return type — their types
       // (`const std::string&`, `-> std::string`) aren't the function name.
-      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
+      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type'
+        && child.type !== 'template_argument_list') {
         queue.push(child);
       }
     }
@@ -1576,6 +1577,12 @@ function cCppIsMacroInvocationMisparse(
   macroNames?: Set<string>
 ): boolean {
   if (!macroNames || !macroNames.has(name)) return false;
+  // Declaration macros followed by a user-written body (`DEFINE_FOO(T) {}`)
+  // can be parsed as a root-level function whose "return type" is the macro
+  // name. Suppress that invocation wrapper; the declaration-macro auxiliary
+  // parse recovers the expanded callable with its real name.
+  const typeNode = getChildByField(node, 'type');
+  if (typeNode?.text.trim() === name) return true;
   // A macro invocation `MACRO(args) { body }` that tree-sitter misparses as a
   // function_definition / declaration always appears INSIDE a function body —
   // its direct parent is a `compound_statement`, because macros are invoked in
@@ -1600,7 +1607,10 @@ export const cExtractor: LanguageExtractor = {
   classTypes: [],
   methodTypes: [],
   interfaceTypes: [],
-  structTypes: ['struct_specifier'],
+  // C unions share declaration/body semantics with structs. Treating them as
+  // struct-like symbols also lets anonymous-union members be visited instead
+  // of dropping the entire body.
+  structTypes: ['struct_specifier', 'union_specifier'],
   enumTypes: ['enum_specifier'],
   enumMemberTypes: ['enumerator'],
   typeAliasTypes: ['type_definition'], // typedef
@@ -1654,7 +1664,8 @@ export const cExtractor: LanguageExtractor = {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
-      if (child.type === 'struct_specifier' && getChildByField(child, 'body')) return 'struct';
+      if ((child.type === 'struct_specifier' || child.type === 'union_specifier')
+        && getChildByField(child, 'body')) return 'struct';
     }
     return undefined;
   },
@@ -1732,7 +1743,7 @@ export const cppExtractor: LanguageExtractor = {
   classTypes: ['class_specifier'],
   methodTypes: ['function_definition'],
   interfaceTypes: [],
-  structTypes: ['struct_specifier'],
+  structTypes: ['struct_specifier', 'union_specifier'],
   enumTypes: ['enum_specifier'],
   enumMemberTypes: ['enumerator'],
   typeAliasTypes: ['type_definition', 'alias_declaration'], // typedef and using

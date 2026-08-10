@@ -69,6 +69,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cxx': 'cpp',
   '.hpp': 'cpp',
   '.hxx': 'cpp',
+  // Common C++ header/template implementation extensions. These files contain
+  // real declarations and frequently own macros consumed by .cpp/.h files.
+  '.hh': 'cpp',
+  '.ipp': 'cpp',
+  '.inl': 'cpp',
+  '.tcc': 'cpp',
   '.cs': 'csharp',
   // ASP.NET Razor / Blazor markup — custom RazorExtractor (links @model/@inject/
   // component tags to their C# types; markup isn't a tree-sitter grammar).

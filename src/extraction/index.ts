@@ -30,6 +30,11 @@ import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
 import {
+  scanCppMacroDefinitions,
+  selectUnambiguousCppMacroDefinitions,
+  type CppMacroDefinition,
+} from './declaration-macros';
+import {
   StoreWriter,
   type StoreBundle,
   finalizeStoreBundle,
@@ -745,6 +750,12 @@ export class ExtractionOrchestrator {
   // alongside globalMacroNames.
   private globalBodylessMacroNames: Set<string> | null = null;
   /**
+   * Unambiguous project-wide macro definitions used only by the auxiliary
+   * declaration-macro recovery parse. Conflicting platform/config spellings
+   * are excluded; same-file definitions can still override them safely.
+   */
+  private globalMacroDefinitions: CppMacroDefinition[] | null = null;
+  /**
    * Accumulates source file paths of nodes whose incoming edges couldn't be
    * re-wired during a sync pass. Populated by storeExtractionResult, consumed
    * and cleared by sync().
@@ -865,6 +876,7 @@ export class ExtractionOrchestrator {
     // error-recovery path that buries the real name.
     const bodylessRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)(?!\s*\()(?:[ \t]*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/[ \t]*)?)?[ \t]*$/gm;
     const bodyless = new Set<string>();
+    const definitions: CppMacroDefinition[] = [];
 
     // Filter to C/C++/ObjC files — only these have the preprocessor and
     // the macro-misparse-as-function problem.
@@ -904,11 +916,13 @@ export class ExtractionOrchestrator {
           const name = bm[1];
           if (name) bodyless.add(name);
         }
+        definitions.push(...scanCppMacroDefinitions(content));
       }
     }
 
     this.globalMacroNames = names;
     this.globalBodylessMacroNames = bodyless;
+    this.globalMacroDefinitions = selectUnambiguousCppMacroDefinitions(definitions);
     return names;
   }
 
@@ -983,8 +997,10 @@ export class ExtractionOrchestrator {
     // preprocessor and would otherwise emit a fake function node in B).
     this.globalMacroNames = null;
     this.globalBodylessMacroNames = null;
+    this.globalMacroDefinitions = null;
     const globalMacroNames = await this.ensureGlobalMacroNames(files);
     const globalBodylessMacroNames = this.globalBodylessMacroNames!;
+    const globalMacroDefinitions = this.globalMacroDefinitions!;
 
     if (signal?.aborted) {
       return {
@@ -1078,6 +1094,7 @@ export class ExtractionOrchestrator {
         grammarBuffers,
         macroNames: [...globalMacroNames],
         bodylessMacroNames: [...globalBodylessMacroNames],
+        macroDefinitions: globalMacroDefinitions,
       });
       parsePool.prewarm();
       log(`Parse worker pool: ${poolSize} worker(s)`);
@@ -1206,7 +1223,12 @@ export class ExtractionOrchestrator {
             if (msg.type === 'global-macros-set') resolve();
             else reject(new Error(`Unexpected message: ${msg.type}`));
           });
-          parseWorker!.postMessage({ type: 'set-global-macros', macroNames: [...globalMacroNames], bodylessMacroNames: [...globalBodylessMacroNames] });
+          parseWorker!.postMessage({
+            type: 'set-global-macros',
+            macroNames: [...globalMacroNames],
+            bodylessMacroNames: [...globalBodylessMacroNames],
+            macroDefinitions: globalMacroDefinitions,
+          });
         });
       }
 
@@ -1253,7 +1275,8 @@ export class ExtractionOrchestrator {
           detectLanguage(filePath, content),
           frameworkNames,
           globalMacroNames,
-          globalBodylessMacroNames
+          globalBodylessMacroNames,
+          globalMacroDefinitions,
         );
       }
 
@@ -1795,7 +1818,15 @@ export class ExtractionOrchestrator {
     // route nodes / middleware / etc.
     const frameworkNames = this.ensureDetectedFrameworks();
     const globalMacroNames = await this.ensureGlobalMacroNames();
-    const result = extractFromSource(relativePath, content, language, frameworkNames, globalMacroNames, this.globalBodylessMacroNames ?? undefined);
+    const result = extractFromSource(
+      relativePath,
+      content,
+      language,
+      frameworkNames,
+      globalMacroNames,
+      this.globalBodylessMacroNames ?? undefined,
+      this.globalMacroDefinitions ?? undefined,
+    );
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {
