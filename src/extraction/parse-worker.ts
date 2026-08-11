@@ -20,6 +20,7 @@ import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import type { Language, ExtractionResult } from '../types';
 import type { CppMacroDefinition } from './declaration-macros';
+import { isWasmRuntimeCorruptionError } from './wasm-errors';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
 // line) directly to stderr when WASM aborts — before the JS catch
@@ -76,7 +77,7 @@ let globalMacroNames: Set<string> | undefined = undefined;
 let globalBodylessMacroNames: Set<string> | undefined = undefined;
 let globalMacroDefinitions: CppMacroDefinition[] | undefined = undefined;
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; language?: Language; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; bodylessMacroNames?: string[]; macroDefinitions?: CppMacroDefinition[]; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; language?: Language; languages?: Language[]; frameworkNames?: string[]; macroNames?: string[]; bodylessMacroNames?: string[]; macroDefinitions?: CppMacroDefinition[]; grammarBuffers?: Record<string, Uint8Array>; skipDeclarationMacroRecovery?: boolean }) => {
   if (msg.type === 'load-grammars') {
     // grammarBuffers (when the orchestrator pre-read them) let a spawn/respawn
     // load grammars from memory instead of re-reading from disk — on slow
@@ -112,7 +113,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
         frameworkNames,
         globalMacroNames,
         globalBodylessMacroNames,
-        globalMacroDefinitions,
+        msg.skipDeclarationMacroRecovery ? undefined : globalMacroDefinitions,
       );
 
       // Periodic parser reset to reclaim WASM heap memory
@@ -126,10 +127,10 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
 
-      // WASM memory errors leave the module in a corrupted state — all
-      // subsequent parses would also fail (cascading failures). Crash the
-      // worker so the main thread spawns a fresh one with a clean heap.
-      if (message.includes('memory access out of bounds') || message.includes('out of memory')) {
+      // WASM runtime corruption leaves the module unsafe for all subsequent
+      // parses (cascading failures). Crash the worker so the main thread
+      // spawns a fresh one with a clean heap and retries this file.
+      if (isWasmRuntimeCorruptionError(message)) {
         process.exit(1);
       }
 

@@ -9,7 +9,7 @@ import {
   selectUnambiguousCppMacroDefinitions,
 } from '../src/extraction/declaration-macros';
 import { extractFromSource } from '../src/extraction/tree-sitter';
-import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
+import { getParser, initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
 
 beforeAll(async () => {
   await initGrammars();
@@ -175,6 +175,66 @@ describe('C/C++ declaration macro expansion', () => {
       expect.objectContaining({ kind: 'variable', name: 'global_state', startLine: 7 }),
     ]));
     expect(result.nodes.filter(node => node.name === 'ordinary')).toHaveLength(1);
+  });
+
+  it('keeps the shared parser healthy across declaration-macro auxiliary parses', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(
+      scanCppMacroDefinitions('#define DECLARE(Name) struct Name { int value; };'),
+    );
+    const sharedParser = getParser('cpp');
+    const recovered = extractFromSource(
+      'generated.cpp',
+      'DECLARE(GeneratedRecord)\n',
+      'cpp',
+      undefined,
+      new Set(['DECLARE']),
+      new Set(),
+      definitions,
+    );
+    const sentinel = extractFromSource(
+      'sentinel.cpp',
+      'struct Sentinel { int field; };\n',
+      'cpp',
+    );
+
+    expect(getParser('cpp')).toBe(sharedParser);
+    expect(recovered.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'struct', name: 'GeneratedRecord' }),
+    ]));
+    expect(sentinel.errors).toEqual([]);
+    expect(sentinel.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'struct', name: 'Sentinel' }),
+      expect.objectContaining({ kind: 'field', name: 'field' }),
+    ]));
+  });
+
+  it('uses context-sparse recovery for large translation units without a size cap', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(
+      scanCppMacroDefinitions('#define DECLARE_VALUE(Name) static int Name;'),
+    );
+    const padding = '// declaration-macro replay budget padding\n'.repeat(7_000);
+    const source = [
+      'int ordinary_value;',
+      padding,
+      'DECLARE_VALUE(recovered_value)',
+    ].join('\n');
+    expect(source.length).toBeGreaterThan(256 * 1024);
+
+    const result = extractFromSource(
+      'large-generated.cpp',
+      source,
+      'cpp',
+      undefined,
+      new Set(['DECLARE_VALUE']),
+      new Set(),
+      definitions,
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'variable', name: 'ordinary_value' }),
+      expect.objectContaining({ kind: 'variable', name: 'recovered_value' }),
+    ]));
   });
 
   it('recovers split function-definition signatures without a semicolon', () => {

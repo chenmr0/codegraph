@@ -13,6 +13,7 @@ class FakeWorker implements ParsePoolWorker {
   private messageListener?: MessageListener;
   private exitListener?: (code: number) => void;
   readonly loadMessages: unknown[] = [];
+  readonly parseMessages: unknown[] = [];
   active = true;
 
   constructor(
@@ -49,6 +50,7 @@ class FakeWorker implements ParsePoolWorker {
       message.id !== undefined &&
       message.filePath
     ) {
+      this.parseMessages.push(raw);
       void Promise.resolve(
         this.parse({ id: message.id, filePath: message.filePath })
       ).then((result) => {
@@ -159,6 +161,30 @@ describe('ParseWorkerPool', () => {
     });
     const parsed = await pool.requestParse(task('one.ts'));
     expect(parsed.durationMs).toBe(42);
+    await pool.destroy();
+  });
+
+  it('forwards declaration-macro recovery fallback mode to the worker', async () => {
+    const workers: FakeWorker[] = [];
+    const pool = new ParseWorkerPool({
+      languages: ['cpp'],
+      size: 1,
+      createWorker: () => {
+        const worker = new FakeWorker(() => result(7));
+        workers.push(worker);
+        return worker;
+      },
+    });
+    await pool.requestParse({
+      filePath: 'retry.cpp',
+      content: 'int value;',
+      language: 'cpp',
+      skipDeclarationMacroRecovery: true,
+    });
+
+    expect(workers[0]!.parseMessages[0]).toEqual(expect.objectContaining({
+      skipDeclarationMacroRecovery: true,
+    }));
     await pool.destroy();
   });
 });

@@ -34,6 +34,7 @@ import {
   selectUnambiguousCppMacroDefinitions,
   type CppMacroDefinition,
 } from './declaration-macros';
+import { isRetryableParseWorkerError } from './wasm-errors';
 import {
   StoreWriter,
   type StoreBundle,
@@ -1258,13 +1259,18 @@ export class ExtractionOrchestrator {
       w.terminate().catch(() => {});
     }
 
-    async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
+    async function requestParse(
+      filePath: string,
+      content: string,
+      skipDeclarationMacroRecovery = false,
+    ): Promise<ExtractionResult> {
       if (parsePool) {
         return parsePool.requestParse({
           filePath,
           content,
           language: detectLanguage(filePath, content),
           frameworkNames,
+          skipDeclarationMacroRecovery,
         });
       }
       if (!WorkerClass) {
@@ -1276,7 +1282,7 @@ export class ExtractionOrchestrator {
           frameworkNames,
           globalMacroNames,
           globalBodylessMacroNames,
-          globalMacroDefinitions,
+          skipDeclarationMacroRecovery ? undefined : globalMacroDefinitions,
         );
       }
 
@@ -1328,7 +1334,14 @@ export class ExtractionOrchestrator {
         entry.timer = timer;
 
         pendingParses.set(id, entry);
-        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames });
+        worker.postMessage({
+          type: 'parse',
+          id,
+          filePath,
+          content,
+          frameworkNames,
+          skipDeclarationMacroRecovery,
+        });
       });
     }
 
@@ -1534,18 +1547,16 @@ export class ExtractionOrchestrator {
     // so synchronous work here blocks the animation from rendering.
     await new Promise(resolve => setImmediate(resolve));
 
-    // Retry pass: files that failed due to WASM memory corruption may succeed
-    // on a fresh worker with a clean heap. Recycle before each attempt so
-    // every file gets the absolute cleanest WASM state possible.
+    // Retry pass: files that failed due to WASM runtime corruption may succeed
+    // on a fresh worker. Recycle before each attempt so every file gets an
+    // uncontaminated parser/runtime state.
     const retryableErrors = errors.filter(
       (e) => e.code === 'parse_error' && e.filePath &&
-        (e.message.includes('Worker exited') ||
-         e.message.includes('memory access out of bounds') ||
-         e.message.includes('timed out'))
+        isRetryableParseWorkerError(e.message)
     );
 
     if (retryableErrors.length > 0 && (parsePool || WorkerClass)) {
-      log(`Retrying ${retryableErrors.length} files that failed due to WASM memory errors...`);
+      log(`Retrying ${retryableErrors.length} files that failed due to worker/WASM runtime errors...`);
 
       const stillFailing: typeof retryableErrors = [];
 
@@ -1567,7 +1578,10 @@ export class ExtractionOrchestrator {
 
         let result: ExtractionResult;
         try {
-          result = await requestParse(filePath, content);
+          // The first attempt already failed in a fresh isolated auxiliary
+          // parser. Preserve the primary AST on retry by omitting optional
+          // declaration-macro replay.
+          result = await requestParse(filePath, content, true);
         } catch {
           stillFailing.push(errEntry);
           continue;
@@ -1627,7 +1641,7 @@ export class ExtractionOrchestrator {
 
           let result: ExtractionResult;
           try {
-            result = await requestParse(filePath, stripped);
+            result = await requestParse(filePath, stripped, true);
           } catch {
             continue;
           }

@@ -4,7 +4,7 @@
  * Handles parsing source code and extracting structural information.
  */
 
-import { Node as SyntaxNode, Tree } from 'web-tree-sitter';
+import { Node as SyntaxNode, Tree, Parser as WasmParser } from 'web-tree-sitter';
 import * as path from 'path';
 import {
   Language,
@@ -15,7 +15,7 @@ import {
   ExtractionError,
   UnresolvedReference,
 } from '../types';
-import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
+import { createParser, getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
 import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
@@ -38,6 +38,7 @@ import {
   expandDeclarationMacros,
   type CppMacroDefinition,
 } from './declaration-macros';
+import { isWasmRuntimeCorruptionError } from './wasm-errors';
 
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
@@ -744,6 +745,8 @@ export class TreeSitterExtractor {
   private globalBodylessMacroNames: Set<string> | null = null;
   /** Unambiguous project-wide definitions for declaration-macro recovery. */
   private globalMacroDefinitions: readonly CppMacroDefinition[] | null = null;
+  /** Parser supplied for a short-lived auxiliary extraction; never cached. */
+  private parserOverride: WasmParser | null = null;
   /** Original source bytes, retained for X-macro analysis before pre-parse transforms. */
   private originalSource: string;
   private originalLineStarts: number[] = [0];
@@ -759,6 +762,7 @@ export class TreeSitterExtractor {
     globalMacroNames?: Set<string>,
     bodylessMacroNames?: Set<string>,
     macroDefinitions?: readonly CppMacroDefinition[],
+    parserOverride?: WasmParser,
   ) {
     this.filePath = filePath;
     this.originalSource = source;
@@ -771,6 +775,7 @@ export class TreeSitterExtractor {
     this.globalMacroNames = globalMacroNames ?? null;
     this.globalBodylessMacroNames = bodylessMacroNames ?? null;
     this.globalMacroDefinitions = macroDefinitions ?? null;
+    this.parserOverride = parserOverride ?? null;
   }
 
   /**
@@ -796,7 +801,7 @@ export class TreeSitterExtractor {
       };
     }
 
-    const parser = getParser(this.language);
+    const parser = this.parserOverride ?? getParser(this.language);
     if (!parser) {
       return {
         nodes: [],
@@ -1038,10 +1043,9 @@ export class TreeSitterExtractor {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
 
-      // WASM memory errors leave the module in a corrupted state — all subsequent
-      // parses would also fail. Re-throw so the worker can detect and crash,
-      // forcing a clean restart with a fresh heap.
-      if (msg.includes('memory access out of bounds') || msg.includes('out of memory')) {
+      // WASM runtime corruption leaves the module unsafe for every subsequent
+      // parse. Re-throw so the worker can terminate and be replaced.
+      if (isWasmRuntimeCorruptionError(msg)) {
         throw error;
       }
 
@@ -1054,10 +1058,7 @@ export class TreeSitterExtractor {
     } finally {
       // Free tree-sitter WASM memory immediately — trees hold native heap memory
       // invisible to V8's GC that accumulates across thousands of files.
-      if (this.tree) {
-        this.tree.delete();
-        this.tree = null;
-      }
+      this.releaseTree();
       // Release source string to reduce GC pressure
       this.source = '';
     }
@@ -1069,6 +1070,35 @@ export class TreeSitterExtractor {
       errors: this.errors,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /** Delete the current native tree once and clear the reference first. */
+  private releaseTree(): void {
+    const tree = this.tree;
+    this.tree = null;
+    tree?.delete();
+  }
+
+  /** Parse one transformed declaration source with a disposable Parser. */
+  private extractDeclarationRecoverySource(source: string): ExtractionResult {
+    const parser = createParser(this.language);
+    if (!parser) {
+      throw new Error(`Failed to create isolated parser for language: ${this.language}`);
+    }
+    try {
+      return extractFromSource(
+        this.filePath,
+        source,
+        this.language,
+        undefined,
+        this.globalMacroNames ?? undefined,
+        this.globalBodylessMacroNames ?? undefined,
+        undefined,
+        parser,
+      );
+    } finally {
+      parser.delete();
+    }
   }
 
   /**
@@ -1098,6 +1128,129 @@ export class TreeSitterExtractor {
       current = current.parent;
     }
     return true;
+  }
+
+  /**
+   * Preserve only the source lines needed to parse declaration-macro output in
+   * its original namespace/class/template context. This keeps line numbers and
+   * qualified names stable without reparsing an entire large translation unit.
+   */
+  private buildDeclarationMacroRecoverySource(
+    expandedSource: string,
+    invocationLines: ReadonlySet<number>,
+  ): string {
+    if (!this.tree || !this.extractor) return expandedSource;
+    const lines = expandedSource.split('\n');
+    const originalLines = this.originalSource.split('\n');
+    const kept = new Set<number>();
+    const root = this.tree.rootNode;
+    const containerTypes = new Set<string>([
+      'namespace_definition',
+      'linkage_specification',
+      ...this.extractor.classTypes,
+      ...this.extractor.structTypes,
+      ...this.extractor.enumTypes,
+    ]);
+
+    const keepRows = (startRow: number, endRow: number): void => {
+      const start = Math.max(0, Math.min(startRow, lines.length - 1));
+      const end = Math.max(start, Math.min(endRow, lines.length - 1));
+      for (let row = start; row <= end; row++) kept.add(row + 1);
+    };
+
+    for (const line of invocationLines) {
+      const row = Math.max(0, line - 1);
+      const originalLine = originalLines[row] ?? '';
+      const column = originalLine.search(/\S/);
+      let current: SyntaxNode | null = root.descendantForPosition({
+        row,
+        column: Math.max(0, column),
+      });
+      let depth = 0;
+      while (current && depth++ < 128) {
+        if (containerTypes.has(current.type)) {
+          const body = this.extractor.resolveBody?.(current, this.extractor.bodyField)
+            ?? getChildByField(current, this.extractor.bodyField);
+          if (body) {
+            let headerStart = current.startPosition.row;
+            if (current.parent?.type === 'template_declaration') {
+              headerStart = current.parent.startPosition.row;
+            }
+            keepRows(headerStart, body.startPosition.row);
+            keepRows(body.endPosition.row, current.endPosition.row);
+
+            // Visibility is semantic context for generated members. Preserve
+            // the latest access section preceding this invocation.
+            let latestAccess: SyntaxNode | null = null;
+            for (const child of body.namedChildren) {
+              if (child.type === 'access_specifier' && child.startPosition.row <= row) {
+                latestAccess = child;
+              }
+            }
+            if (latestAccess) {
+              keepRows(latestAccess.startPosition.row, latestAccess.endPosition.row);
+            }
+          }
+        }
+        current = current.parent;
+      }
+
+      this.keepDeclarationContinuationLines(lines, line, kept);
+    }
+
+    return lines.map((text, index) => kept.has(index + 1) ? text : '').join('\n');
+  }
+
+  /** Keep a split declaration/function body following an expanded invocation. */
+  private keepDeclarationContinuationLines(
+    lines: readonly string[],
+    startLine: number,
+    kept: Set<number>,
+  ): void {
+    let parenDepth = 0;
+    let braceDepth = 0;
+    let bodyStarted = false;
+    let blockComment = false;
+    const lastRow = Math.min(lines.length - 1, Math.max(0, startLine - 1) + 512);
+
+    for (let row = Math.max(0, startLine - 1); row <= lastRow; row++) {
+      kept.add(row + 1);
+      const text = lines[row] ?? '';
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i]!;
+        if (blockComment) {
+          if (char === '*' && text[i + 1] === '/') {
+            blockComment = false;
+            i++;
+          }
+          continue;
+        }
+        if (char === '/' && text[i + 1] === '*') {
+          blockComment = true;
+          i++;
+          continue;
+        }
+        if (char === '/' && text[i + 1] === '/') break;
+        if (char === '"' || char === "'") {
+          const quote = char;
+          for (i++; i < text.length; i++) {
+            if (text[i] === '\\') i++;
+            else if (text[i] === quote) break;
+          }
+          continue;
+        }
+        if (char === '(') parenDepth++;
+        else if (char === ')' && parenDepth > 0) parenDepth--;
+        else if (char === '{' && parenDepth === 0) {
+          bodyStarted = true;
+          braceDepth++;
+        } else if (char === '}' && bodyStarted && --braceDepth === 0) {
+          return;
+        } else if (char === ';' && !bodyStarted && parenDepth === 0) {
+          return;
+        }
+      }
+    }
   }
 
   /** Lexically identify balanced function/lambda bodies even in a damaged AST. */
@@ -1300,11 +1453,10 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Recover declarations created by macros. The expanded source is parsed as a
-   * complete translation unit so namespaces, enclosing classes, templates, and
-   * access sections retain their normal tree-sitter semantics. Only new symbol
-   * nodes anchored to an expanded invocation line are merged; references/calls
-   * remain owned by the primary source parse.
+   * Recover declarations created by macros from a line-preserving sparse source
+   * that retains namespace/class/template context around each invocation. Only
+   * new symbol nodes anchored to an expanded invocation line are merged;
+   * references/calls remain owned by the primary source parse.
    */
   private recoverDeclarationMacroNodes(): void {
     if (
@@ -1323,43 +1475,21 @@ export class TreeSitterExtractor {
     );
     if (expanded.source === this.originalSource || expanded.invocationLines.size === 0) return;
 
-    // Deliberately omit macroDefinitions to prevent recursive auxiliary parses.
-    const recovered = extractFromSource(
-      this.filePath,
+    const recoverySource = this.buildDeclarationMacroRecoverySource(
       expanded.source,
-      this.language,
-      undefined,
-      this.globalMacroNames ?? undefined,
-      this.globalBodylessMacroNames ?? undefined,
-      undefined,
+      expanded.invocationLines,
     );
-    // If the primary file tree was already damaged before the declaration
-    // macro, it may swallow even the correctly expanded declaration. Parse all
-    // invocation lines once more in isolation (line numbers preserved) and use
-    // it only as a supplemental symbol source.
-    const isolatedSource = expanded.source.split('\n')
-      .map((text, index) => expanded.invocationLines.has(index + 1) ? text : '')
-      .join('\n');
-    const isolated = extractFromSource(
-      this.filePath,
-      isolatedSource,
-      this.language,
-      undefined,
-      this.globalMacroNames ?? undefined,
-      this.globalBodylessMacroNames ?? undefined,
-      undefined,
-    );
-    const fullSymbolKeys = new Set(recovered.nodes.map(node => `${node.name}\0${node.startLine}`));
-    const isolatedNodes = isolated.nodes.filter(node =>
-      !fullSymbolKeys.has(`${node.name}\0${node.startLine}`)
-      && (node.kind === 'variable'
-        || (node.kind === 'method' && Boolean(node.qualifiedName?.includes('::')))));
-    const isolatedIds = new Set(isolatedNodes.map(node => node.id));
-    const recoveredNodes = [...recovered.nodes, ...isolatedNodes];
-    const recoveredEdges = [
-      ...recovered.edges,
-      ...isolated.edges.filter(edge => isolatedIds.has(edge.target)),
-    ];
+
+    // All primary-tree work is complete at this point. Release it before any
+    // auxiliary parse so no nested extraction shares a live tree with another
+    // Parser in the same web-tree-sitter runtime.
+    this.releaseTree();
+
+    // Deliberately omit macroDefinitions to prevent recursive auxiliary parses.
+    // A one-shot Parser is never shared with the worker's long-lived parser.
+    const recovered = this.extractDeclarationRecoverySource(recoverySource);
+    const recoveredNodes = recovered.nodes;
+    const recoveredEdges = recovered.edges;
 
     const recoverableKinds = new Set<NodeKind>([
       'class', 'struct', 'enum', 'enum_member', 'interface', 'trait',
@@ -7352,6 +7482,7 @@ export function extractFromSource(
   globalMacroNames?: Set<string>,
   bodylessMacroNames?: Set<string>,
   macroDefinitions?: readonly CppMacroDefinition[],
+  parserOverride?: WasmParser,
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -7400,6 +7531,7 @@ export function extractFromSource(
       globalMacroNames,
       bodylessMacroNames,
       macroDefinitions,
+      parserOverride,
     );
     result = extractor.extract();
   }

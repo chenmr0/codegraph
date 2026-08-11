@@ -22,6 +22,8 @@ export interface ParseTask {
   content: string;
   language: Language;
   frameworkNames?: string[];
+  /** Retry safety mode: preserve the primary AST but omit optional macro replay. */
+  skipDeclarationMacroRecovery?: boolean;
 }
 
 const DEFAULT_POOL_CAP = 8;
@@ -284,6 +286,7 @@ export class ParseWorkerPool {
       content: job.task.content,
       language: job.task.language,
       frameworkNames: job.task.frameworkNames,
+      skipDeclarationMacroRecovery: job.task.skipDeclarationMacroRecovery,
     });
   }
 

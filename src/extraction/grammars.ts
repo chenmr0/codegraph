@@ -288,6 +288,24 @@ export function getParser(language: Language): Parser | null {
     return parserCache.get(language)!;
   }
 
+  const parser = createParser(language);
+  if (!parser) return null;
+  parserCache.set(language, parser);
+  return parser;
+}
+
+/**
+ * Create an uncached parser for an isolated auxiliary parse.
+ *
+ * Declaration-macro recovery may need to parse transformed source while the
+ * primary extraction is still active. Giving that work its own Parser keeps a
+ * failure from corrupting the long-lived parser cached by the worker.
+ * The immutable Language and underlying WASM instance are still shared; a
+ * runtime-level trap is therefore handled by terminating and retrying with a
+ * fresh worker (see wasm-errors.ts and parse-worker.ts).
+ * The caller owns the returned parser and must delete it.
+ */
+export function createParser(language: Language): Parser | null {
   const lang = languageCache.get(language);
   if (!lang) {
     return null;
@@ -295,7 +313,6 @@ export function getParser(language: Language): Parser | null {
 
   const parser = new Parser();
   parser.setLanguage(lang);
-  parserCache.set(language, parser);
   return parser;
 }
 
