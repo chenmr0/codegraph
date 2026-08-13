@@ -33,6 +33,11 @@ describe('isGeneratedFile', () => {
     expect(isGeneratedFile('proto/bar_pb2_grpc.py')).toBe(true);
     expect(isGeneratedFile('lib/baz.pb.cc')).toBe(true);
     expect(isGeneratedFile('lib/baz.pb.h')).toBe(true);
+    expect(isGeneratedFile('src/share/inner_table/ob_inner_table_schema.12101_12150.cpp')).toBe(true);
+    expect(isGeneratedFile('src/share/inner_table/ob_inner_table_schema_constants.h')).toBe(true);
+    expect(isGeneratedFile('src/share/inner_table/ob_inner_table_schema.h')).toBe(true);
+    expect(isGeneratedFile('src/share/inner_table/ob_inner_table_schema_misc.ipp')).toBe(true);
+    expect(isGeneratedFile('src/share/inner_table/ob_load_inner_table_schema.cpp')).toBe(true);
     expect(isGeneratedFile('lib/quux.g.dart')).toBe(true);
     expect(isGeneratedFile('lib/quux.freezed.dart')).toBe(true);
   });

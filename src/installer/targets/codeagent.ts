@@ -192,7 +192,7 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action };
 }
 
-function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
+export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
   const file = settingsJsonPath(loc);
   const settings = readJsonFile(file);
   const created = !fs.existsSync(file);
@@ -202,6 +202,9 @@ function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
 
   const want = getCodeGraphPermissions();
   const before = [...settings.permissions.allow];
+  settings.permissions.allow = settings.permissions.allow.filter(
+    (perm: unknown) => typeof perm !== 'string' || !perm.startsWith('mcp__codegraph__codegraph_'),
+  );
   for (const perm of want) {
     if (!settings.permissions.allow.includes(perm)) {
       settings.permissions.allow.push(perm);

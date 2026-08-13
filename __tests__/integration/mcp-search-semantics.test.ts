@@ -68,7 +68,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
   });
 
   it('returns every exact-name definition and excludes prefix lookalikes', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'helper' });
+    const result = await handler.execute('search', { query: 'helper' });
     expect(result.isError).toBeFalsy();
     const text = result.content[0]!.text;
 
@@ -82,7 +82,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
   });
 
   it('falls back to fuzzy matches with a warning when no exact match exists', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'nonexist' });
+    const result = await handler.execute('search', { query: 'nonexist' });
     expect(result.isError).toBeFalsy();
     const text = result.content[0]!.text;
 
@@ -96,7 +96,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     // Filtering kind=class yields no exact match, so it must fall back to
     // fuzzy and surface the class-typed prefix candidate `HelperUtils` with
     // the warning (rather than returning an empty result).
-    const result = await handler.execute('codegraph_search', {
+    const result = await handler.execute('search', {
       query: 'helper',
       kind: 'class',
     });
@@ -107,7 +107,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
   });
 
   it('resolves a qualified input exactly and exposes the qualified name', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'Widget.helper' });
+    const result = await handler.execute('search', { query: 'Widget.helper' });
     expect(result.isError).toBeFalsy();
     const text = result.content[0]!.text;
     expect(text).toContain('### helper (method)');
@@ -117,7 +117,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
   });
 
   it('uses path to disambiguate same-named exact symbols before limiting', async () => {
-    const result = await handler.execute('codegraph_search', {
+    const result = await handler.execute('search', {
       query: 'helper',
       path: 'src/b.ts',
       limit: 1,
@@ -148,7 +148,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
       });
     }
 
-    const result = await handler.execute('codegraph_search', {
+    const result = await handler.execute('search', {
       query: 'tests::TEST_F',
       path: 'src/repeated.cpp',
       line: 119,
@@ -161,7 +161,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
   });
 
   it('does not fuzzy-fallback for an unknown qualified input', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'Foo.bar' });
+    const result = await handler.execute('search', { query: 'Foo.bar' });
     expect(result.isError).toBeFalsy();
     expect(result.content[0]!.text).toContain('No results found');
   });

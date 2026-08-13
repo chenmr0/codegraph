@@ -29,9 +29,10 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
   it('does not expose codegraph_explore by default', () => {
     delete process.env[ENV];
     const all = listed();
-    expect(all).not.toContain('codegraph_explore');
-    expect(all).not.toContain('codegraph_context');
-    expect(all).not.toContain('codegraph_trace');
+    expect(all).not.toContain('explore');
+    expect(all).toContain('context');
+    expect(all).toContain('text_search');
+    expect(all.every((name) => !name.startsWith('codegraph_'))).toBe(true);
     expect(all.length).toBeGreaterThanOrEqual(7);
   });
 
@@ -39,20 +40,25 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     delete process.env[ENV];
     process.env[EXPLORE_ENV] = '1';
     const all = listed();
-    expect(all).toContain('codegraph_explore');
+    expect(all).toContain('explore');
     expect(all.length).toBeGreaterThanOrEqual(8);
   });
 
   it('filters ListTools to the allowlisted short names', () => {
     process.env[EXPLORE_ENV] = '1';
     process.env[ENV] = 'explore,search,node';
-    expect(listed()).toEqual(['codegraph_explore', 'codegraph_node', 'codegraph_search']);
+    expect(listed()).toEqual(['explore', 'node', 'search']);
   });
 
-  it('accepts fully-qualified codegraph_ names and ignores whitespace', () => {
+  it('allowlists the new exact context and literal text search tools', () => {
+    process.env[ENV] = 'context,text_search';
+    expect(listed()).toEqual(['context', 'text_search']);
+  });
+
+  it('requires short raw names and ignores prefixed allowlist entries', () => {
     process.env[EXPLORE_ENV] = '1';
     process.env[ENV] = ' codegraph_explore , search ';
-    expect(listed()).toEqual(['codegraph_explore', 'codegraph_search']);
+    expect(listed()).toEqual(['search']);
   });
 
   it('treats an empty/whitespace value as unset (full surface, explore disabled by default)', () => {
@@ -62,7 +68,7 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
 
   it('rejects a disabled tool on execute (defense in depth)', async () => {
     process.env[ENV] = 'node';
-    const res = await new ToolHandler(null).execute('codegraph_explore', {});
+    const res = await new ToolHandler(null).execute('explore', {});
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/disabled/);
   });
@@ -71,7 +77,7 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     process.env[ENV] = 'search';
     // No CodeGraph attached, so it fails *after* the allowlist guard — the
     // "disabled" message must NOT appear, proving the guard passed it through.
-    const res = await new ToolHandler(null).execute('codegraph_search', { query: 'x' });
+    const res = await new ToolHandler(null).execute('search', { query: 'x' });
     expect(res.content[0].text).not.toMatch(/disabled/);
   });
 });

@@ -317,36 +317,36 @@ describe('MCP Input Validation', () => {
   });
 
   it('should reject non-string query in codegraph_search', async () => {
-    const result = await handler.execute('codegraph_search', { query: null });
+    const result = await handler.execute('search', { query: null });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
   });
 
   it('should reject empty string query in codegraph_search', async () => {
-    const result = await handler.execute('codegraph_search', { query: '' });
+    const result = await handler.execute('search', { query: '' });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
   });
 
   it('should accept valid query in codegraph_search', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'example' });
+    const result = await handler.execute('search', { query: 'example' });
     expect(result.isError).toBeFalsy();
   });
 
   it('should clamp limit to valid range in codegraph_search', async () => {
     // Extremely large limit should still work (clamped to 100)
-    const result = await handler.execute('codegraph_search', { query: 'example', limit: 999999 });
+    const result = await handler.execute('search', { query: 'example', limit: 999999 });
     expect(result.isError).toBeFalsy();
   });
 
   it('should reject non-string symbol in codegraph_callers', async () => {
-    const result = await handler.execute('codegraph_callers', { symbol: 123 });
+    const result = await handler.execute('callers', { symbol: 123 });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
   });
 
   it('should reject non-string query in codegraph_explore', async () => {
-    const result = await handler.execute('codegraph_explore', { query: undefined });
+    const result = await handler.execute('explore', { query: undefined });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('non-empty string');
   });
@@ -372,34 +372,34 @@ describe('MCP Input Validation', () => {
     };
     const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
 
-    const result = await fakeHandler.execute('codegraph_search', { query: 'x' });
+    const result = await fakeHandler.execute('search', { query: 'x' });
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('... (output truncated)');
   });
 
   it('should reject non-string symbol in codegraph_impact', async () => {
-    const result = await handler.execute('codegraph_impact', { symbol: [] });
+    const result = await handler.execute('impact', { symbol: [] });
     expect(result.isError).toBe(true);
   });
 
   it('should reject non-string symbol in codegraph_node', async () => {
-    const result = await handler.execute('codegraph_node', { symbol: false });
+    const result = await handler.execute('node', { symbol: false });
     expect(result.isError).toBe(true);
   });
 
   it('should reject non-string symbol in codegraph_callees', async () => {
-    const result = await handler.execute('codegraph_callees', { symbol: {} });
+    const result = await handler.execute('callees', { symbol: {} });
     expect(result.isError).toBe(true);
   });
 
   it('should handle NaN limit gracefully', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'example', limit: 'abc' });
+    const result = await handler.execute('search', { query: 'example', limit: 'abc' });
     expect(result.isError).toBeFalsy();
   });
 
   it('should handle negative limit gracefully', async () => {
-    const result = await handler.execute('codegraph_search', { query: 'example', limit: -5 });
+    const result = await handler.execute('search', { query: 'example', limit: -5 });
     expect(result.isError).toBeFalsy();
   });
 
@@ -410,7 +410,7 @@ describe('MCP Input Validation', () => {
   it.runIf(process.platform !== 'win32')(
     'rejects a sensitive POSIX projectPath (/etc) via the MCP handler',
     async () => {
-      const result = await handler.execute('codegraph_search', {
+      const result = await handler.execute('search', {
         query: 'example',
         projectPath: '/etc',
       });
@@ -422,7 +422,7 @@ describe('MCP Input Validation', () => {
   it.runIf(process.platform === 'win32')(
     'rejects a sensitive Windows projectPath (C:\\Windows) via the MCP handler',
     async () => {
-      const result = await handler.execute('codegraph_search', {
+      const result = await handler.execute('search', {
         query: 'example',
         projectPath: 'C:\\Windows',
       });

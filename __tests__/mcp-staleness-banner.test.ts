@@ -4,8 +4,8 @@
  * The watcher tracks every file event since the last successful sync; the
  * tool dispatcher intersects "files referenced in this response" with that
  * pending set and prepends a banner ("⚠️ Some files referenced below were
- * edited since the last index sync…") plus an optional footer ("(Note: N
- * file(s) elsewhere in this project are pending index sync…)").
+ * edited since the last index sync…"). Pending files outside the current
+ * response stay silent; codegraph_status owns the project-wide list.
  *
  * No auto-flush, no static wait — the response is instant and the agent
  * decides whether to Read the specific stale file. These tests exercise
@@ -95,7 +95,7 @@ describe('MCP staleness banner', () => {
     // and the small window before the pending-file Map is populated).
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/alpha-only.ts'));
 
-    const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
+    const res = await handler.execute('search', { query: 'alphaOnly' });
     expect(res.isError).toBeFalsy();
     const text = res.content[0].text;
 
@@ -103,12 +103,12 @@ describe('MCP staleness banner', () => {
     expect(text.startsWith('⚠️')).toBe(true);
     expect(text).toContain('src/alpha-only.ts');
     expect(text).toMatch(/edited \d+ms ago/);
-    expect(text).toMatch(/Read them directly/);
+    expect(text).toMatch(/read only the required range directly/i);
     // The actual result must still follow the banner.
     expect(text).toMatch(/alphaOnly/);
   });
 
-  it('uses the footer (not the banner) when pending files are not referenced', async () => {
+  it('stays silent when pending files are not referenced by the response', async () => {
     cg.watch({ debounceMs: 4000, inertForTests: true });
     await cg.waitUntilWatcherReady();
 
@@ -122,12 +122,12 @@ describe('MCP staleness banner', () => {
     __emitWatchEventForTests(testDir, 'src/bravo-only.ts');
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/bravo-only.ts'));
 
-    const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
+    const res = await handler.execute('search', { query: 'alphaOnly' });
     const text = res.content[0].text;
 
     expect(text.startsWith('⚠️')).toBe(false);
-    expect(text).toMatch(/elsewhere in this project are pending index sync/);
-    expect(text).toContain('src/bravo-only.ts');
+    expect(text).not.toMatch(/elsewhere in this project are pending index sync/);
+    expect(text).not.toContain('src/bravo-only.ts');
   });
 
   it('drops the banner once the sync completes and clears the pending entry', async () => {
@@ -142,7 +142,7 @@ describe('MCP staleness banner', () => {
     // Wait through debounce (200ms) + sync; pendingFiles drains back to empty.
     await waitFor(() => cg.getPendingFiles().length === 0, 3000);
 
-    const res = await handler.execute('codegraph_search', { query: 'alphaOnly' });
+    const res = await handler.execute('search', { query: 'alphaOnly' });
     const text = res.content[0].text;
     expect(text.startsWith('⚠️')).toBe(false);
     expect(text).not.toMatch(/elsewhere in this project are pending index sync/);
@@ -159,7 +159,7 @@ describe('MCP staleness banner', () => {
     __emitWatchEventForTests(testDir, 'src/charlie-only.ts');
     await waitFor(() => cg.getPendingFiles().some((p) => p.path === 'src/charlie-only.ts'));
 
-    const res = await handler.execute('codegraph_status', {});
+    const res = await handler.execute('status', {});
     const text = res.content[0].text;
     expect(text).toContain('### Pending sync:');
     expect(text).toContain('src/charlie-only.ts');

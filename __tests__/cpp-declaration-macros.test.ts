@@ -37,6 +37,18 @@ describe('C/C++ declaration macro expansion', () => {
     expect(result.source.split('\n')[6]).toBe('int after;');
   });
 
+  it('keeps spaced directives and lowercase macro names on the exact fast path', () => {
+    const source = [
+      '#  define local_decl(name) static int name;',
+      'local_decl(recovered_value)',
+    ].join('\n');
+    const result = expandDeclarationMacros(source, []);
+
+    expect(result.source.split('\n')[0]).toBe(source.split('\n')[0]);
+    expect(result.source.split('\n')[1]).toBe('static int recovered_value;');
+    expect(result.invocationLines).toEqual(new Set([2]));
+  });
+
   it('recursively expands helper, variadic, stringify, and token-paste macros', () => {
     const definitions = selectUnambiguousCppMacroDefinitions(scanCppMacroDefinitions([
       '#define DECLARE_METHODS(CLS) int CLS::serialize() const; int CLS::deserialize();',
@@ -119,6 +131,52 @@ describe('C/C++ declaration macro expansion', () => {
     expect(result.invocationLines).toEqual(new Set([1]));
   });
 
+  it('checks declaration scope only after an expansion is declaration-shaped', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(scanCppMacroDefinitions([
+      '#define EXPR(value) ((value) + 1)',
+      '#define DECL(name) static int name;',
+    ].join('\n')));
+    const checkedLines: number[] = [];
+    const source = ['EXPR(1)', 'DECL(global_value)', 'EXPR(2)'].join('\n');
+    const result = expandDeclarationMacros(
+      source,
+      definitions,
+      line => {
+        checkedLines.push(line);
+        return true;
+      },
+    );
+
+    expect(result.source).toBe(['EXPR(1)', 'static int global_value;', 'EXPR(2)'].join('\n'));
+    expect(result.invocationLines).toEqual(new Set([2]));
+    expect(checkedLines).toEqual([2]);
+  });
+
+  it('assembles dense declaration-macro expansions without shifting lines or source boundaries', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(
+      scanCppMacroDefinitions('#define DECL(index) static int value_##index;'),
+    );
+    const declarationCount = 1_000;
+    const sourceLines = [
+      '// prefix sentinel',
+      ...Array.from({ length: declarationCount }, (_, index) => `DECL(${index})`),
+      'int suffix_sentinel;',
+    ];
+    const result = expandDeclarationMacros(sourceLines.join('\n'), definitions);
+    const expandedLines = result.source.split('\n');
+
+    expect(expandedLines).toHaveLength(sourceLines.length);
+    expect(expandedLines[0]).toBe('// prefix sentinel');
+    expect(expandedLines[1]).toBe('static int value_0;');
+    expect(expandedLines[500]).toBe('static int value_499;');
+    expect(expandedLines[declarationCount]).toBe('static int value_999;');
+    expect(expandedLines[declarationCount + 1]).toBe('int suffix_sentinel;');
+    expect(result.invocationLines.size).toBe(declarationCount);
+    expect(result.invocationLines).toEqual(
+      new Set(Array.from({ length: declarationCount }, (_, index) => index + 2)),
+    );
+  });
+
   it('does not index declaration-shaped macros used inside function bodies', () => {
     const definitions = selectUnambiguousCppMacroDefinitions(
       scanCppMacroDefinitions('#define DECL(name) static int name;'),
@@ -137,6 +195,36 @@ describe('C/C++ declaration macro expansion', () => {
     expect(result.nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'variable', name: 'global_value', startLine: 2 }),
     ]));
+  });
+
+  it('keeps declaration scope exact across disjoint functions, methods, and lambdas', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(
+      scanCppMacroDefinitions('#define DECL(name) static int name;'),
+    );
+    const source = [
+      'namespace demo {',
+      'DECL(namespace_value)',
+      'void first() { DECL(first_local) }',
+      'auto callback = [] { DECL(lambda_local) };',
+      'struct Holder {',
+      '  DECL(member_value)',
+      '  void method() { DECL(method_local) }',
+      '};',
+      'DECL(after_value)',
+      '}',
+    ].join('\n');
+    const result = extractFromSource(
+      'scope-ranges.cpp', source, 'cpp', undefined,
+      new Set(['DECL']), new Set(), definitions,
+    );
+    const names = new Set(result.nodes.map(node => node.name));
+
+    expect(names.has('namespace_value')).toBe(true);
+    expect(names.has('member_value')).toBe(true);
+    expect(names.has('after_value')).toBe(true);
+    expect(names.has('first_local')).toBe(false);
+    expect(names.has('lambda_local')).toBe(false);
+    expect(names.has('method_local')).toBe(false);
   });
 
   it('merges generated classes, methods, fields, and variables at invocation lines', () => {

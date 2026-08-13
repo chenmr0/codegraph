@@ -27,6 +27,11 @@ import type { ResolutionContext, ResolutionDiagnostic } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { memoryBudgetBytes } from './memory-budget';
 import { stripCommentsForRegex } from './strip-comments';
+import {
+  cppCallableOwnersMatch,
+  cppParameterKey,
+  cppParameterKeysMatch,
+} from './cpp-signature';
 import { getHeapStatistics } from 'node:v8';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -570,9 +575,10 @@ function* cppOverrideEdges(
  * pairing free functions by bare name would risk mis-pairing. Adding free
  * function support needs a separate verifiable signal.
  *
- * Overloads share a qualifiedName (signature is not encoded); each
- * definition links to every same-qualifiedName declaration. Over-pairs but
- * never mis-pairs — every edge points at a real declaration of that name.
+ * Overloads share a qualifiedName (signature is not encoded), so pairing also
+ * compares their parameter lists. Without that guard, `f()` was linked to
+ * both `f()` and `f(T*)`; codegraph_node then presented the wrong definition
+ * as if it implemented the declaration-only overload.
  */
 /**
  * Last two `::`-separated segments of a C++ method qualifiedName
@@ -669,10 +675,22 @@ function* cppDeclDefEdges(
     const decls = nodes.filter((n) => n.isDeclaration === true);
     const defs = nodes.filter((n) => n.isDeclaration !== true);
     if (defs.length === 0 || decls.length === 0) continue;
+    const overloaded = defs.length > 1 || decls.length > 1;
 
     for (const def of defs) {
       for (const decl of decls) {
         if (def.filePath === decl.filePath) continue; // cross-file only
+        if (!cppCallableOwnersMatch(def, decl)) continue;
+        const defParams = cppParameterKey(def);
+        const declParams = cppParameterKey(decl);
+        // A parsed mismatch is definitive even when only one declaration and
+        // one definition survived extraction: they may still be two different
+        // overloads. Missing signatures are tolerated only for an unambiguous
+        // one-to-one group to preserve legacy coverage.
+        if (
+          (defParams !== null && declParams !== null && !cppParameterKeysMatch(defParams, declParams)) ||
+          (overloaded && (defParams === null || declParams === null))
+        ) continue;
         const key = `${def.id}>${decl.id}`;
         if (seen.has(key)) continue;
         seen.add(key);

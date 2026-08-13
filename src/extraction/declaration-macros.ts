@@ -40,11 +40,20 @@ const MAX_EXPANSION_DEPTH = 24;
 const MAX_SOURCE_INVOCATIONS = 4096;
 
 function isIdentStart(char: string): boolean {
-  return /[A-Za-z_]/.test(char);
+  if (!char) return false;
+  const code = char.charCodeAt(0);
+  return code === 95
+    || (code >= 65 && code <= 90)
+    || (code >= 97 && code <= 122);
 }
 
 function isIdentPart(char: string): boolean {
-  return /[A-Za-z0-9_]/.test(char);
+  if (!char) return false;
+  const code = char.charCodeAt(0);
+  return code === 95
+    || (code >= 48 && code <= 57)
+    || (code >= 65 && code <= 90)
+    || (code >= 97 && code <= 122);
 }
 
 function skipQuoted(text: string, start: number): number {
@@ -178,6 +187,12 @@ function parseDefinition(source: string, hash: number, end: number): CppMacroDef
 
 /** Scan all ordinary `#define` directives in one C/C++ source file. */
 export function scanCppMacroDefinitions(source: string): CppMacroDefinition[] {
+  // Most translation units consume macros but do not define any. Let the
+  // native regexp engine reject those files before the JS line-by-line scan.
+  // This accepts the same whitespace between `#` and `define` as the parser
+  // below; false positives in comments merely fall through to the exact scan.
+  if (!/#\s*define\b/.test(source)) return [];
+
   const definitions: CppMacroDefinition[] = [];
   let offset = 0;
   while (offset < source.length) {
@@ -246,17 +261,23 @@ interface MacroLookup {
   get(name: string): CppMacroDefinition | undefined;
 }
 
-const definitionIndexCache = new WeakMap<
-  readonly CppMacroDefinition[],
-  Map<string, CppMacroDefinition>
->();
+interface MacroDefinitionIndex {
+  definitions: Map<string, CppMacroDefinition>;
+  /** C/C++ identifiers recognized by this module are ASCII. */
+  initialCharacters: Uint8Array;
+}
+
+const definitionIndexCache = new WeakMap<readonly CppMacroDefinition[], MacroDefinitionIndex>();
 
 function definitionIndex(
   definitions: readonly CppMacroDefinition[],
-): Map<string, CppMacroDefinition> {
+): MacroDefinitionIndex {
   const cached = definitionIndexCache.get(definitions);
   if (cached) return cached;
-  const index = new Map(definitions.map(definition => [definition.name, definition]));
+  const byName = new Map(definitions.map(definition => [definition.name, definition]));
+  const initialCharacters = new Uint8Array(128);
+  for (const name of byName.keys()) initialCharacters[name.charCodeAt(0)] = 1;
+  const index = { definitions: byName, initialCharacters };
   definitionIndexCache.set(definitions, index);
   return index;
 }
@@ -543,7 +564,8 @@ export function expandDeclarationMacros(
   projectDefinitions: readonly CppMacroDefinition[],
   isDeclarationScope?: (line: number, column: number) => boolean,
 ): DeclarationMacroExpansion {
-  const globalDefinitions = definitionIndex(projectDefinitions);
+  const globalIndex = definitionIndex(projectDefinitions);
+  const globalDefinitions = globalIndex.definitions;
   const localDefinitions = new Map<string, CppMacroDefinition[]>();
   for (const definition of scanCppMacroDefinitions(source)) {
     let values = localDefinitions.get(definition.name);
@@ -553,6 +575,17 @@ export function expandDeclarationMacros(
     }
     values.push(definition);
   }
+
+  if (globalDefinitions.size === 0 && localDefinitions.size === 0) {
+    return { source, invocationLines: new Set(), expandedMacroNames: new Set() };
+  }
+
+  // Copy the cached 128-byte table because same-file definitions add valid
+  // initials for this invocation only. This exact filter skips slicing and
+  // hashing ordinary identifiers whose first character cannot begin any known
+  // macro; it makes no naming-style assumptions (lowercase macros still work).
+  const candidateInitialCharacters = globalIndex.initialCharacters.slice();
+  for (const name of localDefinitions.keys()) candidateInitialCharacters[name.charCodeAt(0)] = 1;
 
   // Recursive helper expansion needs a single lookup table. A same-file
   // definition is safe for helpers only when its spelling is unique in this
@@ -619,6 +652,12 @@ export function expandDeclarationMacros(
       continue;
     }
 
+    if (candidateInitialCharacters[char.charCodeAt(0)] === 0) {
+      i++;
+      while (i < source.length && isIdentPart(source[i]!)) i++;
+      continue;
+    }
+
     const start = i++;
     while (i < source.length && isIdentPart(source[i]!)) i++;
     const name = source.slice(start, i);
@@ -626,7 +665,6 @@ export function expandDeclarationMacros(
     if (!definition) continue;
 
     const column = start - lineStart;
-    if (isDeclarationScope && !isDeclarationScope(line, column)) continue;
     let args: string[] = [];
     let end = i;
     if (definition.parameters !== null) {
@@ -645,6 +683,12 @@ export function expandDeclarationMacros(
     const expanded = expandText(applied, expansionDefinitions, 1, stack);
     if (!looksLikeDeclaration(expanded) && !isStructuralExpansion(expanded)) continue;
     if (expanded.length > MAX_EXPANSION_BYTES) continue;
+    // Scope classification may build lexical executable ranges and query the
+    // raw AST. Delay that work until expansion has proven this invocation can
+    // actually create declaration syntax. The predicate is pure, so this
+    // preserves the accepted replacement set while avoiding expensive scope
+    // analysis for ordinary expression/statement macros.
+    if (isDeclarationScope && !isDeclarationScope(line, column)) continue;
 
     const original = source.slice(start, end);
     const newlineCount = (original.match(/\n/g) ?? []).length;
@@ -660,10 +704,16 @@ export function expandDeclarationMacros(
   if (replacements.length === 0) {
     return { source, invocationLines, expandedMacroNames };
   }
-  let expandedSource = source;
-  for (let index = replacements.length - 1; index >= 0; index--) {
-    const replacement = replacements[index]!;
-    expandedSource = expandedSource.slice(0, replacement.start) + replacement.text + expandedSource.slice(replacement.end);
+  // Replacements are collected in strictly increasing, non-overlapping source
+  // order because the scanner advances to each invocation's end. Assemble the
+  // result once instead of copying the full translation unit for every macro
+  // (O(source + output), rather than O(replacements * source)).
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const replacement of replacements) {
+    chunks.push(source.slice(cursor, replacement.start), replacement.text);
+    cursor = replacement.end;
   }
-  return { source: expandedSource, invocationLines, expandedMacroNames };
+  chunks.push(source.slice(cursor));
+  return { source: chunks.join(''), invocationLines, expandedMacroNames };
 }

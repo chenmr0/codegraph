@@ -347,6 +347,9 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
 
   const want = getCodeGraphPermissions();
   const before = [...settings.permissions.allow];
+  settings.permissions.allow = settings.permissions.allow.filter(
+    (perm: unknown) => typeof perm !== 'string' || !perm.startsWith('mcp__codegraph__codegraph_'),
+  );
   for (const perm of want) {
     if (!settings.permissions.allow.includes(perm)) {
       settings.permissions.allow.push(perm);

@@ -53,10 +53,16 @@ export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
 export const CODEGRAPH_INSTRUCTIONS_BLOCK = `${CODEGRAPH_SECTION_START}
 ## CodeGraph
 
-In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), use it to retrieve the smallest relevant code context before grep/find or file reads:
+
+The CodeGraph server publishes short raw names so Claude Code exposes the tools exactly as \`codegraph_search\`, \`codegraph_node\`, \`codegraph_context\`, and the other \`codegraph_*\` names below.
 
 - Find a symbol by name → \`codegraph_search\` (returns kind + location + signature).
-- Read a source FILE → \`codegraph_node\`  — faster than Read and with a one-line note of which files depend on it. Use it INSTEAD of Read for indexed source files.
+- Read a known symbol → \`codegraph_node(symbol=..., includeCode=true)\`.
+- Read 2–8 known symbols → ONE \`codegraph_context(targets=[...])\` call.
+- Known file but unknown symbol → \`codegraph_node(file=..., symbolsOnly=true, outlineQuery=optional)\`, then select or batch symbols.
+- Search literal strings/macros/registrations → ONE \`codegraph_text_search(queries=[...], path=...)\` call.
+- Non-symbol text / exact edit boundary only → \`codegraph_node(file=..., offset=..., limit<=120)\`. Bare/full-file MCP reads are rejected.
 - Who calls this / what does this call / what would changing this break → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`.
 - What's in a directory → \`codegraph_files\`.
 - No MCP client? The \`codegraph query\`, \`codegraph callers\`, \`codegraph callees\`, and \`codegraph impact\` shell commands print the same kind of answer.

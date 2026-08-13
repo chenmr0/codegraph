@@ -285,7 +285,7 @@ export class YamlCodec extends Codec {
   });
 
   it('skeletonizes off-spine polymorphic siblings (bodies elided, signatures kept)', async () => {
-    const result = await handler.execute('codegraph_explore', { query: QUERY, maxFiles: 12 });
+    const result = await handler.execute('explore', { query: QUERY, maxFiles: 12 });
     const text = result.content?.[0]?.text ?? '';
 
     // Precondition: the spine must have formed, or nothing skeletonizes.
@@ -306,7 +306,7 @@ export class YamlCodec extends Codec {
   });
 
   it('keeps the on-spine exemplar full even though it is a sibling', async () => {
-    const result = await handler.execute('codegraph_explore', { query: QUERY, maxFiles: 12 });
+    const result = await handler.execute('explore', { query: QUERY, maxFiles: 12 });
     const text = result.content?.[0]?.text ?? '';
 
     const section = sectionFor(text, 'logging-interceptor.ts');
@@ -317,7 +317,7 @@ export class YamlCodec extends Codec {
   });
 
   it('keeps a distinct step full (off-spine but supertype has < 3 implementers)', async () => {
-    const result = await handler.execute('codegraph_explore', { query: QUERY, maxFiles: 12 });
+    const result = await handler.execute('explore', { query: QUERY, maxFiles: 12 });
     const text = result.content?.[0]?.text ?? '';
 
     const section = sectionFor(text, 'response-formatter.ts');
@@ -329,7 +329,7 @@ export class YamlCodec extends Codec {
   it('CODEGRAPH_ADAPTIVE_EXPLORE=0 disables skeletonization (siblings render full)', async () => {
     process.env.CODEGRAPH_ADAPTIVE_EXPLORE = '0';
     try {
-      const result = await handler.execute('codegraph_explore', { query: QUERY, maxFiles: 12 });
+      const result = await handler.execute('explore', { query: QUERY, maxFiles: 12 });
       const text = result.content?.[0]?.text ?? '';
 
       expect(text, 'no file should be skeletonized with the flag off').not.toContain(SKELETON_MARK);
@@ -348,7 +348,7 @@ export class YamlCodec extends Codec {
   const SPARE_QUERY = `${QUERY} authenticate encode AuthInterceptor Codec JsonCodec`;
 
   it('spares an off-spine sibling when the agent NAMED a callable in it (RealCall fix)', async () => {
-    const result = await handler.execute('codegraph_explore', { query: SPARE_QUERY, maxFiles: 15 });
+    const result = await handler.execute('explore', { query: SPARE_QUERY, maxFiles: 15 });
     const text = result.content?.[0]?.text ?? '';
     expect(text).toContain('## Flow (call path among the symbols you queried)');
 
@@ -366,7 +366,7 @@ export class YamlCodec extends Codec {
   });
 
   it('collapses a base+subclasses family file to a FOCUSED view — base method body kept, non-named subclasses signature-only (compiler.py)', async () => {
-    const result = await handler.execute('codegraph_explore', { query: SPARE_QUERY, maxFiles: 15 });
+    const result = await handler.execute('explore', { query: SPARE_QUERY, maxFiles: 15 });
     const text = result.content?.[0]?.text ?? '';
 
     // codec.ts defines the base Codec (>=3 subclasses extend it) and co-locates the
@@ -388,7 +388,7 @@ export class YamlCodec extends Codec {
     // not a unique one. Naming it must NOT keep all five full (that floods the budget
     // — Django's `as_sql`×110). The off-spine siblings still collapse, and since none
     // defines the supertype, `intercept` doesn't even earn a body — pure skeleton.
-    const result = await handler.execute('codegraph_explore', { query: `${QUERY} intercept`, maxFiles: 12 });
+    const result = await handler.execute('explore', { query: `${QUERY} intercept`, maxFiles: 12 });
     const text = result.content?.[0]?.text ?? '';
 
     const bridge = sectionFor(text, 'bridge-interceptor.ts');

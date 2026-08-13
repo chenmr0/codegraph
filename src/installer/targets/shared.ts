@@ -36,14 +36,16 @@ export function getMcpServerConfig(): { type: string; command: string; args: str
  */
 export function getCodeGraphPermissions(): string[] {
   return [
-    'mcp__codegraph__codegraph_explore',
-    'mcp__codegraph__codegraph_search',
-    'mcp__codegraph__codegraph_node',
-    'mcp__codegraph__codegraph_callers',
-    'mcp__codegraph__codegraph_callees',
-    'mcp__codegraph__codegraph_impact',
-    'mcp__codegraph__codegraph_files',
-    'mcp__codegraph__codegraph_status',
+    'mcp__codegraph__explore',
+    'mcp__codegraph__search',
+    'mcp__codegraph__node',
+    'mcp__codegraph__context',
+    'mcp__codegraph__text_search',
+    'mcp__codegraph__callers',
+    'mcp__codegraph__callees',
+    'mcp__codegraph__impact',
+    'mcp__codegraph__files',
+    'mcp__codegraph__status',
   ];
 }
 

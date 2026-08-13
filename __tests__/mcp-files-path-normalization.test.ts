@@ -47,7 +47,7 @@ describe('codegraph_files path normalization', () => {
   });
 
   async function listed(pathFilter: string | undefined): Promise<string> {
-    const result = await handler.execute('codegraph_files', {
+    const result = await handler.execute('files', {
       ...(pathFilter !== undefined ? { path: pathFilter } : {}),
       format: 'flat',
       includeMetadata: false,

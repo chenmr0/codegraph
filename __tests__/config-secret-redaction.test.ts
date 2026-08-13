@@ -87,7 +87,7 @@ describe('config secret redaction (#383)', () => {
   });
 
   it('codegraph_explore surfaces the config key but NEVER the secret value', async () => {
-    const res = await handler.execute('codegraph_explore', {
+    const res = await handler.execute('explore', {
       query: 'DataConfig dbPass apiKey spring.datasource.password app.api.key',
     });
     const text = res.content.map((c) => c.text).join('\n');
@@ -96,7 +96,7 @@ describe('config secret redaction (#383)', () => {
   });
 
   it('codegraph_node includeCode returns the key, not the secret value', async () => {
-    const res = await handler.execute('codegraph_node', {
+    const res = await handler.execute('node', {
       symbol: 'spring.datasource.password',
       includeCode: true,
     });

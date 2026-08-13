@@ -30,8 +30,9 @@ describe('cpp-decl-def synthesizer', () => {
       .prepare(
         `SELECT s.name src_name, s.qualified_name src_qn, s.kind src_kind,
                 s.file_path src_path, s.start_line src_line, s.end_line src_endline,
+                s.signature src_signature,
                 t.name tgt_name, t.qualified_name tgt_qn, t.kind tgt_kind,
-                t.file_path tgt_path, t.start_line tgt_line,
+                t.file_path tgt_path, t.start_line tgt_line, t.signature tgt_signature,
                 e.provenance, json_extract(e.metadata,'$.synthesizedBy') synthBy,
                 json_extract(e.metadata,'$.registeredAt') registeredAt
          FROM edges e
@@ -224,7 +225,7 @@ int Stat::count() {
     expect(edge.tgt_path.endsWith('stat.h')).toBe(true);
   });
 
-  it('pairs overloaded methods — each definition links to every same-name declaration', async () => {
+  it('pairs overloaded methods by parameter list without cross-linking overloads', async () => {
     fs.writeFileSync(
       path.join(dir, 'ov.h'),
       `#pragma once
@@ -253,12 +254,119 @@ int Ov::init(int x) {
     const edges = definesEdges(db);
     cg.close?.();
 
-    // Both qualifiedNames collapse to Ov::init (signature not encoded), so
-    // both definitions link to both declarations — 2 defs × 2 decls = 4 edges.
+    // Both qualifiedNames collapse to Ov::init, but their indexed signatures
+    // distinguish the two overloads. Each definition must link only to its own
+    // declaration — not to every same-name declaration.
     const initEdges = edges.filter((e) => e.src_qn === 'Ov::init');
-    expect(initEdges.length).toBe(4);
+    expect(initEdges.length).toBe(2);
     // Every edge goes from a .cpp definition to a .h declaration.
     expect(initEdges.every((e) => e.src_path.endsWith('ov.cpp') && e.tgt_path.endsWith('ov.h'))).toBe(true);
+    const normalizedPairs = initEdges.map((e) => [e.src_signature, e.tgt_signature].join(' -> '));
+    expect(normalizedPairs.some((pair) => pair.includes('init()') && !pair.includes('init(int x)'))).toBe(true);
+    expect(normalizedPairs.some((pair) => pair.includes('init(int x) -> int init(int x)'))).toBe(true);
+  });
+
+  it('does not attach a no-arg definition to a declaration-only pointer overload', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'channel.h'),
+      `#pragma once
+struct Buffer {};
+class Channel {
+public:
+  int push(Buffer *buffer);
+  int push();
+};
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'channel.cpp'),
+      `#include "channel.h"
+int Channel::push() {
+  return 0;
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const pushEdges = definesEdges(db).filter((e) => e.src_qn === 'Channel::push');
+    cg.close?.();
+
+    expect(pushEdges).toHaveLength(1);
+    expect(pushEdges[0]!.src_signature).toContain('Channel::push()');
+    expect(pushEdges[0]!.tgt_signature).toBe('int push()');
+  });
+
+  it('rejects a parsed parameter mismatch even when only one node exists on each side', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'single.h'),
+      `#pragma once
+struct Buffer {};
+class Single {
+public:
+  int push(Buffer *buffer);
+};
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'single.cpp'),
+      `#include "single.h"
+int Single::push() {
+  return 0;
+}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const pushEdges = definesEdges(db).filter((e) => e.src_qn === 'Single::push');
+    cg.close?.();
+
+    expect(pushEdges).toHaveLength(0);
+  });
+
+  it('pairs OceanBase-style declarations after canonicalizing defaults, names, qualification, and callbacks', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'channel.h'),
+      `#pragma once
+#include <functional>
+namespace common { struct ObNewRow {}; }
+struct ObDtlMsg {};
+struct ObDtlLinkedBuffer {};
+struct ObVirtualChannelInfo {};
+class Channel {
+public:
+  int send(const ObDtlMsg &msg, long timeout_ts = 0, bool is_eof = false);
+  int get_row(ObVirtualChannelInfo &chan_info, common::ObNewRow *&row);
+  int send1(std::function<int(const ObDtlLinkedBuffer &buffer)> &proc, long timeout);
+  int push(ObDtlLinkedBuffer *buffer);
+};
+`,
+    );
+    fs.writeFileSync(
+      path.join(dir, 'channel.cpp'),
+      `#include "channel.h"
+using common::ObNewRow;
+int Channel::send(const ObDtlMsg &packet, long deadline, bool eof) { return eof ? 1 : 0; }
+int Channel::get_row(ObVirtualChannelInfo &info, ObNewRow *&result) { return result ? 1 : 0; }
+int Channel::send1(std::function<int(const ObDtlLinkedBuffer &)> &callback, long deadline) { return 0; }
+`,
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const channelEdges = definesEdges(db).filter((edge) =>
+      ['Channel::send', 'Channel::get_row', 'Channel::send1', 'Channel::push'].includes(edge.src_qn),
+    );
+    cg.close?.();
+
+    expect(channelEdges.filter((edge) => edge.src_qn === 'Channel::send')).toHaveLength(1);
+    expect(channelEdges.filter((edge) => edge.src_qn === 'Channel::get_row')).toHaveLength(1);
+    expect(channelEdges.filter((edge) => edge.src_qn === 'Channel::send1')).toHaveLength(1);
+    expect(channelEdges.some((edge) => edge.src_qn === 'Channel::push')).toBe(false);
   });
 
   it('does NOT pair inline definitions in the same file as their declaration', async () => {

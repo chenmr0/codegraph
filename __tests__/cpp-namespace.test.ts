@@ -55,7 +55,7 @@ describe('C++ namespace extraction & lookup', () => {
       )
       .all(sourceId) as any[];
   const text = async (args: Record<string, unknown>): Promise<string> =>
-    (await h.execute('codegraph_node', args)).content.map((c: any) => c.text).join('\n');
+    (await h.execute('node', args)).content.map((c: any) => c.text).join('\n');
 
   it('scopes a struct inside a named namespace (qn carries ns:: prefix)', async () => {
     await indexFiles({

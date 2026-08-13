@@ -1,9 +1,8 @@
 /**
- * codegraph_node FILE READ mode: a `file` with no `symbol` reads that file like
- * the Read tool — current source with `<n>\t<line>` numbering (byte-for-byte
- * Read's shape), narrowable with offset/limit — plus a one-line blast-radius
- * header. `symbolsOnly` returns the structural map instead. Config/data files
- * are summarized by key, never dumped (#383).
+ * Guarded codegraph_node MCP file mode. Agent calls must request either a
+ * structural outline (`symbolsOnly`) or an explicit source window of at most
+ * 120 lines. Bare/full-file requests and mixed symbol/file-window parameters
+ * are rejected before source reaches the model.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -12,7 +11,7 @@ import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
 
-describe('codegraph_node file-view (Read replacement)', () => {
+describe('codegraph_node guarded MCP file mode', () => {
   let dir: string;
   let cg: CodeGraph;
   let h: ToolHandler;
@@ -42,6 +41,16 @@ describe('codegraph_node file-view (Read replacement)', () => {
         Array.from({ length: 2000 }, (_, i) => `  const v${i} = ${i};`).join('\n') +
         '\n  return 0;\n}\n',
     );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'many.ts'),
+      Array.from({ length: 100 }, (_, i) => `export function fn${i}() { return ${i}; }`).join('\n') + '\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'large-class.ts'),
+      'export class LargeClass {\n' +
+        Array.from({ length: 75 }, (_, i) => `  method${i}() { return ${i}; }`).join('\n') +
+        '\n}\n',
+    );
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.properties'], exclude: [] } });
     await cg.indexAll();
     h = new ToolHandler(cg);
@@ -53,10 +62,18 @@ describe('codegraph_node file-view (Read replacement)', () => {
   });
 
   const text = async (args: Record<string, unknown>): Promise<string> =>
-    (await h.execute('codegraph_node', args)).content.map((c) => c.text).join('\n');
+    (await h.execute('node', args)).content.map((c) => c.text).join('\n');
 
-  it('reads a whole file like Read by default — `<n>\\t<line>` lines (no pad), imports + gaps included', async () => {
-    const out = await text({ file: 'b.ts' }); // no includeCode needed — content is the default
+  it('rejects a bare file instead of returning whole-file source', async () => {
+    const result = await h.execute('node', { file: 'b.ts' });
+    const out = result.content.map((c) => c.text).join('\n');
+    expect(result.isError).toBe(true);
+    expect(out).toMatch(/rejects bare|symbolsOnly/i);
+    expect(out).not.toContain('const SETTING = 7');
+  });
+
+  it('returns a bounded source window in Read-compatible numbered form', async () => {
+    const out = await text({ file: 'b.ts', offset: 1, limit: 7 });
     // Byte-for-byte Read shape: line 1 is "1<TAB>import …", NOT space-padded.
     expect(out).toMatch(/^1\timport \{ helper \} from '\.\/a';$/m);
     expect(out).toContain('// a comment between symbols'); // inter-symbol gap (Read has it; old reconstruction dropped it)
@@ -66,7 +83,7 @@ describe('codegraph_node file-view (Read replacement)', () => {
   });
 
   it('leads with a one-line blast-radius header (the value-add over Read)', async () => {
-    const out = await text({ file: 'a.ts' });
+    const out = await text({ file: 'a.ts', offset: 1, limit: 7 });
     expect(out).toMatch(/used by 1 file: src\/b\.ts/); // a.ts is imported by b.ts
     expect(out).toContain('return x + 1'); // still returns the source
   });
@@ -80,21 +97,30 @@ describe('codegraph_node file-view (Read replacement)', () => {
   });
 
   it('an offset past EOF is reported, not a crash', async () => {
-    const out = await text({ file: 'a.ts', offset: 9999 });
+    const out = await text({ file: 'a.ts', offset: 9999, limit: 10 });
     expect(out).toMatch(/past the end/i);
   });
 
-  it('paginates a large file honestly by default — "lines 1–N of TOTAL", never a silent truncate', async () => {
-    const out = await text({ file: 'big.ts' });
-    expect(out).toMatch(/lines 1[–-]\d+ of \d+/); // explicit window note
-    expect(out).not.toContain('(output truncated)'); // not the generic 15k chop
-    expect(out).toMatch(/^1\texport function big/m); // the head of the window is real source
+  it('rejects a partially bounded file window', async () => {
+    const onlyOffset = await h.execute('node', { file: 'big.ts', offset: 1 });
+    const onlyLimit = await h.execute('node', { file: 'big.ts', limit: 20 });
+    expect(onlyOffset.isError).toBe(true);
+    expect(onlyLimit.isError).toBe(true);
+    expect(onlyOffset.content[0]!.text).toMatch(/both offset and limit/i);
+    expect(onlyLimit.content[0]!.text).toMatch(/both offset and limit/i);
+  });
+
+  it('rejects file windows over 120 lines', async () => {
+    const result = await h.execute('node', { file: 'big.ts', offset: 1, limit: 121 });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/limited to 120 lines/i);
   });
 
   it('does NOT dump a config/data file (yaml/properties) — #383 secret safety', async () => {
-    const out = await text({ file: 'application.properties' });
+    const out = await text({ file: 'application.properties', symbolsOnly: true });
     expect(out).not.toContain('SUPERSECRET123'); // the value never reaches the agent
-    expect(out.toLowerCase()).toMatch(/config|values withheld/);
+    expect(out).toMatch(/symbols|indexed/i);
+    expect(out).not.toContain('server.port=8080');
   });
 
   it('symbolsOnly returns the structural map, not the source', async () => {
@@ -103,6 +129,116 @@ describe('codegraph_node file-view (Read replacement)', () => {
     expect(out).toContain('helper');
     expect(out).toContain('Widget');
     expect(out).not.toContain('return x + 1'); // bodies are NOT included in the map
+    expect(out).toMatch(/choose one symbol/i);
+    expect(out).not.toMatch(/drop `symbolsOnly`/i);
+  });
+
+  it('symbolsOnly reports dependent count without listing dependent paths', async () => {
+    const out = await text({ file: 'a.ts', symbolsOnly: true });
+    expect(out).toMatch(/used by 1 file/i);
+    expect(out).not.toContain('src/b.ts');
+  });
+
+  it('caps a large outline and tells the agent to filter instead of reading the file', async () => {
+    const out = await text({ file: 'many.ts', symbolsOnly: true });
+    expect(out).toContain('fn0');
+    expect(out).not.toContain('fn99');
+    expect(out).toMatch(/capped at 60 of 100/i);
+    expect(out).toMatch(/outlineQuery/i);
+    expect(out).toMatch(/do not read the file/i);
+  });
+
+  it('caps a directly requested large container instead of dumping every member', async () => {
+    const out = await text({ symbol: 'LargeClass', includeCode: true });
+    expect(out).toMatch(/Members \(75; showing 40\)/);
+    expect(out).toContain('method39');
+    expect(out).not.toContain('method74');
+    expect(out).toMatch(/35 more members omitted/);
+    expect(out).toMatch(/symbolsOnly=true.*outlineQuery/i);
+  });
+
+  it('auto-corrects copied file-outline knobs when an exact symbol is supplied', async () => {
+    const result = await h.execute('node', {
+      symbol: 'LargeClass',
+      file: 'large-class.ts',
+      symbolsOnly: true,
+      outlineQuery: 'method7',
+      outlineLimit: 5,
+    });
+    const out = result.content.map((c) => c.text).join('\n');
+    expect(result.isError).not.toBe(true);
+    expect(out).toMatch(/Automatically used symbol mode/i);
+    expect(out).toMatch(/Members \(75; showing 40\)/);
+    expect(out).not.toContain('method74');
+  });
+
+  it('filters an outline by symbol/signature substring', async () => {
+    const out = await text({
+      file: 'many.ts',
+      symbolsOnly: true,
+      outlineQuery: 'fn99',
+      outlineLimit: 5,
+    });
+    expect(out).toContain('fn99');
+    expect(out).not.toMatch(/`fn9`/);
+    expect(out).toMatch(/1 match outlineQuery="fn99"/i);
+  });
+
+  it('guards a non-selective outline filter instead of dumping most of the file', async () => {
+    const out = await text({
+      file: 'large-class.ts',
+      symbolsOnly: true,
+      outlineQuery: 'LargeClass',
+      outlineLimit: 50,
+    });
+    expect(out).toMatch(/query too broad/i);
+    expect(out).toMatch(/qualified\/container names/i);
+    expect(out).toMatch(/leaf symbol\/member token/i);
+    expect(out).toContain('method0');
+    expect(out).not.toContain('method39');
+    expect(out).not.toMatch(/capped at 50/i);
+  });
+
+  it('steers a partial file window away from pagination', async () => {
+    const out = await text({ file: 'big.ts', offset: 1, limit: 10 });
+    expect(out).toMatch(/do not.*next file window/i);
+    expect(out).not.toMatch(/pass `offset`\/`limit` for another range/i);
+  });
+
+  it('rejects includeCode in file mode', async () => {
+    const result = await h.execute('node', {
+      file: 'a.ts',
+      includeCode: true,
+      offset: 1,
+      limit: 5,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/includeCode is only valid in symbol mode/i);
+  });
+
+  it('rejects symbol mode mixed with file-window arguments', async () => {
+    const result = await h.execute('node', {
+      symbol: 'helper',
+      file: 'a.ts',
+      offset: 1,
+      limit: 5,
+      includeCode: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/symbol mode cannot use offset/i);
+    expect(result.content[0]!.text).toContain('Known symbol:');
+    expect(result.content[0]!.text).toContain('Unknown symbol in file:');
+  });
+
+  it('rejects symbolsOnly mixed with a source window', async () => {
+    const result = await h.execute('node', {
+      file: 'a.ts',
+      symbolsOnly: true,
+      offset: 1,
+      limit: 5,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/symbolsOnly cannot be combined/i);
   });
 
   it('still works as a normal symbol lookup (no regression)', async () => {
@@ -112,7 +248,7 @@ describe('codegraph_node file-view (Read replacement)', () => {
   });
 
   it('a miss returns a helpful message, not a crash', async () => {
-    const out = await text({ file: 'does-not-exist.ts' });
+    const out = await text({ file: 'does-not-exist.ts', symbolsOnly: true });
     expect(out).toMatch(/no indexed file matches/i);
   });
 });

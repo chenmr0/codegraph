@@ -46,6 +46,13 @@ const GENERATED_PATTERNS: ReadonlyArray<RegExp> = [
   /_pb2\.pyi$/,
   // C++ — protobuf
   /\.pb\.(cc|h)$/,
+  // OceanBase — inner-table schema chunks are emitted from
+  // ob_inner_table_schema_def.py by generate_inner_table_schema.py.
+  /(?:^|\/)ob_inner_table_schema\.\d+_\d+\.cpp$/,
+  /(?:^|\/)ob_inner_table_schema(?:_constants)?\.h$/,
+  /(?:^|\/)ob_inner_table_schema\.(?:vt|lob)\.cpp$/,
+  /(?:^|\/)ob_inner_table_schema_misc\.ipp$/,
+  /(?:^|\/)ob_load_inner_table_schema\.cpp$/,
   // C# — protobuf / gRPC (protoc-gen-csharp puts output under obj/ but
   // many projects also commit *.g.cs and *Grpc.cs siblings)
   /\.g\.cs$/,

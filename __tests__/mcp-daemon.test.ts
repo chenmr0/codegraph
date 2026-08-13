@@ -289,6 +289,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     const toolsResp = await waitFor(() => findResponse(second.stdout, 2), 10000);
     expect(Array.isArray(toolsResp.result.tools)).toBe(true);
     expect(toolsResp.result.tools.length).toBeGreaterThan(0);
+    const rawNames = toolsResp.result.tools.map((tool: { name: string }) => tool.name);
+    expect(rawNames).toContain('node');
+    expect(rawNames).toContain('context');
+    expect(rawNames.some((name: string) => name.startsWith('codegraph_'))).toBe(false);
   }, 45000);
 
   it('CODEGRAPH_NO_DAEMON=1 keeps each process independent (no socket/pidfile)', async () => {
@@ -417,7 +421,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot)!;
 
     // A warm call goes through the daemon.
-    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    sendMessage(server.child, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'status', arguments: {} } });
     await waitFor(() => findResponse(server.stdout, 2), 10000);
 
     // Kill the daemon out from under the live proxy.
@@ -427,7 +431,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     // The proxy must still be alive and still answer — served in-process now.
     expect(isAlive(server.child.pid!)).toBe(true);
     await waitFor(() => server.stderr.some((l) => l.includes('serving this session in-process')), 8000);
-    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'codegraph_status', arguments: {} } });
+    sendMessage(server.child, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'status', arguments: {} } });
     const resp = await waitFor(() => findResponse(server.stdout, 3), 15000);
     expect(resp.result !== undefined || resp.error !== undefined).toBe(true);
     expect(isAlive(server.child.pid!)).toBe(true);

@@ -1032,7 +1032,24 @@ describe('Installer targets — partial-state idempotency', () => {
     // The unrelated GitKraken hook survives untouched.
     expect(stopCommands.some((c: string) => c.includes('gk') && c.includes('ai hook run'))).toBe(true);
     // Permissions still written as normal alongside the cleanup.
-    expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
+    expect(after.permissions?.allow).toContain('mcp__codegraph__search');
+    expect(after.permissions?.allow).not.toContain('mcp__codegraph__codegraph_search');
+  });
+
+  it('claude: install migrates double-prefixed MCP permissions to short raw tool permissions', () => {
+    const claude = getTarget('claude')!;
+    const file = seedSettings('global', {
+      permissions: {
+        allow: ['mcp__codegraph__codegraph_node', 'mcp__other__keep'],
+      },
+    });
+
+    claude.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.permissions.allow).toContain('mcp__codegraph__node');
+    expect(after.permissions.allow).not.toContain('mcp__codegraph__codegraph_node');
+    expect(after.permissions.allow).toContain('mcp__other__keep');
   });
 
   it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {

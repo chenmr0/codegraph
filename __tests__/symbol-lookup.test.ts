@@ -183,7 +183,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
   it('codegraph_node with a `file` hint pins an overloaded name to that file', async () => {
     // `run` is defined in BOTH stage_apply.rs and stage_detect.rs. A bare lookup
     // returns both; the `file` hint narrows to the one the caller saw in a trail.
-    const res = await handler.execute('codegraph_node', {
+    const res = await handler.execute('node', {
       symbol: 'run',
       includeCode: true,
       file: 'stage_detect.rs',
@@ -240,7 +240,7 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     // `request` is BOTH a method (Session.request) and a free function. The old
     // behavior returned one + a dead-end "Others:" note, forcing a Read to get
     // the other overload; now both bodies come back in one call.
-    const res = await handler.execute('codegraph_node', { symbol: 'request', includeCode: true });
+    const res = await handler.execute('node', { symbol: 'request', includeCode: true });
     const text = res.content?.[0]?.text ?? '';
     expect(text).toContain('3 definitions named "request"');
     // All definitions are rendered (two methods + function), each with a Location.

@@ -749,7 +749,8 @@ export class TreeSitterExtractor {
   private parserOverride: WasmParser | null = null;
   /** Original source bytes, retained for X-macro analysis before pre-parse transforms. */
   private originalSource: string;
-  private originalLineStarts: number[] = [0];
+  /** Built only when a declaration-shaped macro needs source line mapping. */
+  private originalLineStarts: number[] | null = null;
   private lexicalCompoundEnds: Map<number, number> = new Map();
   private lexicalExecutableRanges: SourceRange[] | null = null;
   /** Proven self-including X-macro enum constructs found before parsing. */
@@ -766,9 +767,6 @@ export class TreeSitterExtractor {
   ) {
     this.filePath = filePath;
     this.originalSource = source;
-    for (let i = 0; i < source.length; i++) {
-      if (source[i] === '\n') this.originalLineStarts.push(i + 1);
-    }
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
@@ -1110,7 +1108,7 @@ export class TreeSitterExtractor {
    */
   private isDeclarationMacroScope(line: number, column: number): boolean {
     if (!this.tree) return false;
-    const sourceOffset = (this.originalLineStarts[Math.max(0, line - 1)] ?? 0) + column;
+    const sourceOffset = this.originalLineStart(line) + column;
     if ((this.language === 'c' || this.language === 'cpp')
       && this.isInsideLexicalExecutableBody(sourceOffset)) return false;
     let current = this.tree.rootNode.descendantForPosition({
@@ -1128,6 +1126,18 @@ export class TreeSitterExtractor {
       current = current.parent;
     }
     return true;
+  }
+
+  /** Map a 1-indexed line to its byte offset, building the table on first use. */
+  private originalLineStart(line: number): number {
+    if (this.originalLineStarts === null) {
+      const starts = [0];
+      for (let i = 0; i < this.originalSource.length; i++) {
+        if (this.originalSource[i] === '\n') starts.push(i + 1);
+      }
+      this.originalLineStarts = starts;
+    }
+    return this.originalLineStarts[Math.max(0, line - 1)] ?? 0;
   }
 
   /**
@@ -1259,6 +1269,7 @@ export class TreeSitterExtractor {
       const source = this.originalSource;
       const ranges: SourceRange[] = [];
       const stack: Array<{ executable: boolean; start: number }> = [];
+      let executableDepth = 0;
       let segmentStart = 0;
       let parenDepth = 0;
       let bracketDepth = 0;
@@ -1288,17 +1299,20 @@ export class TreeSitterExtractor {
         else if (char === '[') bracketDepth++;
         else if (char === ']' && bracketDepth > 0) bracketDepth--;
         else if (char === '{' && parenDepth === 0 && bracketDepth === 0) {
-          const parentExecutable = stack.some(entry => entry.executable);
+          const parentExecutable = executableDepth > 0;
           const context = source.slice(segmentStart, i).trim();
           const declarationContainer = /\b(?:namespace|class|struct|union|enum)\b[\s\S]*$/.test(context);
           const callableHeader = /\)[\s\S]*(?:const|volatile|noexcept|override|final|requires|->|:)?\s*$/.test(context)
             || /\][\s\S]*(?:\([^)]*\))?\s*$/.test(context);
-          stack.push({ executable: parentExecutable || (!declarationContainer && callableHeader), start: i });
+          const executable = parentExecutable || (!declarationContainer && callableHeader);
+          stack.push({ executable, start: i });
+          if (executable) executableDepth++;
           segmentStart = i + 1;
         } else if (char === '}' && parenDepth === 0 && bracketDepth === 0) {
           const entry = stack.pop();
-          if (entry?.executable && !stack.some(parent => parent.executable)) {
-            ranges.push({ start: entry.start + 1, end: i });
+          if (entry?.executable) {
+            executableDepth--;
+            if (executableDepth === 0) ranges.push({ start: entry.start + 1, end: i });
           }
           segmentStart = i + 1;
         } else if (char === ';' && parenDepth === 0 && bracketDepth === 0) {
@@ -1307,7 +1321,18 @@ export class TreeSitterExtractor {
       }
       this.lexicalExecutableRanges = ranges;
     }
-    return this.lexicalExecutableRanges.some(range => offset >= range.start && offset < range.end);
+    // Top-level executable ranges are disjoint and appended in source order.
+    // Locate the first range whose end is after the offset instead of scanning
+    // every function body for every declaration-macro candidate.
+    let low = 0;
+    let high = this.lexicalExecutableRanges.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (this.lexicalExecutableRanges[mid]!.end <= offset) low = mid + 1;
+      else high = mid;
+    }
+    const range = this.lexicalExecutableRanges[low];
+    return !!range && offset >= range.start && offset < range.end;
   }
 
   private lexicalCompoundEnd(start: number): number {
