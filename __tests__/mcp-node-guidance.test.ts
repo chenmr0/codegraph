@@ -14,21 +14,36 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(tool.description).not.toMatch(/use it whenever you would Read/i);
   });
 
-  it('publishes the 120-line limit in the JSON schema', () => {
+  it('publishes bounded file-window guidance without schema-rejecting an auto-correctable request', () => {
     const properties = nodeTool().inputSchema.properties;
     expect(properties.limit?.minimum).toBe(1);
-    expect(properties.limit?.maximum).toBe(120);
+    expect(properties.limit?.maximum).toBeUndefined();
+    expect(properties.limit?.description).toMatch(/safely clamped to 120/i);
     expect(properties.offset?.minimum).toBe(1);
     expect(properties.outlineLimit?.maximum).toBe(80);
   });
 
   it('publishes bounded batch-context and literal-search schemas', () => {
+    const search = getStaticTools().find((tool) => tool.name === 'search')!;
     const context = getStaticTools().find((tool) => tool.name === 'context')!;
     const textSearch = getStaticTools().find((tool) => tool.name === 'text_search')!;
+    expect(search.inputSchema.properties.includeCode?.enum).toEqual(['never', 'if_unique']);
+    expect(search.inputSchema.properties.signature?.type).toBe('string');
     expect(context.inputSchema.properties.targets?.minItems).toBe(1);
     expect(context.inputSchema.properties.targets?.maxItems).toBe(8);
+    expect(context.description).toMatch(/members.*offset.*text/i);
     expect(textSearch.inputSchema.properties.queries?.maxItems).toBe(8);
     expect(textSearch.inputSchema.required).toEqual(['queries', 'path']);
+  });
+
+  it('publishes exact overload hints for every relationship tool', () => {
+    for (const name of ['callers', 'callees', 'impact']) {
+      const tool = getStaticTools().find((candidate) => candidate.name === name)!;
+      expect(tool.inputSchema.properties.file?.type).toBe('string');
+      expect(tool.inputSchema.properties.line?.minimum).toBe(1);
+      expect(tool.inputSchema.properties.signature?.type).toBe('string');
+      expect(tool.description).toMatch(/no graph traversal|no impact traversal/i);
+    }
   });
 
   it('keeps server instructions aligned with runtime guards', () => {
@@ -36,7 +51,11 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(SERVER_INSTRUCTIONS).toContain('{ file, offset, limit<=120 }');
     expect(SERVER_INSTRUCTIONS).toMatch(/rejects bare\/full-file reads/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_context` call/i);
+    expect(SERVER_INSTRUCTIONS).toContain('includeCode: "if_unique"');
+    expect(SERVER_INSTRUCTIONS).toMatch(/selected container.*text.*file windows/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_text_search` call/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/file.*line.*signature/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/do not aggregate/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate file windows/i);
     expect(SERVER_INSTRUCTIONS).not.toMatch(/any time you'd use the `Read` tool/i);
   });
@@ -45,8 +64,11 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('symbolsOnly=true');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('limit<=120');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_context');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('includeCode="if_unique"');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_text_search');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/file.*line.*signature/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/refuse to aggregate distinct overloads/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).not.toContain('codegraph_codegraph_node');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/Bare\/full-file MCP reads are rejected/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).not.toMatch(/Use it INSTEAD of Read/i);

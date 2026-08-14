@@ -16,19 +16,20 @@ Claude Code namespaces them with the server name, so invoke the host-visible
 
 ## Route by what you know
 
-- Known symbol location/signature → \`codegraph_search\` (pass a symbol name, not a natural-language question).
-- Known symbol implementation → \`codegraph_node\` with \`symbol\` and \`includeCode: true\`; add \`file\`/\`line\` only to disambiguate.
-- Two to eight known implementations → ONE \`codegraph_context\` call with exact \`targets\`; do not loop \`codegraph_node\`. Its default output omits repetitive relation trails.
-- Callers/callees/change impact → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`.
+- Known symbol/location/signature → \`codegraph_search\` (pass a symbol name or callable signature, not a natural-language question). If its implementation is also needed, set \`includeCode: "if_unique"\`; one logical result returns source immediately, while ambiguity remains safe and source-free.
+- One known implementation after an ambiguous search → \`codegraph_node\` with \`symbol\` and \`includeCode: true\`; add \`file\`/\`line\` only to disambiguate.
+- Several precise implementation needs → ONE \`codegraph_context\` call; mix exact symbols, selected container \`members\`, exact-file \`text\` anchors, and exact file windows in up to eight \`targets\`. Same-file ranges are merged and relation trails are omitted by default. Do not loop \`codegraph_node\` or issue overlapping windows.
+- Callers/callees/change impact → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`. For overloaded or same-named symbols, pass \`file\` + \`line\` or \`signature\`; relationship tools do not aggregate distinct overloads and return exact candidates when still ambiguous.
 - Known directory, unknown file → \`codegraph_files\`.
 - Known file, unknown symbol → \`codegraph_node\` with \`file\` and \`symbolsOnly: true\`; add \`outlineQuery\` when a partial name is known, then choose or batch returned symbols.
 - Literal strings/macros/registrations/table names → ONE \`codegraph_text_search\` call with several \`queries\` and a narrow required \`path\`; do not repeat its results with Grep. Generated files are skipped unless explicitly requested.
-- Non-symbol text or a missing edit boundary → a bounded \`codegraph_node\` file window with both \`offset\` and \`limit\` (maximum 120 lines).
+- Non-symbol text or a missing edit boundary → a bounded \`codegraph_node\` file window with both \`offset\` and \`limit\` (requests above 120 are safely clamped). Batch several boundaries/anchors with \`codegraph_context\` instead.
 
 ## codegraph_node file guard
 
 MCP file mode intentionally rejects bare/full-file reads. Its only valid forms
-are \`{ file, symbolsOnly: true }\` and \`{ file, offset, limit<=120 }\`.
+are \`{ file, symbolsOnly: true }\` and \`{ file, offset, limit<=120 }\` (a larger
+runtime limit is automatically clamped rather than failing).
 Do not combine \`symbol\` with \`offset\`/\`limit\`; \`includeCode\` is symbol-mode
 only. Prefer a symbol over a file window whenever the target can be named.
 Do not paginate file windows. A window footer means switch to a symbol/context

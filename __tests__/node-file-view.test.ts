@@ -1,8 +1,9 @@
 /**
  * Guarded codegraph_node MCP file mode. Agent calls must request either a
- * structural outline (`symbolsOnly`) or an explicit source window of at most
- * 120 lines. Bare/full-file requests and mixed symbol/file-window parameters
- * are rejected before source reaches the model.
+ * structural outline (`symbolsOnly`) or an explicit source window capped at
+ * 120 lines. Oversized requests are corrected in-place; bare/full-file reads
+ * and mixed symbol/file-window parameters are rejected before source reaches
+ * the model.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -82,9 +83,11 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).not.toContain('```'); // Read has no code fence; neither do we
   });
 
-  it('leads with a one-line blast-radius header (the value-add over Read)', async () => {
+  it('keeps repeated dependency paths out of file-window output', async () => {
     const out = await text({ file: 'a.ts', offset: 1, limit: 7 });
-    expect(out).toMatch(/used by 1 file: src\/b\.ts/); // a.ts is imported by b.ts
+    expect(out).toMatch(/lines 1[–-]7 of 7/i);
+    expect(out).not.toMatch(/used by/i);
+    expect(out).not.toContain('src/b.ts');
     expect(out).toContain('return x + 1'); // still returns the source
   });
 
@@ -110,10 +113,13 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(onlyLimit.content[0]!.text).toMatch(/both offset and limit/i);
   });
 
-  it('rejects file windows over 120 lines', async () => {
-    const result = await h.execute('node', { file: 'big.ts', offset: 1, limit: 121 });
-    expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/limited to 120 lines/i);
+  it('auto-clamps file windows over 120 lines instead of requiring a correction call', async () => {
+    const result = await h.execute('node', { file: 'big.ts', offset: 1, limit: 145 });
+    const out = result.content.map((item) => item.text).join('\n');
+    expect(result.isError).not.toBe(true);
+    expect(out).toMatch(/Requested 145 lines; safely clamped to 120/i);
+    expect(out).toMatch(/^120\t/m);
+    expect(out).not.toMatch(/^121\t/m);
   });
 
   it('does NOT dump a config/data file (yaml/properties) — #383 secret safety', async () => {

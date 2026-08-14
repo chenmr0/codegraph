@@ -57,13 +57,13 @@ In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the 
 
 The CodeGraph server publishes short raw names so Claude Code exposes the tools exactly as \`codegraph_search\`, \`codegraph_node\`, \`codegraph_context\`, and the other \`codegraph_*\` names below.
 
-- Find a symbol by name → \`codegraph_search\` (returns kind + location + signature).
+- Find a symbol by name/signature → \`codegraph_search\`; add \`includeCode="if_unique"\` when a unique result should include source immediately.
 - Read a known symbol → \`codegraph_node(symbol=..., includeCode=true)\`.
-- Read 2–8 known symbols → ONE \`codegraph_context(targets=[...])\` call.
+- Batch precise context → ONE \`codegraph_context(targets=[...])\` call (1–8 exact symbols, selected container \`members\`, exact-file \`text\` anchors, or file windows; overlapping ranges are merged).
 - Known file but unknown symbol → \`codegraph_node(file=..., symbolsOnly=true, outlineQuery=optional)\`, then select or batch symbols.
 - Search literal strings/macros/registrations → ONE \`codegraph_text_search(queries=[...], path=...)\` call.
-- Non-symbol text / exact edit boundary only → \`codegraph_node(file=..., offset=..., limit<=120)\`. Bare/full-file MCP reads are rejected.
-- Who calls this / what does this call / what would changing this break → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`.
+- Non-symbol text / exact edit boundary only → \`codegraph_node(file=..., offset=..., limit<=120)\`; larger limits are auto-clamped. Bare/full-file MCP reads are rejected.
+- Who calls this / what does this call / what would changing this break → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`. For overloaded/same-named symbols, pass \`file\` + \`line\` or \`signature\`; these tools refuse to aggregate distinct overloads.
 - What's in a directory → \`codegraph_files\`.
 - No MCP client? The \`codegraph query\`, \`codegraph callers\`, \`codegraph callees\`, and \`codegraph impact\` shell commands print the same kind of answer.
 
