@@ -22,7 +22,12 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { NODE_KINDS } from '../types';
-import { isNaturalLanguageQuery, isTestFile, normalizeNameToken } from '../search/query-utils';
+import {
+  isDistinctiveIdentifier,
+  isNaturalLanguageQuery,
+  isTestFile,
+  normalizeNameToken,
+} from '../search/query-utils';
 import {
   existsSync,
   readFileSync,
@@ -64,16 +69,22 @@ const MCP_NODE_CONTAINER_OUTLINE_SYMBOLS = 40;
 const MCP_CONTEXT_MAX_TARGETS = 8;
 const MCP_CONTEXT_MAX_OUTPUT_CHARS = 20_000;
 const MCP_CONTEXT_MAX_CHARS_PER_TARGET = 8_000;
-const MCP_CONTEXT_MAX_MEMBERS = 16;
+const MCP_CONTEXT_MAX_MEMBERS = 32;
+const MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_PER_FILE = 24;
+const MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_TOTAL = 80;
 const MCP_CONTEXT_MAX_FILE_WINDOW_LINES = 240;
 const MCP_CONTEXT_MAX_TEXT_CONTEXT_LINES = 60;
 const MCP_CONTEXT_MAX_TEXT_MATCHES = 3;
+const MCP_CONTEXT_BROAD_FILE_TARGETS = 3;
+const MCP_CONTEXT_BROAD_FILE_LINES = 360;
 
 /** Literal text search is intentionally narrow and source-only. */
 const MCP_TEXT_SEARCH_MAX_QUERIES = 8;
 const MCP_TEXT_SEARCH_MAX_MATCHES_PER_QUERY = 20;
 const MCP_TEXT_SEARCH_MAX_CONTEXT_LINES = 2;
 const MCP_TEXT_SEARCH_MAX_SCANNED_BYTES = 64 * 1024 * 1024;
+const MCP_TEXT_SEARCH_MAX_SYMBOL_RECOVERIES = 2;
+const MCP_TEXT_SEARCH_MAX_SYMBOL_RECOVERY_CHARS = 4_000;
 
 /**
  * Maximum length for free-form string inputs (query, task, symbol).
@@ -318,6 +329,19 @@ function parseCallableLookup(value: string): { symbol: string; signature?: strin
   return { symbol: match[1]!, signature: value };
 }
 
+/** High-confidence symbol-shaped literal accidentally sent to text_search. */
+function isIdentifierLikeTextQuery(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || /[\\/]/.test(trimmed) || /\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|ts|tsx|js|jsx|py|go|rs|java|cs)$/i.test(trimmed)) {
+    return false;
+  }
+  const parsed = parseCallableLookup(trimmed);
+  const symbol = parsed.symbol;
+  if (!/^[~A-Za-z_$][\w$~]*(?:(?:::|\.)[~A-Za-z_$][\w$~]*)*$/.test(symbol)) return false;
+  const leaf = symbol.replace(/[.]/g, '::').split('::').filter(Boolean).at(-1) ?? symbol;
+  return Boolean(parsed.signature) || /::|\./.test(symbol) || isDistinctiveIdentifier(leaf);
+}
+
 /**
  * Per-file staleness banner emitted at the top of a tool response when the
  * file watcher has pending events for files referenced by the response.
@@ -399,6 +423,8 @@ interface ContextSymbolTarget {
 interface ContextFileTarget {
   mode: 'file';
   file: string;
+  outline: boolean;
+  outlineLimit?: number;
   offset?: number;
   limit?: number;
   text?: string;
@@ -417,6 +443,15 @@ interface ContextFileRange {
   start: number;
   end: number;
   labels: string[];
+}
+
+interface ContextSectionCandidate {
+  label: string;
+  section: string;
+  estimatedChars: number;
+  targetIndexes: Set<number>;
+  file?: ResolvedIndexedFile;
+  ranges?: ContextFileRange[];
 }
 
 type RelationshipTargetResolution =
@@ -504,18 +539,18 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'context',
-    description: 'Read 1–8 precise implementation targets in ONE bounded call. Targets may be exact symbols, selected `members` of a known container, an exact indexed-file window (`file` + `offset` + `limit<=240`), or a literal anchor in one exact file (`file` + `text`). File ranges are merged and deduplicated across targets. Symbol overloads are never silently guessed. This is precise batching, not fuzzy task exploration.',
+    description: 'Read 1–8 implementation targets in ONE bounded call. Targets may be exact symbols, selected `members` of a known container, an exact indexed-file window (`file` + `offset` + `limit<=240`; offset defaults to 1 when only limit is supplied), a literal anchor in one exact file (`file` + `text`), or a bare `{file}` which automatically returns a compact symbol outline instead of failing or dumping source. A JSON-stringified targets array is parsed automatically. File ranges are merged and deduplicated across targets. A multi-file window request that is likely to become batch-Read or exceed the output budget returns a compact symbol preflight instead of dumping partial source. Symbol overloads are never silently guessed.',
     inputSchema: {
       type: 'object',
       properties: {
         targets: {
           type: 'array',
-          description: 'One to eight precise symbol/member/file-window/text-anchor targets. Adjacent or overlapping ranges in the same file are merged.',
+          description: 'One to eight symbol/member/file-window/text-anchor targets. A bare `{file}` becomes a compact outline. Runtime also accepts a JSON-stringified array and parses it automatically. Adjacent or overlapping ranges in the same file are merged.',
           minItems: 1,
           maxItems: MCP_CONTEXT_MAX_TARGETS,
           items: {
             type: 'object',
-            description: 'Choose symbol mode (`symbol`, optional hints/members) OR file mode (`file` with offset+limit or text).',
+            description: 'Choose symbol mode (`symbol`, optional hints/members) OR file mode (`file` alone for an outline, or with offset+limit/text for source).',
             properties: {
               symbol: {
                 type: 'string',
@@ -523,7 +558,7 @@ export const tools: ToolDefinition[] = [
               },
               file: {
                 type: 'string',
-                description: 'Optional path/basename to disambiguate this symbol.',
+                description: 'Path/basename. With a symbol it disambiguates; by itself it automatically returns a compact symbol outline.',
               },
               line: {
                 type: 'number',
@@ -536,14 +571,14 @@ export const tools: ToolDefinition[] = [
               },
               members: {
                 type: 'array',
-                description: 'Symbol mode: 1–16 exact member names inside the named container. Returns their current source ranges together instead of the whole container outline.',
+                description: 'Symbol mode: 1–32 exact member names inside the named container. Returns declarations and matching out-of-line definitions together, bounded by the existing context output budget.',
                 minItems: 1,
                 maxItems: MCP_CONTEXT_MAX_MEMBERS,
                 items: { type: 'string', description: 'Exact member name inside the container.' },
               },
               offset: {
                 type: 'number',
-                description: 'File mode: 1-based exact source-window start; requires limit.',
+                description: 'File mode: 1-based exact source-window start; requires limit. When limit is supplied alone, offset safely defaults to 1.',
                 minimum: 1,
               },
               limit: {
@@ -584,7 +619,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'text_search',
-    description: 'Batch literal-text search over indexed source files for strings the AST graph does not model (macros, registration strings, table names, generated-code markers). Requires a narrow directory/file `path`; searches 1–8 literals in one call and returns small line snippets. Use `codegraph_search` instead for symbol names. Generated files are skipped by default.',
+    description: 'Batch literal-text search over indexed source files for strings the AST graph does not model (macros, registration strings, table names, generated-code markers). Requires a narrow directory/file `path`; searches 1–8 literals in one call and returns small line snippets. Zero-match identifier-like queries automatically include exact global symbol results, avoiding a correction call. Generated files are skipped by default, except when `path` resolves to one exact generated file and includeGenerated was not explicitly disabled.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -623,7 +658,7 @@ export const tools: ToolDefinition[] = [
         },
         includeGenerated: {
           type: 'boolean',
-          description: 'Also search generated source files (default: false). Keep false when a hand-written schema/source definition exists.',
+          description: 'Also search generated source files. Directory searches default to false; one exact generated-file path is auto-included unless this is explicitly false.',
           default: false,
         },
         projectPath: projectPathProperty,
@@ -738,7 +773,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'node',
-    description: 'Read the smallest useful code context. Prefer SYMBOL MODE whenever a function, method, class, struct, enum, or other symbol can be named: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`. When 2–8 symbols are already known, use `codegraph_context` instead of looping this tool. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery`; use an explicit `offset` + `limit` (maximum 120) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
+    description: 'Read the smallest useful code context. Prefer SYMBOL MODE whenever a function, method, class, struct, enum, or other symbol can be named: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`. When 2–8 symbols are already known, use `codegraph_context` instead of looping this tool. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery`; copied offset/limit fields are ignored in that explicit outline mode. Use an explicit `offset` + `limit` (maximum 120) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -771,7 +806,7 @@ export const tools: ToolDefinition[] = [
         },
         symbolsOnly: {
           type: 'boolean',
-          description: 'File mode: return a compact symbol map + dependents. This is the default entry when a file is known but its target symbol is not.',
+          description: 'File mode: return a compact symbol map + dependents. This is the default entry when a file is known but its target symbol is not. If offset/limit were also copied into the call, they are ignored and the outline still succeeds.',
           default: false,
         },
         outlineQuery: {
@@ -1507,16 +1542,51 @@ export class ToolHandler {
    * deliberately omits repetitive relation trails unless explicitly requested.
    */
   private async handleContext(args: Record<string, unknown>): Promise<ToolResult> {
-    if (!Array.isArray(args.targets)) {
+    const corrections: string[] = [];
+    let rawTargetsValue = args.targets;
+    if (typeof rawTargetsValue === 'string') {
+      if (rawTargetsValue.length > 32_000) {
+        return this.errorResult('targets JSON string is too long');
+      }
+      const source = rawTargetsValue.trim();
+      let parsed: unknown;
+      let repaired = false;
+      try {
+        parsed = JSON.parse(source);
+      } catch {
+        // Common tool-serialization typo observed in OpenCode/GLM output:
+        // `[{"file":"x", offset":1}]`. Repair only an unquoted identifier
+        // key that still has its closing quote, then require valid JSON.
+        const repairedSource = source.replace(
+          /([,{]\s*)([A-Za-z_$][\w$]*)"\s*:/g,
+          '$1"$2":',
+        );
+        if (repairedSource !== source) {
+          try {
+            parsed = JSON.parse(repairedSource);
+            repaired = true;
+          } catch { /* handled below */ }
+        }
+      }
+      if (!Array.isArray(parsed)) {
+        return this.errorResult('targets must be an array of 1 to 8 precise symbol or file objects; a JSON string is accepted only when it decodes to that array');
+      }
+      rawTargetsValue = parsed;
+      corrections.push(repaired
+        ? 'parsed JSON-stringified targets and repaired a missing opening quote on an object key'
+        : 'parsed JSON-stringified targets');
+    }
+    if (!Array.isArray(rawTargetsValue)) {
       return this.errorResult('targets must be an array of 1 to 8 precise symbol or file objects');
     }
-    if (args.targets.length < 1 || args.targets.length > MCP_CONTEXT_MAX_TARGETS) {
+    const rawTargets = rawTargetsValue;
+    if (rawTargets.length < 1 || rawTargets.length > MCP_CONTEXT_MAX_TARGETS) {
       return this.errorResult(`targets must contain 1 to ${MCP_CONTEXT_MAX_TARGETS} precise requests`);
     }
 
     const targets: ContextTarget[] = [];
-    for (let i = 0; i < args.targets.length; i++) {
-      const raw = args.targets[i];
+    for (let i = 0; i < rawTargets.length; i++) {
+      const raw = rawTargets[i];
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
         return this.errorResult(`targets[${i}] must be an object`);
       }
@@ -1585,12 +1655,19 @@ export class ToolHandler {
         : this.validateString(target.text, `targets[${i}].text`, 1024);
       if (textValue !== undefined && typeof textValue !== 'string') return textValue;
       const text = textValue?.trim() || undefined;
-      const hasWindow = target.offset !== undefined || target.limit !== undefined;
+      let effectiveOffset = target.offset;
+      const effectiveLimit = target.limit;
+      if (!text && effectiveOffset === undefined && effectiveLimit !== undefined) {
+        effectiveOffset = 1;
+        corrections.push(`targets[${i}]: defaulted missing file-window offset to 1`);
+      }
+      const hasWindow = effectiveOffset !== undefined || effectiveLimit !== undefined;
       if (text && hasWindow) return this.errorResult(`targets[${i}] cannot combine text with offset/limit`);
-      if (!text && !hasWindow) return this.errorResult(`targets[${i}] file mode requires text or both offset and limit`);
+      const outline = !text && !hasWindow;
+      if (outline) corrections.push(`targets[${i}]: treated bare file as a compact symbol outline`);
       if (hasWindow &&
-          (typeof target.offset !== 'number' || !Number.isInteger(target.offset) || target.offset < 1 ||
-           typeof target.limit !== 'number' || !Number.isInteger(target.limit) || target.limit < 1)) {
+          (typeof effectiveOffset !== 'number' || !Number.isInteger(effectiveOffset) || effectiveOffset < 1 ||
+           typeof effectiveLimit !== 'number' || !Number.isInteger(effectiveLimit) || effectiveLimit < 1)) {
         return this.errorResult(`targets[${i}] requires positive integer offset and limit`);
       }
       if (target.contextLines !== undefined &&
@@ -1604,23 +1681,35 @@ export class ToolHandler {
       targets.push({
         mode: 'file',
         file: fileText,
-        offset: target.offset as number | undefined,
-        limit: target.limit === undefined
+        outline,
+        offset: effectiveOffset as number | undefined,
+        limit: effectiveLimit === undefined
           ? undefined
-          : Math.min(target.limit as number, MCP_CONTEXT_MAX_FILE_WINDOW_LINES),
+          : Math.min(effectiveLimit as number, MCP_CONTEXT_MAX_FILE_WINDOW_LINES),
         text,
         contextLines: clamp((target.contextLines as number | undefined) ?? 20, 0, MCP_CONTEXT_MAX_TEXT_CONTEXT_LINES),
         maxMatches: clamp((target.maxMatches as number | undefined) ?? 1, 1, MCP_CONTEXT_MAX_TEXT_MATCHES),
       });
     }
 
+    const outlineTargets = targets.filter((target): target is ContextFileTarget =>
+      target.mode === 'file' && target.outline
+    );
+    if (outlineTargets.length > 0) {
+      const perFileLimit = clamp(
+        Math.floor(MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_TOTAL / outlineTargets.length),
+        8,
+        MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_PER_FILE,
+      );
+      for (const target of outlineTargets) target.outlineLimit = perFileLimit;
+    }
+
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const includeRelations = args.includeRelations === true;
-    const sections: string[] = [];
+    const sectionCandidates: ContextSectionCandidate[] = [];
     const misses: string[] = [];
     const fileRanges = new Map<string, { file: ResolvedIndexedFile; ranges: ContextFileRange[]; targetIndexes: Set<number> }>();
     const resolvedTargets = new Set<number>();
-    let used = 0;
 
     for (let targetIndex = 0; targetIndex < targets.length; targetIndex++) {
       const target = targets[targetIndex]!;
@@ -1628,6 +1717,23 @@ export class ToolHandler {
         const resolved = this.resolveIndexedFile(cg, target.file);
         if ('result' in resolved) {
           misses.push(`- file \`${target.file}\`: ${resolved.result}`);
+          continue;
+        }
+        if (target.outline) {
+          const outlineResult = await this.handleFileView(cg, resolved.file.path, {
+            symbolsOnly: true,
+            outlineLimit: target.outlineLimit,
+            notice: '> Automatically converted bare context file target to a compact symbol outline; no source was dumped.',
+          });
+          const section = outlineResult.content.map((item) => item.text).join('\n');
+          sectionCandidates.push({
+            label: `outline \`${resolved.file.path}\``,
+            section,
+            estimatedChars: section.length,
+            targetIndexes: new Set([targetIndex]),
+            file: resolved.file,
+          });
+          resolvedTargets.add(targetIndex);
           continue;
         }
         if (CONFIG_LEAF_LANGUAGES.has(resolved.file.language)) {
@@ -1664,7 +1770,7 @@ export class ToolHandler {
           }
         } else {
           const start = target.offset!;
-          const rawTarget = args.targets[targetIndex] as Record<string, unknown>;
+          const rawTarget = rawTargets[targetIndex] as Record<string, unknown>;
           const requestedLimit = rawTarget.limit as number;
           if (start > lines.length) {
             misses.push(`- window ${resolved.file.path}:${start}: offset is past EOF (${lines.length})`);
@@ -1695,6 +1801,16 @@ export class ToolHandler {
       }
 
       if (target.members?.length) {
+        // A full C/C++ class definition and its forward declarations share the
+        // same exact symbol/qualified name. Member focus needs the definition's
+        // containment range, so select it automatically when it is the only
+        // concrete container. Keep true multiple definitions ambiguous.
+        if (narrowed.fileMatched && narrowed.lineMatched && matches.length > 1) {
+          const concreteContainers = matches.filter((node) =>
+            CONTAINER_NODE_KINDS.has(node.kind) && node.isDeclaration !== true
+          );
+          if (concreteContainers.length === 1) matches = concreteContainers;
+        }
         if (matches.length !== 1 || !CONTAINER_NODE_KINDS.has(matches[0]!.kind)) {
           misses.push(`- \`${target.symbol}\` members: container target is not unique`);
           continue;
@@ -1776,33 +1892,60 @@ export class ToolHandler {
       }
       const hintWarning = this.formatSymbolHintWarning(target.symbol, narrowed);
       if (hintWarning) section = `${hintWarning}\n\n${section}`;
+      const estimatedChars = section.length;
       if (section.length > MCP_CONTEXT_MAX_CHARS_PER_TARGET) {
         section = this.truncateAtLine(section, MCP_CONTEXT_MAX_CHARS_PER_TARGET) +
           '\n\n... (target truncated; omitted overload locations are listed above when space permits; use `signature` or `file`/`line` only if the missing body is required)';
       }
-      if (used + section.length > MCP_CONTEXT_MAX_OUTPUT_CHARS) {
-        misses.push(`- \`${target.symbol}\`: omitted by the ${MCP_CONTEXT_MAX_OUTPUT_CHARS}-character batch budget; request it alone only if required`);
-        continue;
-      }
-      sections.push(section);
-      used += section.length;
+      sectionCandidates.push({
+        label: `symbol \`${target.symbol}\``,
+        section,
+        estimatedChars,
+        targetIndexes: new Set([targetIndex]),
+      });
       resolvedTargets.add(targetIndex);
     }
 
     for (const entry of fileRanges.values()) {
       let section = this.renderContextFileRanges(cg, entry.file, entry.ranges);
+      const estimatedChars = section.length;
       if (section.length > MCP_CONTEXT_MAX_CHARS_PER_TARGET * 1.5) {
         section = this.truncateAtLine(section, Math.floor(MCP_CONTEXT_MAX_CHARS_PER_TARGET * 1.5)) +
           '\n\n... (precise file batch truncated by the per-file budget; narrow only the missing range)';
       }
-      if (used + section.length > MCP_CONTEXT_MAX_OUTPUT_CHARS) {
-        misses.push(`- \`${entry.file.path}\`: omitted by the ${MCP_CONTEXT_MAX_OUTPUT_CHARS}-character batch budget`);
-        for (const index of entry.targetIndexes) resolvedTargets.delete(index);
-        continue;
-      }
-      sections.push(section);
-      used += section.length;
+      sectionCandidates.push({
+        label: `file \`${entry.file.path}\``,
+        section,
+        estimatedChars,
+        targetIndexes: new Set(entry.targetIndexes),
+        file: entry.file,
+        ranges: entry.ranges,
+      });
     }
+
+    const estimatedOutputChars = sectionCandidates.reduce((total, candidate) => total + candidate.estimatedChars, 0) +
+      Math.max(0, sectionCandidates.length - 1) * 7;
+    const fileWindowTargets = targets.filter((target): target is ContextFileTarget =>
+      target.mode === 'file' && !target.text && target.offset !== undefined && target.limit !== undefined
+    );
+    const requestedWindowLines = fileWindowTargets.reduce((total, target) => total + target.limit!, 0);
+    const broadFileWindowBatch = fileWindowTargets.length >= MCP_CONTEXT_BROAD_FILE_TARGETS &&
+      requestedWindowLines >= MCP_CONTEXT_BROAD_FILE_LINES;
+    if (sectionCandidates.length > 0 &&
+        (estimatedOutputChars > MCP_CONTEXT_MAX_OUTPUT_CHARS || broadFileWindowBatch)) {
+      return this.textResult(this.renderContextPreflight(
+        cg,
+        sectionCandidates,
+        estimatedOutputChars,
+        broadFileWindowBatch,
+        fileWindowTargets.length,
+        requestedWindowLines,
+        corrections,
+        misses,
+      ));
+    }
+
+    const sections = sectionCandidates.map((candidate) => candidate.section);
 
     const out: string[] = [
       ...(targets.length === 1
@@ -1813,6 +1956,9 @@ export class ToolHandler {
       sections.join('\n\n---\n\n'),
     ];
     if (misses.length > 0) out.push('', '## Unresolved / omitted targets', ...misses);
+    if (corrections.length > 0) {
+      out.push('', `> Automatically corrected: ${corrections.join('; ')}.`);
+    }
     out.push(
       '',
       includeRelations
@@ -1868,16 +2014,23 @@ export class ToolHandler {
       MCP_TEXT_SEARCH_MAX_CONTEXT_LINES,
     );
     const caseSensitive = args.caseSensitive !== false;
-    const includeGenerated = args.includeGenerated === true;
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const allPathCandidates = cg.getFiles().filter((file) => {
       const normalized = file.path.replace(/\\/g, '/').toLowerCase();
       return normalized.includes(pathHint) &&
         !CONFIG_LEAF_LANGUAGES.has(file.language);
     });
+    const exactPathCandidates = allPathCandidates.filter((file) => {
+      const normalized = file.path.replace(/\\/g, '/').toLowerCase();
+      return normalized === pathHint || normalized.endsWith('/' + pathHint);
+    });
+    const pathCandidates = exactPathCandidates.length === 1 ? exactPathCandidates : allPathCandidates;
+    const autoIncludedExactGenerated = args.includeGenerated === undefined &&
+      exactPathCandidates.length === 1 && isGeneratedFile(exactPathCandidates[0]!.path);
+    const includeGenerated = args.includeGenerated === true || autoIncludedExactGenerated;
     const candidates = includeGenerated
-      ? allPathCandidates
-      : allPathCandidates.filter((file) => !isGeneratedFile(file.path));
+      ? pathCandidates
+      : pathCandidates.filter((file) => !isGeneratedFile(file.path));
     if (candidates.length === 0) {
       return this.textResult(`No indexed source files match path "${pathValue}"${includeGenerated ? '' : ' after generated files were excluded'}.`);
     }
@@ -1885,7 +2038,7 @@ export class ToolHandler {
     type TextHit = { file: string; line: number; start: number; end: number };
     const hits = new Map<string, TextHit[]>();
     for (const query of queries) hits.set(query, []);
-    const generatedSkipped = allPathCandidates.length - candidates.length;
+    const generatedSkipped = pathCandidates.length - candidates.length;
     let scannedBytes = 0;
     let scannedFiles = 0;
     let unreadableFiles = 0;
@@ -1920,7 +2073,11 @@ export class ToolHandler {
 
     const out: string[] = [
       `# Literal text search — ${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}, ${scannedFiles}/${candidates.length} matching files scanned`,
-      `Path: \`${pathValue}\`${includeGenerated ? '' : ` · ${generatedSkipped} generated file(s) skipped`}`,
+      `Path: \`${pathValue}\`${autoIncludedExactGenerated
+        ? ' · exact generated file auto-included'
+        : includeGenerated
+          ? ''
+          : ` · ${generatedSkipped} generated file(s) skipped`}`,
     ];
     const queryCounts = queries.map((query) => ({ query, count: hits.get(query)!.length }));
     out.push('', '## Query summary');
@@ -1981,6 +2138,44 @@ export class ToolHandler {
           .map((line, index) => `${window.start + index + 1}\t${line}`)
           .join('\n');
         out.push('', `**${location}** · matched ${matched}`, '```text', snippet, '```');
+      }
+    }
+
+    const symbolRecoveryQueries = queryCounts
+      .filter(({ query, count }) => count === 0 && isIdentifierLikeTextQuery(query))
+      .filter(({ query }) => {
+        const symbol = parseCallableLookup(query).symbol;
+        return cg.getNodesBySymbolExact(symbol).length > 0 ||
+          this.findCaseInsensitiveSymbolMatches(cg, symbol).length > 0;
+      });
+    const recoveries: Array<{ query: string; text: string }> = [];
+    for (const { query } of symbolRecoveryQueries.slice(0, MCP_TEXT_SEARCH_MAX_SYMBOL_RECOVERIES)) {
+      const result = await this.handleSearch({
+        query,
+        includeCode: 'if_unique',
+        limit: 8,
+        projectPath: args.projectPath,
+      });
+      const text = result.content.map((block) => block.text).join('\n').trim();
+      if (text) {
+        recoveries.push({
+          query,
+          text: this.truncateAtLine(text, MCP_TEXT_SEARCH_MAX_SYMBOL_RECOVERY_CHARS),
+        });
+      }
+    }
+    if (recoveries.length > 0) {
+      out.push(
+        '',
+        '## Exact symbol recovery for zero-match identifiers',
+        '',
+        '> These identifiers were absent from the requested literal-search path but exist as indexed symbols elsewhere. The exact search result is included now; do not call `codegraph_search` or Grep for them again.',
+      );
+      for (const recovery of recoveries) {
+        out.push('', `### ${recovery.query}`, '', recovery.text);
+      }
+      if (symbolRecoveryQueries.length > recoveries.length) {
+        out.push('', `> ${symbolRecoveryQueries.length - recoveries.length} additional identifier-like zero-match quer${symbolRecoveryQueries.length - recoveries.length === 1 ? 'y was' : 'ies were'} not expanded to preserve the output budget.`);
       }
     }
     if (budgetReached) {
@@ -3397,6 +3592,7 @@ export class ToolHandler {
     // the outline-only knobs. A file window remains a hard conflict because the
     // caller may genuinely be asking for either source range.
     const autoCorrectedOutlineArgs = Boolean(symbolRaw && !hasWindowArgs && hasOutlineArgs);
+    const autoCorrectedOutlineWindow = Boolean(!symbolRaw && fileHint && symbolsOnly && hasWindowArgs);
     // `symbolsOnly=true` expresses an intent to inspect structure, so preserve
     // that intent by rendering the named container outline in symbol mode.
     const includeCode = args.includeCode === true || autoCorrectedOutlineArgs;
@@ -3435,12 +3631,6 @@ export class ToolHandler {
       if (!symbolsOnly && (args.outlineQuery !== undefined || args.outlineLimit !== undefined)) {
         return this.errorResult('outlineQuery and outlineLimit require symbolsOnly=true.');
       }
-      if (symbolsOnly && (args.offset !== undefined || args.limit !== undefined)) {
-        return this.errorResult(
-          'symbolsOnly cannot be combined with offset or limit. Use either ' +
-          '{ file, symbolsOnly: true } or { file, offset, limit }.'
-        );
-      }
       if (!symbolsOnly) {
         if (offset === undefined || limit === undefined) {
           return this.errorResult(
@@ -3451,12 +3641,15 @@ export class ToolHandler {
       }
       const cg = this.getCodeGraph(args.projectPath as string | undefined);
       return this.handleFileView(cg, fileHint, {
-        offset,
-        limit: limit === undefined ? undefined : Math.min(limit, MCP_NODE_MAX_FILE_WINDOW_LINES),
+        offset: autoCorrectedOutlineWindow ? undefined : offset,
+        limit: autoCorrectedOutlineWindow || limit === undefined ? undefined : Math.min(limit, MCP_NODE_MAX_FILE_WINDOW_LINES),
         requestedLimit: limit,
         symbolsOnly,
         outlineQuery,
         outlineLimit,
+        notice: autoCorrectedOutlineWindow
+          ? '> Automatically used `symbolsOnly` outline mode and ignored copied `offset`/`limit` fields.'
+          : undefined,
       });
     }
 
@@ -3581,6 +3774,7 @@ export class ToolHandler {
       outlineQuery?: string;
       outlineLimit?: number;
       requestedLimit?: number;
+      notice?: string;
     } = {},
   ): Promise<ToolResult> {
     const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
@@ -3677,6 +3871,7 @@ export class ToolHandler {
         : outlineLimit;
       const filterNote = query ? `; ${filtered.length} match outlineQuery="${opts.outlineQuery}"` : '';
       const out = [
+        ...(opts.notice ? [opts.notice, ''] : []),
         `**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}${filterNote}, ${compactDepSummary}`,
         '',
       ];
@@ -3701,7 +3896,7 @@ export class ToolHandler {
       if (!broadQuery && filtered.length > outlineLimit) {
         out.push('', `> Outline capped at ${outlineLimit} of ${filtered.length} matching symbols. Narrow with \`outlineQuery\`; do not read the file to recover the omitted list.`);
       }
-      out.push('', '> Choose one symbol from the returned exact names and call `codegraph_node`, or batch 2–8 symbols with `codegraph_context`. Do not page through the file; use an offset/limit window only for non-symbol text or a missing edit boundary.');
+      out.push('', '> Choose exact names from this outline. Read one implementation with `codegraph_node`; batch 1–8 precise symbol/member/text/file-region targets with ONE `codegraph_context`. Do not page through the file.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
 
@@ -4311,6 +4506,91 @@ export class ToolHandler {
       );
     }
     return out.join('\n');
+  }
+
+  /**
+   * Refuse a likely batch-Read before any source reaches the model context.
+   * The compact preflight reports actual rendered-size estimates and exposes
+   * exact symbols already indexed inside the requested windows, so the next
+   * call can switch to symbol/member focus instead of paging or Read.
+   */
+  private renderContextPreflight(
+    cg: CodeGraph,
+    candidates: ContextSectionCandidate[],
+    estimatedOutputChars: number,
+    broadFileWindowBatch: boolean,
+    fileWindowTargetCount: number,
+    requestedWindowLines: number,
+    corrections: string[],
+    misses: string[],
+  ): string {
+    const out: string[] = [
+      '# Context preflight — source not emitted',
+      '',
+      '> This request was stopped before rendering source, preventing a broad batch-Read or a partial response that omits trailing targets.',
+    ];
+    if (broadFileWindowBatch) {
+      out.push(
+        '',
+        `- Broad file-window batch: ${fileWindowTargetCount} windows totaling ${requestedWindowLines} requested lines.`,
+      );
+    }
+    if (estimatedOutputChars > MCP_CONTEXT_MAX_OUTPUT_CHARS) {
+      out.push(`- Estimated rendered source: about ${estimatedOutputChars} characters, above the ${MCP_CONTEXT_MAX_OUTPUT_CHARS}-character batch budget.`);
+    } else {
+      out.push(`- Estimated rendered source: about ${estimatedOutputChars} characters.`);
+    }
+
+    out.push('', '## Section estimates');
+    for (const candidate of candidates) {
+      out.push(`- ${candidate.label}: about ${candidate.estimatedChars} characters`);
+    }
+
+    const fileCandidates = candidates.filter((candidate) => candidate.file && candidate.ranges?.length);
+    if (fileCandidates.length > 0) {
+      out.push('', '## Exact symbols inside the requested ranges');
+      for (const candidate of fileCandidates) {
+        const nodes = cg.getNodesInFile(candidate.file!.path)
+          .filter((node) => node.kind !== 'file' && node.kind !== 'import' && node.kind !== 'export')
+          .filter((node) => candidate.ranges!.some((range) =>
+            node.startLine <= range.end && (node.endLine ?? node.startLine) >= range.start
+          ))
+          .sort((left, right) => {
+            const containerOrder = Number(!CONTAINER_NODE_KINDS.has(left.kind)) - Number(!CONTAINER_NODE_KINDS.has(right.kind));
+            if (containerOrder !== 0) return containerOrder;
+            const declarationOrder = Number(left.isDeclaration === true) - Number(right.isDeclaration === true);
+            if (declarationOrder !== 0) return declarationOrder;
+            return left.startLine - right.startLine;
+          });
+        const seen = new Set<string>();
+        const exact = nodes.filter((node) => {
+          const key = `${node.qualifiedName}\u0000${node.kind}\u0000${node.startLine}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        }).slice(0, 12);
+        if (exact.length === 0) {
+          out.push(`- \`${candidate.file!.path}\`: no indexed symbols in these ranges; use one smaller exact region or a text anchor.`);
+          continue;
+        }
+        out.push(
+          `- \`${candidate.file!.path}\`: ` +
+          exact.map((node) => `\`${displaySymbol(node)}\` (${node.kind}, :${node.startLine})`).join(', ') +
+          (nodes.length > exact.length ? `, +${nodes.length - exact.length} more` : ''),
+        );
+      }
+    }
+
+    if (misses.length > 0) out.push('', '## Unresolved targets', ...misses);
+    if (corrections.length > 0) out.push('', `> Automatically corrected before preflight: ${corrections.join('; ')}.`);
+    out.push(
+      '',
+      '## Next call',
+      '- Prefer one `codegraph_context` with exact `symbol` targets or `{ symbol: <container>, members: [...] }` selected from the names above.',
+      '- For non-symbol boundaries, replace wide windows with `{ file, text, contextLines }` anchors.',
+      '- If the raw regions are genuinely required, split them into smaller context batches using the section estimates above. Do not use Read or page through the files.',
+    );
+    return this.truncateOutput(out.join('\n'));
   }
 
   /**
@@ -5101,7 +5381,7 @@ export class ToolHandler {
       lines.push(
         `- … +${children.length - visible.length} more members omitted`,
         '',
-        '> Large container outline capped. Use the exact member name already known from the task, or request a file outline with `symbolsOnly=true` and `outlineQuery`; do not Read the class file.',
+        '> Large container outline capped. Use ONE `codegraph_context` target `{ symbol, file, members: [...] }` for up to 32 already-known members; do not request a broader file outline or Read the class file.',
       );
     }
     return lines.join('\n');
@@ -5126,7 +5406,7 @@ export class ToolHandler {
 
     if (outline) {
       lines.push('', outline, '',
-        `> Structural outline only. Call codegraph_node on a specific member for its body. Use a bounded file window (maximum 120 lines) only if an exact edit boundary is still missing.`);
+        '> Structural outline only. Read one member with codegraph_node, or batch up to 32 named members with ONE codegraph_context `{ symbol, file, members: [...] }`; it also returns matching C++ out-of-line definitions. Use a file region only for a non-symbol edit boundary.');
     } else if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.

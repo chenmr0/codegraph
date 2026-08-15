@@ -2,10 +2,13 @@
  * opencode target.
  *
  *   - MCP server entry to `~/.config/opencode/opencode.jsonc` (global,
- *     XDG-style; `%APPDATA%/opencode/opencode.jsonc` on Windows) or
+ *     XDG-style on every platform) or
  *     `./opencode.jsonc` (local). Falls back to `opencode.json` when a
  *     `.json` file already exists; defaults new installs to `.jsonc`
  *     because that's what opencode itself creates on first run.
+ *   - A native-tool reminder plugin in the auto-discovered OpenCode plugin
+ *     directory. It appends a short, contextual CodeGraph hint after a
+ *     grep/read touches indexed source.
  *   - Instructions to `~/.config/opencode/AGENTS.md` (global) or
  *     `./AGENTS.md` (local). opencode reads AGENTS.md for agent
  *     instructions — same convention Codex CLI uses.
@@ -47,13 +50,16 @@ import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
+import {
+  OPENCODE_REMINDER_PLUGIN_FILENAME,
+  OPENCODE_REMINDER_PLUGIN_MARKER,
+  OPENCODE_REMINDER_PLUGIN_SOURCE,
+} from '../opencode-reminder-plugin';
 
 function globalConfigDir(): string {
-  if (process.platform === 'win32') {
-    const appData = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
-    return path.join(appData, 'opencode');
-  }
-  // XDG_CONFIG_HOME if set, else ~/.config — matches opencode's docs.
+  // OpenCode uses XDG_CONFIG_HOME (or ~/.config) on Windows too. In
+  // particular, `opencode debug paths` reports ~/.config/opencode rather
+  // than %APPDATA%/opencode on current Windows releases.
   const xdg = process.env.XDG_CONFIG_HOME && process.env.XDG_CONFIG_HOME.trim().length > 0
     ? process.env.XDG_CONFIG_HOME
     : path.join(os.homedir(), '.config');
@@ -78,6 +84,13 @@ function configPath(loc: Location): string {
 
 function instructionsPath(loc: Location): string {
   return path.join(configBaseDir(loc), 'AGENTS.md');
+}
+
+function reminderPluginPath(loc: Location): string {
+  const pluginDir = loc === 'global'
+    ? path.join(globalConfigDir(), 'plugins')
+    : path.join(process.cwd(), '.opencode', 'plugins');
+  return path.join(pluginDir, OPENCODE_REMINDER_PLUGIN_FILENAME);
 }
 
 function readConfigText(file: string): string {
@@ -131,6 +144,7 @@ class OpencodeTarget implements AgentTarget {
   install(loc: Location, _opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     files.push(writeMcpEntry(loc));
+    files.push(writeReminderPlugin(loc));
 
     // AGENTS.md — the short marker-fenced CodeGraph block (#704). The
     // MCP initialize instructions reach only the main agent; AGENTS.md is
@@ -174,6 +188,7 @@ class OpencodeTarget implements AgentTarget {
     }
 
     files.push(removeInstructionsEntry(loc));
+    files.push(removeReminderPlugin(loc));
 
     return { files };
   }
@@ -188,7 +203,36 @@ class OpencodeTarget implements AgentTarget {
   }
 
   describePaths(loc: Location): string[] {
-    return [configPath(loc), instructionsPath(loc)];
+    return [configPath(loc), reminderPluginPath(loc), instructionsPath(loc)];
+  }
+}
+
+function writeReminderPlugin(loc: Location): WriteResult['files'][number] {
+  const file = reminderPluginPath(loc);
+  const existed = fs.existsSync(file);
+  if (existed && fs.readFileSync(file, 'utf-8') === OPENCODE_REMINDER_PLUGIN_SOURCE) {
+    return { path: file, action: 'unchanged' };
+  }
+  atomicWriteFileSync(file, OPENCODE_REMINDER_PLUGIN_SOURCE);
+  return { path: file, action: existed ? 'updated' : 'created' };
+}
+
+function removeReminderPlugin(loc: Location): WriteResult['files'][number] {
+  const file = reminderPluginPath(loc);
+  if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
+
+  // The filename is namespaced, but still avoid deleting a user replacement
+  // that no longer carries our ownership marker.
+  let content = '';
+  try { content = fs.readFileSync(file, 'utf-8'); } catch { return { path: file, action: 'kept' }; }
+  if (!content.includes(OPENCODE_REMINDER_PLUGIN_MARKER)) {
+    return { path: file, action: 'kept' };
+  }
+  try {
+    fs.unlinkSync(file);
+    return { path: file, action: 'removed' };
+  } catch {
+    return { path: file, action: 'kept' };
   }
 }
 

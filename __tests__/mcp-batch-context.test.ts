@@ -94,6 +94,28 @@ describe('MCP bounded batch context and literal search', () => {
         '',
       ].join('\n'),
     );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'forward_container_fwd.h'),
+      'class ForwardContainer;\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'forward_container.h'),
+      'class ForwardContainer { public: int run(); };\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'forward_container.cpp'),
+      '#include "forward_container.h"\nint ForwardContainer::run() { return 7; }\n',
+    );
+    for (const name of ['alpha', 'beta', 'gamma']) {
+      fs.writeFileSync(
+        path.join(dir, 'src', `wide_${name}.ts`),
+        [
+          `export function wide_${name}() { return ${name.length}; }`,
+          ...Array.from({ length: 149 }, (_, index) => `// ${name}-${index} ${'x'.repeat(120)}`),
+          '',
+        ].join('\n'),
+      );
+    }
     cg = CodeGraph.initSync(dir, {
       config: { include: ['src/**/*.ts', 'src/**/*.h', 'src/**/*.cpp'], exclude: [] },
     });
@@ -230,6 +252,15 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toContain('return helper(1)');
   });
 
+  it('selects the sole concrete container definition over forward declarations', async () => {
+    const out = await output('context', {
+      targets: [{ symbol: 'ForwardContainer', members: ['run'] }],
+    });
+    expect(out).not.toMatch(/container target is not unique/i);
+    expect(out).toContain('src/forward_container.h');
+    expect(out).toContain('int ForwardContainer::run() { return 7; }');
+  });
+
   it('merges overlapping and adjacent file windows and text anchors', async () => {
     const out = await output('context', {
       targets: [
@@ -249,6 +280,45 @@ describe('MCP bounded batch context and literal search', () => {
     });
     expect(out).toMatch(/safely clamped to 240 lines/i);
     expect(out).toContain('TABLE_NAME');
+  });
+
+  it('defaults a limit-only context window to offset 1', async () => {
+    const out = await output('context', {
+      targets: [{ file: 'flow.ts', limit: 3 }],
+    });
+    expect(out).toContain('merged current-source ranges 1-3');
+    expect(out).toMatch(/defaulted missing file-window offset to 1/i);
+    expect(out).toContain('return helper(1)');
+  });
+
+  it('preflights a broad multi-file batch even when its small fixtures fit the character budget', async () => {
+    const out = await output('context', {
+      targets: ['flow.ts', 'metrics.h', 'named_container.h'].map((file) => ({
+        file,
+        offset: 1,
+        limit: 120,
+      })),
+    });
+    expect(out).toMatch(/Context preflight.*source not emitted/i);
+    expect(out).toMatch(/3 windows totaling 360 requested lines/i);
+    expect(out).not.toMatch(/above the 20000-character batch budget/i);
+    expect(out).toContain('TransferMetrics');
+  });
+
+  it('preflights an over-budget file batch before emitting source', async () => {
+    const out = await output('context', {
+      targets: ['alpha', 'beta', 'gamma'].map((name) => ({
+        file: `wide_${name}.ts`,
+        offset: 1,
+        limit: 150,
+      })),
+    });
+    expect(out).toMatch(/Context preflight.*source not emitted/i);
+    expect(out).toMatch(/3 windows totaling 450 requested lines/i);
+    expect(out).toMatch(/above the 20000-character batch budget/i);
+    expect(out).toContain('wide_alpha');
+    expect(out).not.toContain('alpha-100');
+    expect(out).toMatch(/Do not use Read/i);
   });
 
   it('prefers a named container over same-name constructors unless precisely pinned', async () => {
@@ -591,6 +661,52 @@ describe('MCP bounded batch context and literal search', () => {
     expect(blank.isError).toBe(true);
   });
 
+  it('auto-parses JSON-stringified context targets, including the observed missing-key-quote typo', async () => {
+    const stringified = await handler.execute('context', {
+      targets: JSON.stringify([{ symbol: 'first', file: 'flow.ts' }]),
+    });
+    const stringifiedOut = stringified.content.map((c) => c.text).join('\n');
+    expect(stringified.isError).not.toBe(true);
+    expect(stringifiedOut).toContain('return helper(1)');
+    expect(stringifiedOut).toMatch(/parsed JSON-stringified targets/i);
+
+    const repaired = await handler.execute('context', {
+      targets: '[{"file":"src/flow.ts", offset":1, "limit":2}]',
+    });
+    const repairedOut = repaired.content.map((c) => c.text).join('\n');
+    expect(repaired.isError).not.toBe(true);
+    expect(repairedOut).toContain('1\texport function helper');
+    expect(repairedOut).toMatch(/repaired a missing opening quote/i);
+  });
+
+  it('auto-converts one or several bare file targets into compact symbol outlines', async () => {
+    const single = await handler.execute('context', {
+      targets: [{ file: 'src/flow.ts' }],
+    });
+    const singleOut = single.content.map((c) => c.text).join('\n');
+    expect(single.isError).not.toBe(true);
+    expect(singleOut).toContain('Automatically converted bare context file target');
+    expect(singleOut).toContain('### Symbols');
+    expect(singleOut).toContain('`first`');
+    expect(singleOut).not.toContain('2\texport function first');
+
+    const batch = await handler.execute('context', {
+      targets: [
+        { file: 'src/flow.ts' },
+        { file: 'src/metrics.cpp' },
+      ],
+    });
+    const batchOut = batch.content.map((c) => c.text).join('\n');
+    expect(batch.isError).not.toBe(true);
+    expect(batchOut).toMatch(/Precise implementation context \(2\/2 targets resolved\)/i);
+    expect(batchOut).toContain('**src/flow.ts**');
+    expect(batchOut).toContain('**src/metrics.cpp**');
+    expect(batchOut).toContain('`first`');
+    expect(batchOut).toContain('TransferMetrics::get_row');
+    expect(batchOut).toMatch(/targets\[0\].*compact symbol outline/i);
+    expect(batchOut).toMatch(/targets\[1\].*compact symbol outline/i);
+  });
+
   it('batch-searches literals in a bounded path and skips generated source by default', async () => {
     const out = await output('text_search', {
       queries: ['__all_virtual_demo', 'REGISTER_CHANNEL'],
@@ -615,6 +731,34 @@ describe('MCP bounded batch context and literal search', () => {
       maxMatchesPerQuery: 5,
     });
     expect(out).toContain('widget.generated.ts');
+  });
+
+  it('auto-includes one exact generated file unless explicitly disabled', async () => {
+    const automatic = await output('text_search', {
+      queries: ['GENERATED_MARKER'],
+      path: 'src/widget.generated.ts',
+    });
+    const disabled = await output('text_search', {
+      queries: ['GENERATED_MARKER'],
+      path: 'src/widget.generated.ts',
+      includeGenerated: false,
+    });
+    expect(automatic).toContain('widget.generated.ts');
+    expect(automatic).toMatch(/exact generated file auto-included/i);
+    expect(disabled).toMatch(/after generated files were excluded/i);
+  });
+
+  it('recovers an exact global symbol for an identifier missing in the literal path', async () => {
+    const out = await output('text_search', {
+      queries: ['wide_alpha'],
+      path: 'src/flow.ts',
+      contextLines: 0,
+    });
+    expect(out).toMatch(/wide_alpha.*0 matches/i);
+    expect(out).toMatch(/Exact symbol recovery/i);
+    expect(out).toContain('src/wide_alpha.ts');
+    expect(out).toContain('export function wide_alpha()');
+    expect(out).toMatch(/do not call `codegraph_search` or Grep/i);
   });
 
   it('rejects unbounded or malformed literal searches', async () => {

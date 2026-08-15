@@ -31,9 +31,17 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(search.inputSchema.properties.signature?.type).toBe('string');
     expect(context.inputSchema.properties.targets?.minItems).toBe(1);
     expect(context.inputSchema.properties.targets?.maxItems).toBe(8);
+    const contextTarget = context.inputSchema.properties.targets?.items as any;
+    expect(contextTarget.properties.members.maxItems).toBe(32);
+    expect(contextTarget.properties.offset.description).toMatch(/defaults to 1/i);
     expect(context.description).toMatch(/members.*offset.*text/i);
+    expect(context.description).toMatch(/preflight/i);
+    expect(context.description).toMatch(/bare.*file.*compact symbol outline/i);
+    expect(context.description).toMatch(/JSON-stringified targets array is parsed automatically/i);
     expect(textSearch.inputSchema.properties.queries?.maxItems).toBe(8);
     expect(textSearch.inputSchema.required).toEqual(['queries', 'path']);
+    expect(textSearch.description).toMatch(/zero-match identifier/i);
+    expect(textSearch.description).toMatch(/exact generated file/i);
   });
 
   it('publishes exact overload hints for every relationship tool', () => {
@@ -51,9 +59,13 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(SERVER_INSTRUCTIONS).toContain('{ file, offset, limit<=120 }');
     expect(SERVER_INSTRUCTIONS).toMatch(/rejects bare\/full-file reads/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_context` call/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/compact symbol preflight/i);
     expect(SERVER_INSTRUCTIONS).toContain('includeCode: "if_unique"');
     expect(SERVER_INSTRUCTIONS).toMatch(/selected container.*text.*file windows/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/bare.*file.*compact symbol outline/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/JSON-stringified.*parsed automatically/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_text_search` call/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/zero-match identifier/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/file.*line.*signature/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/do not aggregate/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate file windows/i);

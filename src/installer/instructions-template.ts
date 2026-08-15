@@ -59,9 +59,9 @@ The CodeGraph server publishes short raw names so Claude Code exposes the tools 
 
 - Find a symbol by name/signature → \`codegraph_search\`; add \`includeCode="if_unique"\` when a unique result should include source immediately.
 - Read a known symbol → \`codegraph_node(symbol=..., includeCode=true)\`.
-- Batch precise context → ONE \`codegraph_context(targets=[...])\` call (1–8 exact symbols, selected container \`members\`, exact-file \`text\` anchors, or file windows; overlapping ranges are merged).
+- Batch precise context → ONE \`codegraph_context(targets=[...])\` call (1–8 exact symbols, selected container \`members\`, exact-file \`text\` anchors, file windows, or bare \`{file}\` targets that auto-return compact outlines; JSON-stringified targets are auto-parsed; overlapping ranges are merged; broad window batches return a compact symbol preflight instead of partial source).
 - Known file but unknown symbol → \`codegraph_node(file=..., symbolsOnly=true, outlineQuery=optional)\`, then select or batch symbols.
-- Search literal strings/macros/registrations → ONE \`codegraph_text_search(queries=[...], path=...)\` call.
+- Search literal strings/macros/registrations → ONE \`codegraph_text_search(queries=[...], path=...)\` call; zero-match identifiers recover exact symbols in the same response, and an exact generated-file path is auto-included.
 - Non-symbol text / exact edit boundary only → \`codegraph_node(file=..., offset=..., limit<=120)\`; larger limits are auto-clamped. Bare/full-file MCP reads are rejected.
 - Who calls this / what does this call / what would changing this break → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`. For overloaded/same-named symbols, pass \`file\` + \`line\` or \`signature\`; these tools refuse to aggregate distinct overloads.
 - What's in a directory → \`codegraph_files\`.

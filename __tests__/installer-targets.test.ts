@@ -300,6 +300,25 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('created');
   });
 
+  it('opencode: install writes an auto-discovered grep/read reminder plugin', () => {
+    const opencode = getTarget('opencode')!;
+    const first = opencode.install('global', { autoAllow: true });
+    const plugin = path.join(tmpHome, '.config', 'opencode', 'plugins', 'codegraph-reminder.js');
+
+    expect(fs.existsSync(plugin)).toBe(true);
+    const body = fs.readFileSync(plugin, 'utf-8');
+    expect(body).toContain('CODEGRAPH_OPENCODE_REMINDER_PLUGIN');
+    expect(body).toContain('"tool.execute.after"');
+    expect(body).toContain('tool !== "grep" && tool !== "read"');
+    expect(body).toContain('existsSync(join(root, ".codegraph"))');
+    expect(body).toContain('<system-reminder>');
+    expect(body).toContain('优先使用 CodeGraph系列工具，而不是read，grep等。');
+    expect(first.files.find((f) => f.path === plugin)?.action).toBe('created');
+
+    const second = opencode.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === plugin)?.action).toBe('unchanged');
+  });
+
   it('opencode: install replaces a legacy AGENTS.md codegraph block, preserving user content', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
@@ -340,7 +359,9 @@ describe('Installer targets — partial-state idempotency', () => {
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
     expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/.opencode/plugins/codegraph-reminder.js'))).toBe(true);
     expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), '.opencode', 'plugins', 'codegraph-reminder.js'))).toBe(true);
   });
 
   it('gemini: install writes settings.json (mcpServers.codegraph) and the GEMINI.md block (#704)', () => {
@@ -851,6 +872,21 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(afterUninstall).not.toContain('codegraph');
     expect(afterUninstall).toContain('// important comment');
     expect(afterUninstall).toContain('"other"');
+  });
+
+  it('opencode: uninstall removes its reminder plugin but keeps a user replacement', () => {
+    const opencode = getTarget('opencode')!;
+    const plugin = path.join(tmpHome, '.config', 'opencode', 'plugins', 'codegraph-reminder.js');
+
+    opencode.install('global', { autoAllow: true });
+    opencode.uninstall('global');
+    expect(fs.existsSync(plugin)).toBe(false);
+
+    fs.mkdirSync(path.dirname(plugin), { recursive: true });
+    fs.writeFileSync(plugin, 'export const UserPlugin = async () => ({})\n');
+    const result = opencode.uninstall('global');
+    expect(fs.existsSync(plugin)).toBe(true);
+    expect(result.files.find((f) => f.path === plugin)?.action).toBe('kept');
   });
 
   it('codex: user-added key inside [mcp_servers.codegraph] survives idempotent re-install', () => {

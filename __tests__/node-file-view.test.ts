@@ -135,7 +135,7 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('helper');
     expect(out).toContain('Widget');
     expect(out).not.toContain('return x + 1'); // bodies are NOT included in the map
-    expect(out).toMatch(/choose one symbol/i);
+    expect(out).toMatch(/batch 1[–-]8 precise.*codegraph_context/i);
     expect(out).not.toMatch(/drop `symbolsOnly`/i);
   });
 
@@ -160,7 +160,8 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('method39');
     expect(out).not.toContain('method74');
     expect(out).toMatch(/35 more members omitted/);
-    expect(out).toMatch(/symbolsOnly=true.*outlineQuery/i);
+    expect(out).toMatch(/codegraph_context.*members/i);
+    expect(out).not.toMatch(/request a file outline/i);
   });
 
   it('auto-corrects copied file-outline knobs when an exact symbol is supplied', async () => {
@@ -236,15 +237,19 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(result.content[0]!.text).toContain('Unknown symbol in file:');
   });
 
-  it('rejects symbolsOnly mixed with a source window', async () => {
+  it('auto-corrects symbolsOnly mixed with copied source-window fields', async () => {
     const result = await h.execute('node', {
       file: 'a.ts',
       symbolsOnly: true,
       offset: 1,
       limit: 5,
     });
-    expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/symbolsOnly cannot be combined/i);
+    const out = result.content[0]!.text;
+    expect(result.isError).not.toBe(true);
+    expect(out).toMatch(/Automatically used `symbolsOnly` outline mode/i);
+    expect(out).toContain('### Symbols');
+    expect(out).toContain('helper');
+    expect(out).not.toContain('return x + 1');
   });
 
   it('still works as a normal symbol lookup (no regression)', async () => {
