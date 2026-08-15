@@ -311,8 +311,10 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('"tool.execute.after"');
     expect(body).toContain('tool !== "grep" && tool !== "read"');
     expect(body).toContain('existsSync(join(root, ".codegraph"))');
-    expect(body).toContain('<system-reminder>');
-    expect(body).toContain('优先使用 CodeGraph系列工具，而不是read，grep等。');
+    expect(body).toContain('experimental.chat.system.transform');
+    expect(body).toContain('CODEGRAPH_DYNAMIC_SYSTEM_REMINDER');
+    expect(body).not.toContain('output.output +=');
+    expect(body).toContain('优先使用 CodeGraph系列工具，而不是read、grep等。');
     expect(first.files.find((f) => f.path === plugin)?.action).toBe('created');
 
     const second = opencode.install('global', { autoAllow: true });

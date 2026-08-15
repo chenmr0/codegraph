@@ -7,7 +7,9 @@ import { OPENCODE_REMINDER_PLUGIN_SOURCE } from '../src/installer/opencode-remin
 
 describe('OpenCode CodeGraph native-tool reminder plugin', () => {
   let dir: string;
-  let hook: (input: any, output: any) => Promise<void>;
+  let afterHook: (input: any, output: any) => Promise<void>;
+  let systemHook: (input: any, output: any) => Promise<void>;
+  let eventHook: (input: any) => Promise<void>;
 
   beforeEach(async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-opencode-reminder-'));
@@ -15,7 +17,9 @@ describe('OpenCode CodeGraph native-tool reminder plugin', () => {
     fs.writeFileSync(pluginFile, OPENCODE_REMINDER_PLUGIN_SOURCE);
     const pluginModule = await import(`${pathToFileURL(pluginFile).href}?test=${Date.now()}-${Math.random()}`);
     const plugin = await pluginModule.CodeGraphReminderPlugin({ directory: dir, worktree: dir });
-    hook = plugin['tool.execute.after'];
+    afterHook = plugin['tool.execute.after'];
+    systemHook = plugin['experimental.chat.system.transform'];
+    eventHook = plugin.event;
   });
 
   afterEach(() => {
@@ -24,45 +28,100 @@ describe('OpenCode CodeGraph native-tool reminder plugin', () => {
 
   it('does nothing when the current repository is not indexed', async () => {
     const output = { output: 'int main() {}', title: '', metadata: {} };
-    await hook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, output);
-    expect(output.output).not.toContain('<system-reminder>');
+    await afterHook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, output);
+    const system = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, system);
+    expect(output.output).toBe('int main() {}');
+    expect(system.system).toEqual(['base']);
   });
 
-  it('reminds after indexed source read, but not docs or a repeated same-file read', async () => {
+  it('injects a real system reminder after indexed source read without changing tool output', async () => {
     fs.mkdirSync(path.join(dir, '.codegraph'));
     const first = { output: 'int main() {}', title: '', metadata: {} };
-    await hook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, first);
-    expect(first.output).toContain('<system-reminder>');
-    expect(first.output).toContain('优先使用 CodeGraph系列工具，而不是read，grep等。');
-    expect(first.output).toContain('</system-reminder>');
+    await afterHook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, first);
+    expect(first.output).toBe('int main() {}');
 
-    const repeated = { output: 'return 0;', title: '', metadata: {} };
-    await hook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp', offset: 100 } }, repeated);
-    expect(repeated.output).not.toContain('<system-reminder>');
+    const firstSystem = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, firstSystem);
+    expect(firstSystem.system).toHaveLength(2);
+    expect(firstSystem.system[1]).toContain('[CODEGRAPH_DYNAMIC_SYSTEM_REMINDER]');
+    expect(firstSystem.system[1]).toContain('优先使用 CodeGraph系列工具，而不是read、grep等。');
+    expect(firstSystem.system[1]).not.toContain('<system-reminder>');
 
-    const docs = { output: '# Guide', title: '', metadata: {} };
-    await hook({ tool: 'read', sessionID: 's1', args: { filePath: 'README.md' } }, docs);
-    expect(docs.output).not.toContain('<system-reminder>');
+    // The reminder stays armed across model requests so an auxiliary model
+    // request cannot consume it before the main agent sees it.
+    const repeatedSystem = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, repeatedSystem);
+    expect(repeatedSystem.system).toHaveLength(2);
+
+    // Reusing the same output array must not duplicate the system entry.
+    await systemHook({ sessionID: 's1' }, repeatedSystem);
+    expect(repeatedSystem.system).toHaveLength(2);
   });
 
-  it('recognizes source paths in grep output and re-arms after CodeGraph use', async () => {
+  it('does not arm the reminder for docs', async () => {
+    fs.mkdirSync(path.join(dir, '.codegraph'));
+
+    const docs = { output: '# Guide', title: '', metadata: {} };
+    await afterHook({ tool: 'read', sessionID: 's1', args: { filePath: 'README.md' } }, docs);
+    const system = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, system);
+    expect(system.system).toEqual(['base']);
+  });
+
+  it('recognizes source paths in grep output and clears or re-arms around CodeGraph use', async () => {
     fs.mkdirSync(path.join(dir, '.codegraph'));
     const grep = { output: 'src/channel.cpp:42: get_dfc()', title: '', metadata: {} };
-    await hook({ tool: 'grep', sessionID: 's1', args: { path: 'src', pattern: 'get_dfc' } }, grep);
-    expect(grep.output).toContain('<system-reminder>');
-    expect(grep.output).toContain('优先使用 CodeGraph系列工具');
+    await afterHook({ tool: 'grep', sessionID: 's1', args: { path: 'src', pattern: 'get_dfc' } }, grep);
+    const armed = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, armed);
+    expect(armed.system.join('\n')).toContain('优先使用 CodeGraph系列工具');
+    expect(grep.output).toBe('src/channel.cpp:42: get_dfc()');
 
-    await hook({ tool: 'codegraph_search', sessionID: 's1', args: { query: 'get_dfc' } }, { output: 'hit' });
+    await afterHook({ tool: 'codegraph_search', sessionID: 's1', args: { query: 'get_dfc' } }, { output: 'hit' });
+    const cleared = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, cleared);
+    expect(cleared.system).toEqual(['base']);
+
     const nextGrep = { output: 'src/channel.cpp:42: get_dfc()', title: '', metadata: {} };
-    await hook({ tool: 'grep', sessionID: 's1', args: { path: 'src', pattern: 'get_dfc' } }, nextGrep);
-    expect(nextGrep.output).toContain('<system-reminder>');
+    await afterHook({ tool: 'grep', sessionID: 's1', args: { path: 'src', pattern: 'get_dfc' } }, nextGrep);
+    const rearmed = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, rearmed);
+    expect(rearmed.system.join('\n')).toContain('优先使用 CodeGraph系列工具');
   });
 
   it('does not redirect a read of a file edited in the same session', async () => {
     fs.mkdirSync(path.join(dir, '.codegraph'));
-    await hook({ tool: 'edit', sessionID: 's1', args: { filePath: 'main.cpp' } }, { output: 'done' });
+    await afterHook({ tool: 'edit', sessionID: 's1', args: { filePath: 'main.cpp' } }, { output: 'done' });
     const output = { output: 'new source', title: '', metadata: {} };
-    await hook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, output);
-    expect(output.output).not.toContain('<system-reminder>');
+    await afterHook({ tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } }, output);
+    const system = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, system);
+    expect(system.system).toEqual(['base']);
+  });
+
+  it('clears pending reminders when implementation starts or the session ends', async () => {
+    fs.mkdirSync(path.join(dir, '.codegraph'));
+    const read = () => afterHook(
+      { tool: 'read', sessionID: 's1', args: { filePath: 'main.cpp' } },
+      { output: 'source', title: '', metadata: {} },
+    );
+    const expectCleared = async () => {
+      const system = { system: ['base'] };
+      await systemHook({ sessionID: 's1' }, system);
+      expect(system.system).toEqual(['base']);
+    };
+
+    await read();
+    await afterHook({ tool: 'edit', sessionID: 's1', args: { filePath: 'other.cpp' } }, { output: 'done' });
+    await expectCleared();
+
+    await read();
+    await eventHook({ event: { type: 'session.idle', properties: { sessionID: 's1' } } });
+    await expectCleared();
+
+    await read();
+    await eventHook({ event: { type: 'session.deleted', properties: { info: { id: 's1' } } } });
+    await expectCleared();
   });
 });

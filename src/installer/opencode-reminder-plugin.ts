@@ -1,10 +1,12 @@
 /**
  * Dependency-free OpenCode plugin installed beside the CodeGraph MCP entry.
  *
- * OpenCode's tool.execute.after hook is intentionally used instead of a
- * permanent system-prompt rule: the reminder appears at the exact decision
- * point where an agent has started a native grep/read chain, while indexed
- * sessions that never fall back pay no prompt-token cost.
+ * OpenCode's tool.execute.after hook detects the exact decision point where
+ * an agent has started a native grep/read chain. A session-scoped pending flag
+ * then lets experimental.chat.system.transform inject the reminder into the
+ * next model request as a real system instruction. Indexed sessions that
+ * never fall back pay no prompt-token cost, and native tool output remains
+ * untouched.
  *
  * Keep the generated file plain JavaScript. OpenCode auto-discovers direct
  * .js children of .opencode/plugins (project) and
@@ -30,6 +32,9 @@ const SOURCE_EXTENSIONS = new Set([
 ])
 
 const OUTPUT_SOURCE_RE = /(?:^|[\\\\/\\s(])[^:\\r\\n]*\\.(?:c|h|cc|cpp|cxx|hh|hpp|hxx|ipp|inl|tcc|m|mm|cs|cshtml|razor|java|kt|kts|scala|sc|go|rs|swift|dart|pas|dpr|dpk|lpr|dfm|fmx|py|pyw|rb|rake|php|module|install|theme|inc|ts|tsx|mts|cts|js|jsx|mjs|cjs|xsjs|xsjslib|vue|svelte|lua|luau|liquid|twig)(?=[:\\s)\\]\\r\\n]|$)/im
+const SYSTEM_REMINDER_MARKER = "[CODEGRAPH_DYNAMIC_SYSTEM_REMINDER]"
+const SYSTEM_REMINDER = SYSTEM_REMINDER_MARKER + "\\n" +
+  "优先使用 CodeGraph系列工具，而不是read、grep等。当前项目源码已建立CodeGraph索引；仅当CodeGraph无结果、目标文件已在本会话修改导致索引stale，或目标内容不受索引覆盖时，才使用read、grep。"
 
 function findIndexRoot(start) {
   if (!start || typeof start !== "string") return null
@@ -71,7 +76,7 @@ function sessionSet(map, sessionID) {
 export const CodeGraphReminderPlugin = async ({ directory, worktree }) => {
   const projectDirectory = resolve(worktree || directory || process.cwd())
   const modifiedBySession = new Map()
-  const remindedBySession = new Map()
+  const pendingBySession = new Set()
 
   return {
     "tool.execute.after": async (input, output) => {
@@ -80,20 +85,20 @@ export const CodeGraphReminderPlugin = async ({ directory, worktree }) => {
       const args = input.args && typeof input.args === "object" ? input.args : {}
 
       if (tool.startsWith("codegraph_")) {
-        // If the agent later falls back again, make the reminder visible again.
-        remindedBySession.delete(sessionID)
+        pendingBySession.delete(sessionID)
         return
       }
 
       if (tool === "edit" || tool === "write") {
         const changed = absolutePath(toolPath(args), projectDirectory)
         if (changed) sessionSet(modifiedBySession, sessionID).add(changed.toLowerCase())
+        // Exploration has transitioned into implementation. A later native
+        // source fallback will arm a fresh reminder when appropriate.
+        pendingBySession.delete(sessionID)
         return
       }
 
       if (tool !== "grep" && tool !== "read") return
-      if (!output || typeof output.output !== "string") return
-      if (output.output.includes("<system-reminder>")) return
 
       const indexRoot = findIndexRoot(projectDirectory)
       if (!indexRoot) return
@@ -102,27 +107,33 @@ export const CodeGraphReminderPlugin = async ({ directory, worktree }) => {
       const target = absolutePath(rawPath, projectDirectory)
       if (target && !isInside(indexRoot, target)) return
 
+      const outputText = typeof output?.output === "string" ? output.output : ""
       const sourceMatch = (target && isSourcePath(target)) ||
-        (tool === "grep" && OUTPUT_SOURCE_RE.test(output.output))
+        (tool === "grep" && OUTPUT_SOURCE_RE.test(outputText))
       if (!sourceMatch) return
 
       if (target && modifiedBySession.get(sessionID)?.has(target.toLowerCase())) return
 
-      const reminderKey = tool + ":" + (target || indexRoot).toLowerCase()
-      const reminded = sessionSet(remindedBySession, sessionID)
-      if (reminded.has(reminderKey)) return
-      reminded.add(reminderKey)
+      pendingBySession.add(sessionID)
+    },
+    "experimental.chat.system.transform": async (input, output) => {
+      const sessionID = input?.sessionID
+      if (!sessionID || !pendingBySession.has(sessionID)) return
+      if (!output || !Array.isArray(output.system)) return
+      if (output.system.some((part) => typeof part === "string" && part.includes(SYSTEM_REMINDER_MARKER))) return
 
-      const hint = "<system-reminder>优先使用 CodeGraph系列工具，而不是read，grep等。</system-reminder>"
-
-      output.output += "\\n\\n" + hint
+      // Mutate in place: OpenCode passes the live system prompt array to this
+      // hook and later converts each entry into a role=system model message.
+      // Keep the flag armed across requests so an auxiliary title/summary
+      // inference cannot consume the reminder before the main agent sees it.
+      output.system.push(SYSTEM_REMINDER)
     },
     event: async ({ event }) => {
-      if (event?.type !== "session.deleted") return
+      if (event?.type !== "session.idle" && event?.type !== "session.deleted") return
       const sessionID = event.properties?.info?.id ?? event.properties?.sessionID
       if (!sessionID) return
       modifiedBySession.delete(sessionID)
-      remindedBySession.delete(sessionID)
+      pendingBySession.delete(sessionID)
     },
   }
 }
