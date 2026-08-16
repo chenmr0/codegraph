@@ -46,12 +46,17 @@ import {
   numberSourceLines,
   synthEdgeNote,
 } from './node-helpers';
+import {
+  formatRawSourceEvidence,
+  scanRawSourceEvidence,
+  type RawEvidenceSpec,
+} from './raw-source-evidence';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
 
 /** Maximum source lines returned by one MCP codegraph_node file window. */
-const MCP_NODE_MAX_FILE_WINDOW_LINES = 120;
+const MCP_NODE_MAX_FILE_WINDOW_LINES = 500;
 
 /** Default/maximum number of entries in a file structural outline. */
 const MCP_NODE_DEFAULT_OUTLINE_SYMBOLS = 60;
@@ -72,11 +77,18 @@ const MCP_CONTEXT_MAX_CHARS_PER_TARGET = 8_000;
 const MCP_CONTEXT_MAX_MEMBERS = 32;
 const MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_PER_FILE = 24;
 const MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_TOTAL = 80;
-const MCP_CONTEXT_MAX_FILE_WINDOW_LINES = 240;
+const MCP_CONTEXT_MAX_FILE_WINDOW_LINES = 500;
 const MCP_CONTEXT_MAX_TEXT_CONTEXT_LINES = 60;
 const MCP_CONTEXT_MAX_TEXT_MATCHES = 3;
 const MCP_CONTEXT_BROAD_FILE_TARGETS = 3;
 const MCP_CONTEXT_BROAD_FILE_LINES = 360;
+const MCP_CONTEXT_MAX_FILE_SYMBOLS = 32;
+const MCP_CONTEXT_MAX_FILE_TEXTS = 8;
+const MCP_CONTEXT_MAX_EXPECTED_MISSING = 8;
+const MCP_CONTEXT_MEMBER_NEIGHBOR_LINES = 2;
+
+/** Symbol search can resolve several exact lookups and one raw fallback scan. */
+const MCP_SEARCH_MAX_QUERIES = 8;
 
 /** Literal text search is intentionally narrow and source-only. */
 const MCP_TEXT_SEARCH_MAX_QUERIES = 8;
@@ -342,6 +354,12 @@ function isIdentifierLikeTextQuery(value: string): boolean {
   return Boolean(parsed.signature) || /::|\./.test(symbol) || isDistinctiveIdentifier(leaf);
 }
 
+/** Exact symbol/signature grammar without the distinctiveness gate used by recovery scans. */
+function isExactSymbolLookup(value: string): boolean {
+  const parsed = parseCallableLookup(value.trim());
+  return /^[~A-Za-z_$][\w$~]*(?:(?:::|\.)[~A-Za-z_$][\w$~]*)*$/.test(parsed.symbol);
+}
+
 /**
  * Per-file staleness banner emitted at the top of a tool response when the
  * file watcher has pending events for files referenced by the response.
@@ -425,9 +443,14 @@ interface ContextFileTarget {
   file: string;
   outline: boolean;
   outlineLimit?: number;
+  outlineQueries?: string[];
+  symbols?: Array<{ symbol: string; signature?: string }>;
+  texts?: string[];
   offset?: number;
   limit?: number;
   text?: string;
+  /** A singular text supplied with offset+limit validates that exact window. */
+  textAsWindowAssertion?: boolean;
   contextLines: number;
   maxMatches: number;
 }
@@ -489,9 +512,9 @@ export const tools: ToolDefinition[] = [
   {
     name: 'search',
     description:
-      '按符号名搜索：精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
+      '按符号名搜索：`query` 查一个，`queries` 原生批量查 1–8 个；批量查无结果只执行一次多模式 raw-source 扫描。精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
       '支持裸名称和限定名（如 rtl::OString、Session.request），重名时可用 path/line 消歧。' +
-      '可直接传入可调用签名；唯一逻辑重载可用 includeCode="if_unique" 在同一次返回源码。' +
+      '可直接传入可调用签名；唯一逻辑重载可用 includeCode="if_unique" 在同一次返回声明和定义源码。限定 owner 写错但 leaf symbol 存在时先返回结构化候选，不做全仓 raw 扫描。' +
       '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
       '"how does auth work?"（自然语言问题）。' +
       '正面示例："signIn"、"UserService"、"handleAuth"、"TRMDBG"',
@@ -503,6 +526,26 @@ export const tools: ToolDefinition[] = [
           description:
             '符号名或限定名（例如 "signIn"、"rtl::OString"、"Session.request"）。' +
             '禁止传入：十六进制值(0x...)、自然语言问题、空格分隔的命令/描述',
+        },
+        queries: {
+          type: 'array',
+          description: '原生批量模式：1–8 个查询对象。每项必须有 query，并可单独覆盖 kind/limit/path/line/signature/includeCode。不要循环调用 search。运行时也兼容字符串项。',
+          minItems: 1,
+          maxItems: MCP_SEARCH_MAX_QUERIES,
+          items: {
+            type: 'object',
+            description: '一个精确符号查询。',
+            properties: {
+              query: { type: 'string', description: '符号名、限定名或可调用签名。' },
+              kind: { type: 'string', description: '可选节点类型过滤。', enum: SEARCHABLE_KINDS },
+              limit: { type: 'number', description: '该查询最大结果数。', minimum: 1, maximum: 100 },
+              path: { type: 'string', description: '可选文件路径子串。' },
+              line: { type: 'number', description: '可选 1-based 行号。', minimum: 1 },
+              signature: { type: 'string', description: '可选精确/显著签名。' },
+              includeCode: { type: 'string', description: '唯一逻辑重载时内联声明和定义源码。', enum: ['never', 'if_unique'] },
+            },
+            required: ['query'],
+          },
         },
         kind: {
           type: 'string',
@@ -534,18 +577,18 @@ export const tools: ToolDefinition[] = [
         },
         projectPath: projectPathProperty,
       },
-      required: ['query'],
+      required: [],
     },
   },
   {
     name: 'context',
-    description: 'Read 1–8 implementation targets in ONE bounded call. Targets may be exact symbols, selected `members` of a known container, an exact indexed-file window (`file` + `offset` + `limit<=240`; offset defaults to 1 when only limit is supplied), a literal anchor in one exact file (`file` + `text`), or a bare `{file}` which automatically returns a compact symbol outline instead of failing or dumping source. A JSON-stringified targets array is parsed automatically. File ranges are merged and deduplicated across targets. A multi-file window request that is likely to become batch-Read or exceed the output budget returns a compact symbol preflight instead of dumping partial source. Symbol overloads are never silently guessed.',
+    description: 'Manifest-driven implementation context: read 1–8 explicit target groups in ONE bounded call without natural-language inference. Use `{symbol, members:[...]}` for a container; member focus includes access labels and small comment/neighbor edit context. Exact `offset`/`limit` windows and singular `text` anchors remain supported; when singular `text` is combined with `offset+limit`, the explicit window is returned and text is checked as an assertion. Or use `{file, symbols:[...], texts:[...]}` to group up to 32 exact symbols and 8 literal edit anchors in one file. File-scoped and exact symbol targets include matching declaration/definition source bodies by default. `expectedMissing` verifies explicitly named new identifiers without using them for retrieval. File ranges are merged and deduplicated; unresolved symbols receive grep-equivalent current-source evidence in the same response. A bare `{file}` returns a compact symbol outline; batch outlines support symbolsOnly, outlineQuery/outlineQueries OR filters, and outlineLimit. A JSON-stringified targets array is parsed automatically. Preflight is character-budget driven: fitting precise windows are returned; over-budget non-manifest batches stop before partial source.',
     inputSchema: {
       type: 'object',
       properties: {
         targets: {
           type: 'array',
-          description: 'One to eight symbol/member/file-window/text-anchor targets. A bare `{file}` becomes a compact outline. Runtime also accepts a JSON-stringified array and parses it automatically. Adjacent or overlapping ranges in the same file are merged.',
+          description: 'One to eight explicit manifest groups. Prefer one `{file, symbols:[...]}` per implementation file or `{symbol:<container>, members:[...]}` per class. A bare `{file}` becomes an outline. Runtime also accepts a JSON-stringified array. Adjacent/overlapping current-source ranges are merged.',
           minItems: 1,
           maxItems: MCP_CONTEXT_MAX_TARGETS,
           items: {
@@ -558,7 +601,21 @@ export const tools: ToolDefinition[] = [
               },
               file: {
                 type: 'string',
-                description: 'Path/basename. With a symbol it disambiguates; by itself it automatically returns a compact symbol outline.',
+                description: 'Path/basename. With `symbol` it disambiguates. With `symbols`/`texts` it defines one manifest group. By itself it returns a compact outline.',
+              },
+              symbols: {
+                type: 'array',
+                description: 'File-manifest mode: 1–32 exact symbol names or callable signatures expected in this file. Matching declarations/definitions in other files are included when expand=`declaration_definition`. Do not put natural-language phrases here.',
+                minItems: 1,
+                maxItems: MCP_CONTEXT_MAX_FILE_SYMBOLS,
+                items: { type: 'string', description: 'Exact symbol name, qualified name, or callable signature.' },
+              },
+              texts: {
+                type: 'array',
+                description: 'File-manifest mode: 1–8 literal edit anchors searched together in this exact file. Useful for macros/schema markers/non-symbol boundaries.',
+                minItems: 1,
+                maxItems: MCP_CONTEXT_MAX_FILE_TEXTS,
+                items: { type: 'string', description: 'Exact literal text anchor.' },
               },
               line: {
                 type: 'number',
@@ -583,12 +640,12 @@ export const tools: ToolDefinition[] = [
               },
               limit: {
                 type: 'number',
-                description: 'File mode: source-window length (maximum 240; larger runtime values are safely clamped).',
+                description: 'File mode: source-window length (maximum 500; larger runtime values are safely clamped; output character budgets still apply).',
                 minimum: 1,
               },
               text: {
                 type: 'string',
-                description: 'File mode: literal anchor to locate in this exact indexed file. Cannot be combined with offset/limit.',
+                description: 'File mode: literal anchor to locate in this exact indexed file. When combined with offset+limit, the explicit window is returned and text is treated as an assertion instead of causing a parameter error.',
               },
               contextLines: {
                 type: 'number',
@@ -604,6 +661,27 @@ export const tools: ToolDefinition[] = [
                 maximum: MCP_CONTEXT_MAX_TEXT_MATCHES,
                 default: 1,
               },
+              symbolsOnly: {
+                type: 'boolean',
+                description: 'File outline mode. In batch mode this is accepted for parity with node(file=..., symbolsOnly=true).',
+              },
+              outlineQuery: {
+                type: 'string',
+                description: 'File outline mode: one substring or `a|b|c` OR expression over name/qualified name/signature.',
+              },
+              outlineQueries: {
+                type: 'array',
+                description: 'File outline mode: 1–8 case-insensitive OR filters.',
+                minItems: 1,
+                maxItems: 8,
+                items: { type: 'string', description: 'Partial symbol/member token.' },
+              },
+              outlineLimit: {
+                type: 'number',
+                description: 'File outline mode: maximum entries for this file (maximum 80).',
+                minimum: 1,
+                maximum: MCP_NODE_MAX_OUTLINE_SYMBOLS,
+              },
             },
           },
         },
@@ -611,6 +689,19 @@ export const tools: ToolDefinition[] = [
           type: 'boolean',
           description: 'Include caller/callee trails for every target (default: false). Leave false for edit context; use relationship tools for graph questions.',
           default: false,
+        },
+        expand: {
+          type: 'string',
+          description: 'Deterministic expansion for file-scoped `symbols`: include matching declaration/definition partners, or only nodes in the named file. No natural-language or semantic inference is performed.',
+          enum: ['declaration_definition', 'none'],
+          default: 'declaration_definition',
+        },
+        expectedMissing: {
+          type: 'array',
+          description: 'Explicit identifiers expected to be new/absent before the edit. They are verified with current-source evidence but never used to discover implementation targets.',
+          minItems: 1,
+          maxItems: MCP_CONTEXT_MAX_EXPECTED_MISSING,
+          items: { type: 'string', description: 'Exact identifier expected not to exist yet.' },
         },
         projectPath: projectPathProperty,
       },
@@ -668,7 +759,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'callers',
-    description: 'List functions that call one exact symbol/overload. Optional `file`, `line`, and `signature` hints disambiguate overloaded or same-named symbols. If more than one logical overload remains, no graph traversal is run; exact candidates are returned instead of aggregating unrelated callers.',
+    description: 'List functions that call one exact symbol/overload. Optional `file`, `line`, and `signature` hints disambiguate overloaded or same-named symbols. If more than one logical overload remains, no graph traversal is run; exact candidates are returned instead of aggregating unrelated callers. For one exact C++/interface override, callers attached to its base virtual declaration are aggregated across the explicit dispatch family.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -773,10 +864,83 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'node',
-    description: 'Read the smallest useful code context. Prefer SYMBOL MODE whenever a function, method, class, struct, enum, or other symbol can be named: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`. When 2–8 symbols are already known, use `codegraph_context` instead of looping this tool. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery`; copied offset/limit fields are ignored in that explicit outline mode. Use an explicit `offset` + `limit` (maximum 120) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
+    description: 'Read the smallest useful code context. Native BATCH MODE accepts `targets=[...]` with 1–8 precise symbol/member/text/file-region targets, including grouped `{file, symbols:[...], texts:[...]}` manifests and filtered file outlines, and automatically returns one merged implementation bundle; prefer it over looping codegraph_node or context. Exact C/C++ symbol source includes paired declaration and definition bodies. Member focus includes access labels and small comment/neighbor edit context. Prefer SYMBOL MODE for one known implementation: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery="a|b"` or `outlineQueries`. Use an explicit `offset` + `limit` (maximum 500, subject to the output character budget) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
     inputSchema: {
       type: 'object',
       properties: {
+        targets: {
+          type: 'array',
+          description: 'Native batch mode: 1–8 precise targets. Supports `{symbol, file?, line?, signature?, members?}`, grouped `{file, symbols:[...], texts:[...]}`, `{file}` for an outline, `{file, text, contextLines?, maxMatches?}`, and `{file, offset, limit}`. Source ranges are merged and declaration/definition partners are expanded exactly like codegraph_context.',
+          minItems: 1,
+          maxItems: MCP_CONTEXT_MAX_TARGETS,
+          items: {
+            type: 'object',
+            description: 'One precise symbol/member/text/file-region target.',
+            properties: {
+              symbol: { type: 'string', description: 'Exact symbol or qualified name.' },
+              file: { type: 'string', description: 'Optional symbol disambiguator, or exact file for outline/text/region mode.' },
+              symbols: {
+                type: 'array',
+                description: 'File-manifest mode: 1–32 exact symbol names or callable signatures in this file.',
+                minItems: 1,
+                maxItems: MCP_CONTEXT_MAX_FILE_SYMBOLS,
+                items: { type: 'string', description: 'Exact symbol name, qualified name, or callable signature.' },
+              },
+              texts: {
+                type: 'array',
+                description: 'File-manifest mode: 1–8 literal edit anchors searched together in this file.',
+                minItems: 1,
+                maxItems: MCP_CONTEXT_MAX_FILE_TEXTS,
+                items: { type: 'string', description: 'Exact literal text anchor.' },
+              },
+              line: { type: 'number', description: 'Optional 1-based source line for symbol disambiguation.', minimum: 1 },
+              signature: { type: 'string', description: 'Optional exact/distinctive callable signature.' },
+              members: {
+                type: 'array',
+                description: 'Container-member focus; up to 32 exact member names.',
+                minItems: 1,
+                maxItems: MCP_CONTEXT_MAX_MEMBERS,
+                items: { type: 'string', description: 'Exact member name.' },
+              },
+              offset: { type: 'number', description: 'Exact file-region start.', minimum: 1 },
+              limit: { type: 'number', description: 'Exact file-region line count; safely clamped to 500, with output character budgets still enforced.', minimum: 1 },
+              text: { type: 'string', description: 'Literal anchor in the exact file. With offset+limit it becomes a window assertion and does not conflict.' },
+              contextLines: {
+                type: 'number',
+                description: 'Lines before/after a text anchor.',
+                minimum: 0,
+                maximum: MCP_CONTEXT_MAX_TEXT_CONTEXT_LINES,
+              },
+              maxMatches: {
+                type: 'number',
+                description: 'Maximum text-anchor matches.',
+                minimum: 1,
+                maximum: MCP_CONTEXT_MAX_TEXT_MATCHES,
+              },
+              symbolsOnly: {
+                type: 'boolean',
+                description: 'Return a compact outline for this batch file target.',
+              },
+              outlineQuery: {
+                type: 'string',
+                description: 'Outline filter; supports `a|b|c` as OR.',
+              },
+              outlineQueries: {
+                type: 'array',
+                description: 'One to eight outline filters combined with OR.',
+                minItems: 1,
+                maxItems: 8,
+                items: { type: 'string', description: 'Partial symbol/member token.' },
+              },
+              outlineLimit: {
+                type: 'number',
+                description: 'Maximum outline entries for this file.',
+                minimum: 1,
+                maximum: MCP_NODE_MAX_OUTLINE_SYMBOLS,
+              },
+            },
+          },
+        },
         symbol: {
           type: 'string',
           description: 'Symbol mode: exact symbol name to inspect. Prefer this whenever the target can be named.',
@@ -790,9 +954,22 @@ export const tools: ToolDefinition[] = [
           type: 'boolean',
           description: 'Symbol mode only: include the caller/callee trail. Omitted = auto (suppressed for an already-disambiguated file/line or qualified symbol; included for a bare exploratory symbol). Set explicitly for deterministic behavior.',
         },
+        expand: {
+          type: 'string',
+          description: 'Batch mode only: expand file-scoped symbols to declaration/definition partners, or keep only nodes in the named file.',
+          enum: ['declaration_definition', 'none'],
+          default: 'declaration_definition',
+        },
+        expectedMissing: {
+          type: 'array',
+          description: 'Batch mode only: explicitly named new identifiers to verify as absent with current-source evidence; never used for retrieval.',
+          minItems: 1,
+          maxItems: MCP_CONTEXT_MAX_EXPECTED_MISSING,
+          items: { type: 'string', description: 'Exact identifier expected not to exist yet.' },
+        },
         file: {
           type: 'string',
-          description: 'Path/basename. With `symbol`, disambiguates that definition. Without `symbol`, requires either `symbolsOnly=true` or both `offset` and `limit<=120`.',
+          description: 'Path/basename. With `symbol`, disambiguates that definition. Without `symbol`, requires either `symbolsOnly=true` or both `offset` and `limit<=500`.',
         },
         offset: {
           type: 'number',
@@ -801,7 +978,7 @@ export const tools: ToolDefinition[] = [
         },
         limit: {
           type: 'number',
-          description: 'Guarded file-window mode only: requested line count. Values above 120 are accepted and safely clamped to 120, avoiding a failed correction call. Cannot be combined with `symbol` or `symbolsOnly`.',
+          description: 'Guarded file-window mode only: requested line count. Values above 500 are accepted and safely clamped to 500 (the output character budget still applies), avoiding a failed correction call. Cannot be combined with `symbol` or `symbolsOnly`.',
           minimum: 1,
         },
         symbolsOnly: {
@@ -812,6 +989,13 @@ export const tools: ToolDefinition[] = [
         outlineQuery: {
           type: 'string',
           description: 'symbolsOnly mode: optional case-insensitive substring filter over symbol/qualified name/signature. Use when the task gives partial names.',
+        },
+        outlineQueries: {
+          type: 'array',
+          description: 'symbolsOnly mode: 1–8 case-insensitive OR filters. `outlineQuery="a|b"` is normalized to the same form.',
+          minItems: 1,
+          maxItems: 8,
+          items: { type: 'string', description: 'Partial symbol/member token.' },
         },
         outlineLimit: {
           type: 'number',
@@ -1403,6 +1587,50 @@ export class ToolHandler {
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
+    if (args.queries === undefined) {
+      if (args.query === undefined) return this.errorResult('Provide query for one symbol or queries for a batch of 1 to 8 symbols');
+      return this.handleSearchSingle(args);
+    }
+    if (args.query !== undefined) return this.errorResult('codegraph_search cannot combine query with queries; choose single or batch mode');
+    if (!Array.isArray(args.queries) || args.queries.length < 1 || args.queries.length > MCP_SEARCH_MAX_QUERIES) {
+      return this.errorResult(`queries must contain 1 to ${MCP_SEARCH_MAX_QUERIES} symbol queries`);
+    }
+
+    const deferredRawEvidence: RawEvidenceSpec[] = [];
+    const sections: string[] = [];
+    const defaults = { ...args };
+    delete defaults.queries;
+    for (let i = 0; i < args.queries.length; i++) {
+      const raw = args.queries[i];
+      const item = typeof raw === 'string'
+        ? { query: raw }
+        : raw && typeof raw === 'object' && !Array.isArray(raw)
+          ? raw as Record<string, unknown>
+          : null;
+      if (!item) return this.errorResult(`queries[${i}] must be a string or query object`);
+      const result = await this.handleSearchSingle({ ...defaults, ...item }, deferredRawEvidence);
+      if (result.isError) return result;
+      const queryLabel = typeof item.query === 'string' ? item.query : `queries[${i}]`;
+      sections.push(`## ${queryLabel}\n\n${result.content.map((entry) => entry.text).join('\n')}`);
+    }
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const evidence = this.renderRawEvidence(cg, deferredRawEvidence);
+    const out = [
+      `# Batch symbol search (${args.queries.length} queries)`,
+      '',
+      '> Exact/structured resolution was completed for every query. All true graph misses below shared one multi-pattern raw-source fallback scan.',
+      '',
+      sections.join('\n\n---\n\n'),
+      evidence,
+    ].filter(Boolean).join('\n\n');
+    return this.textResult(this.truncateOutput(out));
+  }
+
+  private async handleSearchSingle(
+    args: Record<string, unknown>,
+    deferredRawEvidence?: RawEvidenceSpec[],
+  ): Promise<ToolResult> {
     const queryValue = this.validateString(args.query, 'query');
     if (typeof queryValue !== 'string') return queryValue;
     const queryText = queryValue.trim();
@@ -1415,7 +1643,15 @@ export class ToolHandler {
     if (signatureValue !== undefined && typeof signatureValue !== 'string') return signatureValue;
     const signature = signatureValue?.trim() || undefined;
     if (args.signature !== undefined && !signature) return this.errorResult('signature must not be blank');
-    const includeCode = args.includeCode === undefined ? 'never' : args.includeCode;
+    let includeCode = args.includeCode === undefined ? 'never' : args.includeCode;
+    let includeCodeCorrection = '';
+    if (typeof includeCode === 'string') {
+      const stripped = includeCode.trim().replace(/^["']+|["']+$/g, '');
+      if ((stripped === 'never' || stripped === 'if_unique') && stripped !== includeCode) {
+        includeCodeCorrection = `> Automatically corrected includeCode=${JSON.stringify(includeCode)} to ${JSON.stringify(stripped)}.`;
+        includeCode = stripped;
+      }
+    }
     if (includeCode !== 'never' && includeCode !== 'if_unique') {
       return this.errorResult('includeCode must be "never" or "if_unique"');
     }
@@ -1424,12 +1660,13 @@ export class ToolHandler {
     // course before the FTS→LIKE→fuzzy chain wastes time on bad input.
     const nlCheck = isNaturalLanguageQuery(query);
     if (nlCheck.isNatural) {
-      return this.textResult(
+      return this.textResult([
+        includeCodeCorrection,
         `codegraph_search 需要传入符号名，不支持自然语言描述或非符号内容。\n\n` +
         `收到的查询: "${query}"\n` +
         `检测到: ${nlCheck.reason}\n\n` +
-        `→ 请从你的问题中提取关键符号名，直接搜索符号名。\n`
-      );
+        `→ 请从你的问题中提取关键符号名，直接搜索符号名。\n`,
+      ].filter(Boolean).join('\n\n'));
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
@@ -1479,9 +1716,12 @@ export class ToolHandler {
         const candidates = this.rankExactSymbolNodes(exact).slice(0, limit);
         const formatted = this.formatSearchResults(cg, candidates.map((node) => ({ node, score: 1.0 })));
         return this.textResult(this.truncateOutput([
+          includeCodeCorrection,
           `> Signature hint did not match \`${signature}\`. No source was inlined and no overload was guessed.`,
           '',
           formatted,
+          '',
+          '> Raw-source fallback was skipped: exact structured symbol candidates already exist, so this is a signature assertion mismatch rather than a graph miss.',
           '',
           '> Copy one returned signature exactly, or use its path plus line.',
         ].join('\n')));
@@ -1491,13 +1731,33 @@ export class ToolHandler {
     if (exact.length > 0) {
       const ranked = this.rankExactSymbolNodes(this.preferContainerMatches(exact, lineHint, signature));
       const groups = this.relationshipOverloadGroups(cg, ranked, exactAll);
+      const declarationOnly = ranked.some((node) =>
+        node.isDeclaration === true && cppParameterKey(node) !== null &&
+        this.indexedDefinitionForDeclaration(cg, node) === null
+      );
+      const declarationEvidenceNeedle = declarationOnly ? this.rawEvidenceNeedle(query) : undefined;
+      const declarationEvidence = declarationEvidenceNeedle
+        ? this.renderSearchRawEvidence(cg, [{
+          label: signature ?? queryText,
+          needle: declarationEvidenceNeedle,
+          path: validatedPath,
+          purpose: 'declaration_only',
+        }], deferredRawEvidence)
+        : '';
       if (includeCode === 'if_unique' && groups.length === 1) {
         const primary = this.rankExactSymbolNodes(groups[0]!)[0]!;
-        const section = await this.renderNodeSection(cg, primary, true, false);
+        const section = await this.renderImplementationGroup(cg, groups[0]!, false);
         const notice = caseCorrected
           ? `> Case-insensitive unique correction: \`${queryText}\` → \`${primary.signature ?? displaySymbol(primary)}\`.`
           : `> Unique exact result; source included in this search response. Do not call codegraph_node for it.`;
-        return this.textResult(this.truncateOutput([notice, '', section, this.formatOtherOverloadSummary(cg, query, primary)].filter(Boolean).join('\n')));
+        return this.textResult(this.truncateOutput([
+          includeCodeCorrection,
+          notice,
+          '',
+          section,
+          this.formatOtherOverloadSummary(cg, query, primary),
+          declarationEvidence,
+        ].filter(Boolean).join('\n')));
       }
       const total = ranked.length;
       const capped = ranked.slice(0, limit);
@@ -1514,13 +1774,36 @@ export class ToolHandler {
         ? `\n\n> Showing ${capped.length} of ${total} exact ${qualifier}matches${pathNote}${lineNote}. Raise \`limit\` or narrow \`path\`/\`line\` to see the intended symbol.`
         : '';
       const formatted = this.formatSearchResults(cg, capped.map((node) => ({ node, score: 1.0 })));
-      return this.textResult(this.truncateOutput(formatted + caseNote + sourceNote + note));
+      return this.textResult(this.truncateOutput([
+        includeCodeCorrection,
+        formatted + caseNote + sourceNote + note,
+        declarationEvidence,
+      ].filter(Boolean).join('\n\n')));
     }
 
     // A qualified query is already an explicit disambiguation request. Never
     // silently degrade it to an unrelated fuzzy symbol.
     if (isQualified) {
-      return this.textResult(`No results found for "${query}"`);
+      const ownerRecovery = await this.renderQualifiedOwnerRecovery(
+        cg,
+        queryText,
+        query,
+        kinds,
+        pathHint,
+        validatedPath,
+        lineHint,
+        signature,
+        limit,
+        includeCode === 'if_unique',
+      );
+      if (ownerRecovery) {
+        return this.textResult(this.truncateOutput([includeCodeCorrection, ownerRecovery].filter(Boolean).join('\n\n')));
+      }
+      const needle = this.rawEvidenceNeedle(query);
+      const evidence = needle
+        ? this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        : '';
+      return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
 
     // No exact bare-name match — fuzzy fallback, visibly labelled.
@@ -1529,11 +1812,23 @@ export class ToolHandler {
       : query;
     const fuzzy = cg.searchNodes(fuzzyQuery, { limit, kinds, line: lineHint });
     if (fuzzy.length === 0) {
-      return this.textResult(`No results found for "${query}"`);
+      const needle = this.rawEvidenceNeedle(query);
+      const evidence = needle
+        ? this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        : '';
+      return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
     const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:`;
     const formatted = this.formatSearchResults(cg, this.rankSearchResults(fuzzy));
-    return this.textResult(this.truncateOutput(note + '\n' + formatted));
+    const needle = exactAll.length === 0 ? this.rawEvidenceNeedle(query) : undefined;
+    const evidence = needle
+      ? this.renderSearchRawEvidence(cg, [{ label: `exact identifier behind fuzzy results: ${queryText}`, needle, path: validatedPath }], deferredRawEvidence)
+      : '';
+    return this.textResult(this.truncateOutput([
+      includeCodeCorrection,
+      note + '\n' + formatted,
+      evidence,
+    ].filter(Boolean).join('\n\n')));
   }
 
   /**
@@ -1543,6 +1838,27 @@ export class ToolHandler {
    */
   private async handleContext(args: Record<string, unknown>): Promise<ToolResult> {
     const corrections: string[] = [];
+    const expand = args.expand === undefined ? 'declaration_definition' : args.expand;
+    if (expand !== 'declaration_definition' && expand !== 'none') {
+      return this.errorResult('expand must be "declaration_definition" or "none"');
+    }
+    const expectedMissing: string[] = [];
+    if (args.expectedMissing !== undefined) {
+      if (!Array.isArray(args.expectedMissing) || args.expectedMissing.length < 1 ||
+          args.expectedMissing.length > MCP_CONTEXT_MAX_EXPECTED_MISSING) {
+        return this.errorResult(`expectedMissing must contain 1 to ${MCP_CONTEXT_MAX_EXPECTED_MISSING} exact identifiers`);
+      }
+      for (let i = 0; i < args.expectedMissing.length; i++) {
+        const value = this.validateString(args.expectedMissing[i], `expectedMissing[${i}]`, 256);
+        if (typeof value !== 'string') return value;
+        const identifier = value.trim();
+        if (!identifier) return this.errorResult(`expectedMissing[${i}] must not be blank`);
+        if (!isExactSymbolLookup(identifier)) {
+          return this.errorResult(`expectedMissing[${i}] must be an exact identifier, qualified name, or callable signature`);
+        }
+        expectedMissing.push(identifier);
+      }
+    }
     let rawTargetsValue = args.targets;
     if (typeof rawTargetsValue === 'string') {
       if (rawTargetsValue.length > 32_000) {
@@ -1604,7 +1920,10 @@ export class ToolHandler {
 
       if (symbolText) {
         if (target.offset !== undefined || target.limit !== undefined || target.text !== undefined ||
-            target.contextLines !== undefined || target.maxMatches !== undefined) {
+            target.texts !== undefined || target.symbols !== undefined ||
+            target.contextLines !== undefined || target.maxMatches !== undefined ||
+            target.symbolsOnly !== undefined || target.outlineQuery !== undefined ||
+            target.outlineQueries !== undefined || target.outlineLimit !== undefined) {
           return this.errorResult(`targets[${i}] mixes symbol mode with file-window/text mode`);
         }
         if (target.line !== undefined &&
@@ -1650,21 +1969,94 @@ export class ToolHandler {
       if (target.signature !== undefined || target.line !== undefined || target.members !== undefined) {
         return this.errorResult(`targets[${i}] uses symbol-only hints without a symbol`);
       }
+      if (target.symbolsOnly !== undefined && typeof target.symbolsOnly !== 'boolean') {
+        return this.errorResult(`targets[${i}].symbolsOnly must be a boolean`);
+      }
+      const outlineQueries: string[] = [];
+      if (target.outlineQuery !== undefined) {
+        const value = this.validateString(target.outlineQuery, `targets[${i}].outlineQuery`, 256);
+        if (typeof value !== 'string') return value;
+        for (const token of value.split('|').map((part) => part.trim()).filter(Boolean)) {
+          if (!outlineQueries.includes(token)) outlineQueries.push(token);
+        }
+      }
+      if (target.outlineQueries !== undefined) {
+        if (!Array.isArray(target.outlineQueries) || target.outlineQueries.length < 1 || target.outlineQueries.length > 8) {
+          return this.errorResult(`targets[${i}].outlineQueries must contain 1 to 8 filters`);
+        }
+        for (let j = 0; j < target.outlineQueries.length; j++) {
+          const value = this.validateString(target.outlineQueries[j], `targets[${i}].outlineQueries[${j}]`, 256);
+          if (typeof value !== 'string') return value;
+          const token = value.trim();
+          if (!token) return this.errorResult(`targets[${i}].outlineQueries[${j}] must not be blank`);
+          if (!outlineQueries.includes(token)) outlineQueries.push(token);
+        }
+      }
+      if (outlineQueries.length > 8) return this.errorResult(`targets[${i}] has more than 8 outline filters after expanding outlineQuery OR terms`);
+      if (target.outlineLimit !== undefined &&
+          (typeof target.outlineLimit !== 'number' || !Number.isInteger(target.outlineLimit) || target.outlineLimit < 1)) {
+        return this.errorResult(`targets[${i}].outlineLimit must be a positive integer`);
+      }
+      let symbols: Array<{ symbol: string; signature?: string }> | undefined;
+      if (target.symbols !== undefined) {
+        if (!Array.isArray(target.symbols) || target.symbols.length < 1 || target.symbols.length > MCP_CONTEXT_MAX_FILE_SYMBOLS) {
+          return this.errorResult(`targets[${i}].symbols must contain 1 to ${MCP_CONTEXT_MAX_FILE_SYMBOLS} exact names or signatures`);
+        }
+        symbols = [];
+        for (let j = 0; j < target.symbols.length; j++) {
+          const value = this.validateString(target.symbols[j], `targets[${i}].symbols[${j}]`, 1024);
+          if (typeof value !== 'string') return value;
+          const text = value.trim();
+          if (!text) return this.errorResult(`targets[${i}].symbols[${j}] must not be blank`);
+          const parsed = parseCallableLookup(text);
+          if (!isExactSymbolLookup(text)) {
+            return this.errorResult(`targets[${i}].symbols[${j}] must be an exact symbol name or callable signature, not natural language`);
+          }
+          symbols.push({ symbol: parsed.symbol, signature: parsed.signature });
+        }
+      }
       const textValue = target.text === undefined
         ? undefined
         : this.validateString(target.text, `targets[${i}].text`, 1024);
       if (textValue !== undefined && typeof textValue !== 'string') return textValue;
       const text = textValue?.trim() || undefined;
+      let texts: string[] | undefined;
+      if (target.texts !== undefined) {
+        if (!Array.isArray(target.texts) || target.texts.length < 1 || target.texts.length > MCP_CONTEXT_MAX_FILE_TEXTS) {
+          return this.errorResult(`targets[${i}].texts must contain 1 to ${MCP_CONTEXT_MAX_FILE_TEXTS} literals`);
+        }
+        if (text) return this.errorResult(`targets[${i}] cannot combine text with texts`);
+        texts = [];
+        for (let j = 0; j < target.texts.length; j++) {
+          const value = this.validateString(target.texts[j], `targets[${i}].texts[${j}]`, 1024);
+          if (typeof value !== 'string') return value;
+          const literal = value.trim();
+          if (!literal) return this.errorResult(`targets[${i}].texts[${j}] must not be blank`);
+          texts.push(literal);
+        }
+      }
       let effectiveOffset = target.offset;
       const effectiveLimit = target.limit;
-      if (!text && effectiveOffset === undefined && effectiveLimit !== undefined) {
+      const hasManifest = Boolean(symbols?.length || texts?.length);
+      if (!text && !hasManifest && effectiveOffset === undefined && effectiveLimit !== undefined) {
         effectiveOffset = 1;
         corrections.push(`targets[${i}]: defaulted missing file-window offset to 1`);
       }
       const hasWindow = effectiveOffset !== undefined || effectiveLimit !== undefined;
-      if (text && hasWindow) return this.errorResult(`targets[${i}] cannot combine text with offset/limit`);
-      const outline = !text && !hasWindow;
-      if (outline) corrections.push(`targets[${i}]: treated bare file as a compact symbol outline`);
+      // Models commonly add a literal anchor to an already precise region.
+      // That is redundant, not ambiguous: preserve the explicit edit window
+      // and use the singular text as an assertion about its contents. Grouped
+      // manifests remain incompatible with a raw range because their items
+      // independently determine the returned ranges.
+      const textAsWindowAssertion = Boolean(text && hasWindow && !hasManifest);
+      if (hasManifest && hasWindow) return this.errorResult(`targets[${i}] cannot combine symbols/texts with offset/limit`);
+      const requestedOutline = target.symbolsOnly === true || outlineQueries.length > 0 || target.outlineLimit !== undefined;
+      if (requestedOutline && (text || hasManifest || hasWindow)) {
+        return this.errorResult(`targets[${i}] cannot combine outline controls with symbols/text/window mode`);
+      }
+      const outline = requestedOutline || (!text && !hasManifest && !hasWindow);
+      if (outline && !requestedOutline) corrections.push(`targets[${i}]: treated bare file as a compact symbol outline`);
+      if (outline && requestedOutline && target.symbolsOnly !== true) corrections.push(`targets[${i}]: inferred symbolsOnly=true from outline filters/limit`);
       if (hasWindow &&
           (typeof effectiveOffset !== 'number' || !Number.isInteger(effectiveOffset) || effectiveOffset < 1 ||
            typeof effectiveLimit !== 'number' || !Number.isInteger(effectiveLimit) || effectiveLimit < 1)) {
@@ -1678,15 +2070,25 @@ export class ToolHandler {
           (typeof target.maxMatches !== 'number' || !Number.isInteger(target.maxMatches) || target.maxMatches < 1)) {
         return this.errorResult(`targets[${i}].maxMatches must be a positive integer`);
       }
+      if (textAsWindowAssertion) {
+        corrections.push(`targets[${i}]: kept the explicit file window and treated text as a window assertion`);
+      }
       targets.push({
         mode: 'file',
         file: fileText,
         outline,
+        outlineQueries: outlineQueries.length > 0 ? outlineQueries : undefined,
+        outlineLimit: target.outlineLimit === undefined
+          ? undefined
+          : clamp(target.outlineLimit as number, 1, MCP_NODE_MAX_OUTLINE_SYMBOLS),
+        symbols,
+        texts,
         offset: effectiveOffset as number | undefined,
         limit: effectiveLimit === undefined
           ? undefined
           : Math.min(effectiveLimit as number, MCP_CONTEXT_MAX_FILE_WINDOW_LINES),
         text,
+        textAsWindowAssertion,
         contextLines: clamp((target.contextLines as number | undefined) ?? 20, 0, MCP_CONTEXT_MAX_TEXT_CONTEXT_LINES),
         maxMatches: clamp((target.maxMatches as number | undefined) ?? 1, 1, MCP_CONTEXT_MAX_TEXT_MATCHES),
       });
@@ -1701,15 +2103,37 @@ export class ToolHandler {
         8,
         MCP_CONTEXT_MAX_OUTLINE_SYMBOLS_PER_FILE,
       );
-      for (const target of outlineTargets) target.outlineLimit = perFileLimit;
+      for (const target of outlineTargets) {
+        target.outlineLimit = Math.min(target.outlineLimit ?? perFileLimit, perFileLimit);
+      }
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const includeRelations = args.includeRelations === true;
     const sectionCandidates: ContextSectionCandidate[] = [];
     const misses: string[] = [];
+    const rawEvidenceSpecs: RawEvidenceSpec[] = [];
     const fileRanges = new Map<string, { file: ResolvedIndexedFile; ranges: ContextFileRange[]; targetIndexes: Set<number> }>();
     const resolvedTargets = new Set<number>();
+    const addNodeRange = (node: Node, label: string, targetIndex: number) => {
+      if (CONFIG_LEAF_LANGUAGES.has(node.language)) return;
+      const file: ResolvedIndexedFile = { path: node.filePath, language: node.language };
+      const entry = fileRanges.get(file.path) ?? { file, ranges: [], targetIndexes: new Set<number>() };
+      entry.ranges.push({ start: node.startLine, end: node.endLine, labels: [label] });
+      entry.targetIndexes.add(targetIndex);
+      fileRanges.set(file.path, entry);
+    };
+    for (const expected of expectedMissing) {
+      const parsed = parseCallableLookup(expected);
+      const exact = typeof cg.getNodesBySymbolExact === 'function'
+        ? cg.getNodesBySymbolExact(parsed.symbol)
+        : cg.getNodesByName(parsed.symbol);
+      if (exact.length > 0) {
+        misses.push(`- expected-new \`${expected}\`: already exists as ${exact.length} indexed symbol node(s)`);
+      }
+      const needle = this.rawEvidenceNeedle(parsed.symbol);
+      if (needle) rawEvidenceSpecs.push({ label: `expected-new: ${expected}`, needle });
+    }
 
     for (let targetIndex = 0; targetIndex < targets.length; targetIndex++) {
       const target = targets[targetIndex]!;
@@ -1723,6 +2147,7 @@ export class ToolHandler {
           const outlineResult = await this.handleFileView(cg, resolved.file.path, {
             symbolsOnly: true,
             outlineLimit: target.outlineLimit,
+            outlineQueries: target.outlineQueries,
             notice: '> Automatically converted bare context file target to a compact symbol outline; no source was dumped.',
           });
           const section = outlineResult.content.map((item) => item.text).join('\n');
@@ -1736,8 +2161,70 @@ export class ToolHandler {
           resolvedTargets.add(targetIndex);
           continue;
         }
+        let resolvedAnyManifestItem = false;
+        if (target.symbols?.length) {
+          for (const wanted of target.symbols) {
+            let allMatches = typeof cg.getNodesBySymbolExact === 'function'
+              ? cg.getNodesBySymbolExact(wanted.symbol)
+              : cg.getNodesByName(wanted.symbol);
+            if (allMatches.length === 0) allMatches = this.findCaseInsensitiveSymbolMatches(cg, wanted.symbol);
+            if (allMatches.length === 0) {
+              const label = wanted.signature ?? wanted.symbol;
+              misses.push(`- symbol \`${label}\` expected in ${resolved.file.path}: not found in the graph`);
+              const needle = this.rawEvidenceNeedle(wanted.symbol);
+              if (needle) rawEvidenceSpecs.push({ label, needle, path: resolved.file.path });
+              continue;
+            }
+            const narrowed = this.narrowSymbolMatches(allMatches, resolved.file.path, undefined);
+            if (!narrowed.fileMatched) {
+              const label = wanted.signature ?? wanted.symbol;
+              misses.push(`- symbol \`${label}\`: exact candidates exist, but none in ${resolved.file.path}`);
+              const needle = this.rawEvidenceNeedle(wanted.symbol);
+              if (needle) rawEvidenceSpecs.push({ label, needle, path: resolved.file.path });
+              continue;
+            }
+            let selected = this.preferContainerMatches(narrowed.matches, undefined, wanted.signature);
+            selected = this.narrowMatchesBySignature(selected, wanted.signature);
+            if (selected.length === 0) {
+              const label = wanted.signature ?? wanted.symbol;
+              misses.push(`- symbol \`${label}\` in ${resolved.file.path}: signature did not match any exact candidate`);
+              const needle = this.rawEvidenceNeedle(wanted.symbol);
+              if (needle) rawEvidenceSpecs.push({ label, needle, path: resolved.file.path });
+              continue;
+            }
+            const expanded = expand === 'declaration_definition'
+              ? this.relationshipOverloadGroups(cg, selected, allMatches).flat()
+              : selected;
+            if (expanded.some((node) =>
+              node.isDeclaration === true && cppParameterKey(node) !== null &&
+              this.indexedDefinitionForDeclaration(cg, node) === null
+            )) {
+              const needle = this.rawEvidenceNeedle(wanted.symbol);
+              if (needle) rawEvidenceSpecs.push({
+                label: `declaration-only: ${wanted.signature ?? wanted.symbol}`,
+                needle,
+                purpose: 'declaration_only',
+              });
+            }
+            const seen = new Set<string>();
+            for (const node of expanded) {
+              if (seen.has(node.id)) continue;
+              seen.add(node.id);
+              addNodeRange(node, `manifest symbol: ${wanted.signature ?? wanted.symbol}`, targetIndex);
+            }
+            resolvedAnyManifestItem = true;
+          }
+        }
+        const requestedTexts = target.texts ?? (target.text ? [target.text] : []);
+        const needsCurrentFile = requestedTexts.length > 0 ||
+          (target.offset !== undefined && target.limit !== undefined);
+        if (!needsCurrentFile) {
+          if (resolvedAnyManifestItem) resolvedTargets.add(targetIndex);
+          continue;
+        }
         if (CONFIG_LEAF_LANGUAGES.has(resolved.file.language)) {
           misses.push(`- file \`${resolved.file.path}\`: configuration/data values are withheld; read it directly only if a value is required`);
+          if (resolvedAnyManifestItem) resolvedTargets.add(targetIndex);
           continue;
         }
         const abs = validatePathWithinRoot(cg.getProjectRoot(), resolved.file.path);
@@ -1747,26 +2234,50 @@ export class ToolHandler {
         }
         if (content === null) {
           misses.push(`- file \`${resolved.file.path}\`: current source could not be read`);
+          if (resolvedAnyManifestItem) resolvedTargets.add(targetIndex);
           continue;
         }
         const lines = content.split('\n');
         const ranges: ContextFileRange[] = [];
-        if (target.text) {
-          const wanted = target.text;
-          const matched: number[] = [];
-          for (let line = 0; line < lines.length && matched.length < target.maxMatches; line++) {
-            if (lines[line]!.includes(wanted)) matched.push(line + 1);
-          }
-          if (matched.length === 0) {
-            misses.push(`- text \`${wanted}\` in ${resolved.file.path}: not found`);
+        if (target.textAsWindowAssertion) {
+          const start = target.offset!;
+          const rawTarget = rawTargets[targetIndex] as Record<string, unknown>;
+          const requestedLimit = rawTarget.limit as number;
+          if (start > lines.length) {
+            misses.push(`- window ${resolved.file.path}:${start}: offset is past EOF (${lines.length})`);
             continue;
           }
-          for (const line of matched) {
-            ranges.push({
-              start: Math.max(1, line - target.contextLines),
-              end: Math.min(lines.length, line + target.contextLines),
-              labels: [`text: ${wanted}`],
-            });
+          const end = Math.min(lines.length, start + target.limit! - 1);
+          const asserted = requestedTexts[0]!;
+          const matched = lines.slice(start - 1, end).some((line) => line.includes(asserted));
+          ranges.push({
+            start,
+            end,
+            labels: [
+              `requested window${requestedLimit > MCP_CONTEXT_MAX_FILE_WINDOW_LINES ? `; safely clamped to ${MCP_CONTEXT_MAX_FILE_WINDOW_LINES} lines` : ''}`,
+              matched ? `text assertion matched: ${asserted}` : `text assertion NOT present in this window: ${asserted}`,
+            ],
+          });
+          if (!matched) {
+            misses.push(`- text assertion \`${asserted}\` is not present in requested window ${resolved.file.path}:${start}-${end}; the explicit window was returned unchanged`);
+          }
+        } else if (requestedTexts.length > 0) {
+          for (const wanted of requestedTexts) {
+            const matched: number[] = [];
+            for (let line = 0; line < lines.length && matched.length < target.maxMatches; line++) {
+              if (lines[line]!.includes(wanted)) matched.push(line + 1);
+            }
+            if (matched.length === 0) {
+              misses.push(`- text \`${wanted}\` in ${resolved.file.path}: CONFIRMED_ABSENT in the complete current file`);
+              continue;
+            }
+            for (const line of matched) {
+              ranges.push({
+                start: Math.max(1, line - target.contextLines),
+                end: Math.min(lines.length, line + target.contextLines),
+                labels: [`text: ${wanted}`],
+              });
+            }
           }
         } else {
           const start = target.offset!;
@@ -1782,21 +2293,27 @@ export class ToolHandler {
             labels: [`requested window${requestedLimit > MCP_CONTEXT_MAX_FILE_WINDOW_LINES ? `; safely clamped to ${MCP_CONTEXT_MAX_FILE_WINDOW_LINES} lines` : ''}`],
           });
         }
-        const entry = fileRanges.get(resolved.file.path) ?? { file: resolved.file, ranges: [], targetIndexes: new Set<number>() };
-        entry.ranges.push(...ranges);
-        entry.targetIndexes.add(targetIndex);
-        fileRanges.set(resolved.file.path, entry);
-        resolvedTargets.add(targetIndex);
+        if (ranges.length > 0) {
+          const entry = fileRanges.get(resolved.file.path) ?? { file: resolved.file, ranges: [], targetIndexes: new Set<number>() };
+          entry.ranges.push(...ranges);
+          entry.targetIndexes.add(targetIndex);
+          fileRanges.set(resolved.file.path, entry);
+          resolvedAnyManifestItem = true;
+        }
+        if (resolvedAnyManifestItem) resolvedTargets.add(targetIndex);
         continue;
       }
 
-      let matches = this.findSymbolMatches(cg, target.symbol);
+      const allMatches = this.findSymbolMatches(cg, target.symbol);
+      let matches = allMatches;
       const narrowed = this.narrowSymbolMatches(matches, target.file, target.line);
       matches = narrowed.matches;
       matches = this.preferContainerMatches(matches, target.line, target.signature);
       matches = this.narrowMatchesBySignature(matches, target.signature);
       if (matches.length === 0) {
         misses.push(`- \`${target.symbol}\`${target.file ? ` in ${target.file}` : ''}: not found`);
+        const needle = this.rawEvidenceNeedle(target.symbol);
+        if (needle) rawEvidenceSpecs.push({ label: target.signature ?? target.symbol, needle, path: target.file });
         continue;
       }
 
@@ -1834,6 +2351,12 @@ export class ToolHandler {
           }
           if (localMatches.length === 0) {
             missingMembers.push(wanted);
+            const needle = this.rawEvidenceNeedle(wanted);
+            if (needle) rawEvidenceSpecs.push({
+              label: `${displaySymbol(container)}::${wanted}`,
+              needle,
+              path: target.file,
+            });
             continue;
           }
 
@@ -1857,14 +2380,36 @@ export class ToolHandler {
             }
           }
 
+          if (memberMatches.some((node) =>
+            node.isDeclaration === true && cppParameterKey(node) !== null &&
+            this.indexedDefinitionForDeclaration(cg, node) === null
+          )) {
+            const needle = this.rawEvidenceNeedle(wanted);
+            if (needle) rawEvidenceSpecs.push({
+              label: `declaration-only: ${displaySymbol(container)}::${wanted}`,
+              needle,
+              purpose: 'declaration_only',
+            });
+          }
+
           for (const member of memberMatches) {
             if (CONFIG_LEAF_LANGUAGES.has(member.language)) continue;
             const file: ResolvedIndexedFile = { path: member.filePath, language: member.language };
             const entry = fileRanges.get(file.path) ?? { file, ranges: [], targetIndexes: new Set<number>() };
+            if (member.filePath === container.filePath) {
+              const accessLine = this.findCppAccessBoundaryLine(cg, container, member.startLine);
+              if (accessLine !== undefined) {
+                entry.ranges.push({
+                  start: accessLine,
+                  end: accessLine,
+                  labels: [`access boundary for member: ${wanted}`],
+                });
+              }
+            }
             entry.ranges.push({
-              start: member.startLine,
-              end: member.endLine,
-              labels: [`member: ${wanted}${corrected ? ` → ${member.name}` : ''}`],
+              start: Math.max(1, member.startLine - MCP_CONTEXT_MEMBER_NEIGHBOR_LINES),
+              end: member.endLine + MCP_CONTEXT_MEMBER_NEIGHBOR_LINES,
+              labels: [`member: ${wanted}${corrected ? ` → ${member.name}` : ''}; includes edit-ready comments/neighbors`],
             });
             entry.targetIndexes.add(targetIndex);
             fileRanges.set(file.path, entry);
@@ -1881,10 +2426,22 @@ export class ToolHandler {
       }
 
       let section: string;
-      if (matches.length === 1) {
-        const selected = matches[0]!;
+      if (matches.some((node) =>
+        node.isDeclaration === true && cppParameterKey(node) !== null &&
+        this.indexedDefinitionForDeclaration(cg, node) === null
+      )) {
+        const needle = this.rawEvidenceNeedle(target.symbol);
+        if (needle) rawEvidenceSpecs.push({
+          label: `declaration-only: ${target.signature ?? target.symbol}`,
+          needle,
+          purpose: 'declaration_only',
+        });
+      }
+      const overloadGroups = this.relationshipOverloadGroups(cg, matches, allMatches);
+      if (overloadGroups.length === 1) {
+        const selected = this.rankExactSymbolNodes(overloadGroups[0]!)[0]!;
         section = [
-          await this.renderNodeSection(cg, selected, true, includeRelations),
+          await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations),
           this.formatOtherOverloadSummary(cg, target.symbol, selected),
         ].filter(Boolean).join('\n\n');
       } else {
@@ -1926,39 +2483,71 @@ export class ToolHandler {
     const estimatedOutputChars = sectionCandidates.reduce((total, candidate) => total + candidate.estimatedChars, 0) +
       Math.max(0, sectionCandidates.length - 1) * 7;
     const fileWindowTargets = targets.filter((target): target is ContextFileTarget =>
-      target.mode === 'file' && !target.text && target.offset !== undefined && target.limit !== undefined
+      target.mode === 'file' && target.offset !== undefined && target.limit !== undefined
     );
     const requestedWindowLines = fileWindowTargets.reduce((total, target) => total + target.limit!, 0);
     const broadFileWindowBatch = fileWindowTargets.length >= MCP_CONTEXT_BROAD_FILE_TARGETS &&
       requestedWindowLines >= MCP_CONTEXT_BROAD_FILE_LINES;
+    const evidenceText = this.renderRawEvidence(cg, rawEvidenceSpecs);
+    const manifestDriven = expectedMissing.length > 0 || targets.some((target) =>
+      (target.mode === 'file' && Boolean(target.symbols?.length || target.texts?.length)) ||
+      (target.mode === 'symbol' && Boolean(target.members?.length))
+    );
+    let renderedCandidates = sectionCandidates;
+    let omittedCandidates: ContextSectionCandidate[] = [];
     if (sectionCandidates.length > 0 &&
-        (estimatedOutputChars > MCP_CONTEXT_MAX_OUTPUT_CHARS || broadFileWindowBatch)) {
-      return this.textResult(this.renderContextPreflight(
-        cg,
-        sectionCandidates,
-        estimatedOutputChars,
-        broadFileWindowBatch,
-        fileWindowTargets.length,
-        requestedWindowLines,
-        corrections,
-        misses,
-      ));
+        estimatedOutputChars + evidenceText.length > MCP_CONTEXT_MAX_OUTPUT_CHARS) {
+      if (!manifestDriven) {
+        const preflight = this.renderContextPreflight(
+          cg,
+          sectionCandidates,
+          estimatedOutputChars + evidenceText.length,
+          broadFileWindowBatch,
+          fileWindowTargets.length,
+          requestedWindowLines,
+          corrections,
+          misses,
+        );
+        return this.textResult([preflight, evidenceText].filter(Boolean).join('\n\n'));
+      }
+      const sourceBudget = Math.max(8_000, MCP_CONTEXT_MAX_OUTPUT_CHARS - evidenceText.length - 2_000);
+      const kept: ContextSectionCandidate[] = [];
+      const omitted: ContextSectionCandidate[] = [];
+      let used = 0;
+      for (const candidate of sectionCandidates) {
+        const cost = candidate.section.length + (kept.length > 0 ? 7 : 0);
+        if (kept.length === 0 || used + cost <= sourceBudget) {
+          kept.push(candidate);
+          used += cost;
+        } else {
+          omitted.push(candidate);
+        }
+      }
+      renderedCandidates = kept;
+      omittedCandidates = omitted;
     }
-
-    const sections = sectionCandidates.map((candidate) => candidate.section);
+    const sections = renderedCandidates.map((candidate) => candidate.section);
 
     const out: string[] = [
       ...(targets.length === 1
         ? ['> One precise context target was supplied; the same bounded renderer was used.', '']
         : []),
-      `# Precise implementation context (${resolvedTargets.size}/${targets.length} targets resolved)`,
+      `${manifestDriven ? '# Manifest-driven implementation context' : '# Precise implementation context'} (${resolvedTargets.size}/${targets.length} targets resolved)`,
       '',
       sections.join('\n\n---\n\n'),
     ];
+    if (omittedCandidates.length > 0) {
+      out.push('', '## Complete sections omitted by output budget');
+      for (const candidate of omittedCandidates) {
+        out.push(`- ${candidate.label}: about ${candidate.section.length} rendered characters`);
+      }
+      out.push('', '> The sections above are complete. Request the omitted labels together in the next `codegraph_context` call; do not re-read sections already shown.');
+    }
     if (misses.length > 0) out.push('', '## Unresolved / omitted targets', ...misses);
     if (corrections.length > 0) {
       out.push('', `> Automatically corrected: ${corrections.join('; ')}.`);
     }
+    if (evidenceText) out.push('', evidenceText);
     out.push(
       '',
       includeRelations
@@ -2197,12 +2786,16 @@ export class ToolHandler {
     const { target } = resolved;
 
     // A declaration and its matching definition represent one logical
-    // overload, so collect both endpoints without crossing into siblings.
+    // overload. Virtual/override dispatch can attach real call sites to the
+    // base endpoint while the user asks for the derived implementation, so
+    // walk only explicit synthesized-dispatch links for the same overload.
+    const dispatchNodes = this.relationshipDispatchFamily(cg, target.nodes);
+    const dispatchIds = new Set(dispatchNodes.map((node) => node.id));
     const seen = new Set<string>();
     const allCallers: Node[] = [];
-    for (const node of target.nodes) {
+    for (const node of dispatchNodes) {
       for (const c of cg.getCallers(node.id)) {
-        if (!seen.has(c.node.id)) {
+        if (!dispatchIds.has(c.node.id) && !seen.has(c.node.id)) {
           seen.add(c.node.id);
           allCallers.push(c.node);
         }
@@ -2210,13 +2803,24 @@ export class ToolHandler {
     }
 
     if (allCallers.length === 0) {
-      return this.textResult(`No callers found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`);
+      const needle = this.rawEvidenceNeedle(target.symbol);
+      const evidence = needle
+        ? this.renderRawEvidence(cg, [{ label: `zero callers: ${target.signature ?? target.symbol}`, needle }])
+        : '';
+      return this.textResult([
+        `No callers found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`,
+        evidence,
+        evidence ? '> Raw matches can include declarations, definitions, references, macros, or calls. They are shown to expose possible graph/index gaps; raw text alone is not classified as a caller.' : '',
+      ].filter(Boolean).join('\n\n'));
     }
 
+    const dispatchNote = dispatchNodes.length > target.nodes.length
+      ? `\n\n> Virtual dispatch family expanded ${target.nodes.length} selected declaration/definition endpoint(s) to ${dispatchNodes.length} exact base/override endpoint(s); callers were deduplicated across that family.`
+      : '';
     const formatted = this.formatNodeList(
       allCallers.slice(0, limit),
       `Callers of ${this.formatRelationshipTarget(target)}`,
-    ) + target.lookupNote;
+    ) + dispatchNote + target.lookupNote;
     return this.textResult(this.truncateOutput(formatted));
   }
 
@@ -2242,7 +2846,15 @@ export class ToolHandler {
     }
 
     if (allCallees.length === 0) {
-      return this.textResult(`No callees found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`);
+      const needle = this.rawEvidenceNeedle(target.symbol);
+      const evidence = needle
+        ? this.renderRawEvidence(cg, [{ label: `zero callees: ${target.signature ?? target.symbol}`, needle }])
+        : '';
+      return this.textResult([
+        `No callees found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`,
+        evidence,
+        evidence ? '> Raw matches can include declarations, definitions, references, macros, or calls. They are shown to expose possible graph/index gaps; raw text alone is not classified as a callee.' : '',
+      ].filter(Boolean).join('\n\n'));
     }
 
     const formatted = this.formatNodeList(
@@ -3574,18 +4186,70 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
+    if (args.targets !== undefined) {
+      const conflicting = [
+        'symbol', 'file', 'line', 'offset', 'limit', 'symbolsOnly', 'outlineQuery', 'outlineQueries', 'outlineLimit',
+      ].filter((key) => args[key] !== undefined);
+      if (conflicting.length > 0) {
+        return this.errorResult(
+          `codegraph_node batch mode cannot combine targets with top-level ${conflicting.join(', ')}. ` +
+          'Move each precise symbol/member/text/file-region request inside targets.',
+        );
+      }
+      const bundled = await this.handleContext({
+        targets: args.targets,
+        includeRelations: args.includeRelations,
+        expand: args.expand,
+        expectedMissing: args.expectedMissing,
+        projectPath: args.projectPath,
+      });
+      if (!bundled.isError && bundled.content[0]?.type === 'text') {
+        bundled.content[0].text =
+          '> Native codegraph_node batch mode used one merged implementation bundle. Treat every source range below as already read.\n\n' +
+          bundled.content[0].text;
+      }
+      return bundled;
+    }
+
+    if (args.expand !== undefined || args.expectedMissing !== undefined) {
+      return this.errorResult('codegraph_node expand and expectedMissing are batch-only; provide targets=[...].');
+    }
+
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
     const lineHint = typeof args.line === 'number' && args.line > 0 ? args.line : undefined;
     const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : undefined;
     const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : undefined;
-    const symbolsOnly = args.symbolsOnly === true;
+    const symbolRaw = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+    const inferredOutlineMode = Boolean(
+      !symbolRaw && fileHint && args.symbolsOnly === undefined &&
+      (args.outlineQuery !== undefined || args.outlineQueries !== undefined || args.outlineLimit !== undefined)
+    );
+    const symbolsOnly = args.symbolsOnly === true || inferredOutlineMode;
     const outlineQuery = typeof args.outlineQuery === 'string' ? args.outlineQuery.trim() : undefined;
+    const outlineQueries: string[] = [];
+    if (outlineQuery) {
+      for (const token of outlineQuery.split('|').map((part) => part.trim()).filter(Boolean)) {
+        if (!outlineQueries.includes(token)) outlineQueries.push(token);
+      }
+    }
+    if (args.outlineQueries !== undefined) {
+      if (!Array.isArray(args.outlineQueries) || args.outlineQueries.length < 1 || args.outlineQueries.length > 8) {
+        return this.errorResult('outlineQueries must contain 1 to 8 filters');
+      }
+      for (let i = 0; i < args.outlineQueries.length; i++) {
+        const value = this.validateString(args.outlineQueries[i], `outlineQueries[${i}]`, 256);
+        if (typeof value !== 'string') return value;
+        const token = value.trim();
+        if (!token) return this.errorResult(`outlineQueries[${i}] must not be blank`);
+        if (!outlineQueries.includes(token)) outlineQueries.push(token);
+      }
+    }
+    if (outlineQueries.length > 8) return this.errorResult('outline filters exceed 8 after expanding outlineQuery OR terms');
     const outlineLimit = typeof args.outlineLimit === 'number' && Number.isFinite(args.outlineLimit)
       ? clamp(Math.floor(args.outlineLimit), 1, MCP_NODE_MAX_OUTLINE_SYMBOLS)
       : MCP_NODE_DEFAULT_OUTLINE_SYMBOLS;
-    const symbolRaw = typeof args.symbol === 'string' ? args.symbol.trim() : '';
     const hasWindowArgs = args.offset !== undefined || args.limit !== undefined;
-    const hasOutlineArgs = symbolsOnly || args.outlineQuery !== undefined || args.outlineLimit !== undefined;
+    const hasOutlineArgs = symbolsOnly || args.outlineQuery !== undefined || args.outlineQueries !== undefined || args.outlineLimit !== undefined;
     // A surprisingly common agent call supplies an exact symbol and also carries
     // file-outline knobs copied from a previous call. This is not ambiguous: the
     // exact symbol is the smaller context target, so accept it and ignore only
@@ -3622,20 +4286,20 @@ export class ToolHandler {
       if (includeCode) {
         return this.errorResult(
           'includeCode is only valid in symbol mode. For a file outline use ' +
-          '{ file, symbolsOnly: true }; for source use { file, offset, limit } with limit <= 120.'
+          '{ file, symbolsOnly: true }; for source use { file, offset, limit } with limit <= 500.'
         );
       }
       if (args.includeRelations !== undefined) {
         return this.errorResult('includeRelations is only valid in symbol mode.');
       }
-      if (!symbolsOnly && (args.outlineQuery !== undefined || args.outlineLimit !== undefined)) {
-        return this.errorResult('outlineQuery and outlineLimit require symbolsOnly=true.');
+      if (!symbolsOnly && (args.outlineQuery !== undefined || args.outlineQueries !== undefined || args.outlineLimit !== undefined)) {
+        return this.errorResult('outlineQuery, outlineQueries, and outlineLimit require symbolsOnly=true.');
       }
       if (!symbolsOnly) {
         if (offset === undefined || limit === undefined) {
           return this.errorResult(
             'MCP file mode rejects bare or partially bounded file reads. Use ' +
-            '{ file, symbolsOnly: true } first, or provide both offset and limit (limit <= 120).'
+            '{ file, symbolsOnly: true } first, or provide both offset and limit (limit <= 500).'
           );
         }
       }
@@ -3646,10 +4310,16 @@ export class ToolHandler {
         requestedLimit: limit,
         symbolsOnly,
         outlineQuery,
+        outlineQueries: outlineQueries.length > 0 ? outlineQueries : undefined,
         outlineLimit,
-        notice: autoCorrectedOutlineWindow
-          ? '> Automatically used `symbolsOnly` outline mode and ignored copied `offset`/`limit` fields.'
-          : undefined,
+        notice: [
+          inferredOutlineMode
+            ? '> Automatically inferred `symbolsOnly=true` because a file plus `outlineQuery`/`outlineLimit` was supplied.'
+            : '',
+          autoCorrectedOutlineWindow
+            ? '> Automatically used `symbolsOnly` outline mode and ignored copied `offset`/`limit` fields.'
+            : '',
+        ].filter(Boolean).join('\n') || undefined,
       });
     }
 
@@ -3658,9 +4328,14 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
 
-    let matches = this.findSymbolMatches(cg, symbol);
+    const allMatches = this.findSymbolMatches(cg, symbol);
+    let matches = allMatches;
     if (matches.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      const needle = this.rawEvidenceNeedle(symbol);
+      const evidence = needle
+        ? this.renderRawEvidence(cg, [{ label: symbol, needle, path: fileHint }])
+        : '';
+      return this.textResult([`Symbol "${symbol}" not found in the codebase`, evidence].filter(Boolean).join('\n\n'));
     }
 
     // Disambiguate a heavily-overloaded name to a specific definition the caller
@@ -3678,9 +4353,13 @@ export class ToolHandler {
       : '';
 
     // Single definition — the common case.
-    if (matches.length === 1) {
-      const section = await this.renderNodeSection(cg, matches[0]!, includeCode, includeRelations);
-      const overloadSummary = this.formatOtherOverloadSummary(cg, symbol, matches[0]!);
+    const overloadGroups = this.relationshipOverloadGroups(cg, matches, allMatches);
+    if (overloadGroups.length === 1) {
+      const primary = this.rankExactSymbolNodes(overloadGroups[0]!)[0]!;
+      const section = includeCode
+        ? await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations)
+        : await this.renderNodeSection(cg, primary, false, includeRelations);
+      const overloadSummary = this.formatOtherOverloadSummary(cg, symbol, primary);
       return this.textResult(this.truncateOutput(
         [autoCorrectionNotice, hintWarning, section, overloadSummary, relationshipRouteNotice].filter(Boolean).join('\n\n')
       ));
@@ -3754,7 +4433,7 @@ export class ToolHandler {
   /**
    * Guarded MCP file mode: resolve `fileArg` (path or basename) to an indexed
    * file, then return either its structural map (`symbolsOnly`) or a bounded
-   * source window (`offset` + `limit`, at most 120 lines). The public handler
+   * source window (`offset` + `limit`, at most 500 lines). The public handler
    * rejects bare-file requests before reaching this method.
    *
    * Parity goal: the numbered source block is byte-for-byte the shape Read
@@ -3772,6 +4451,7 @@ export class ToolHandler {
       limit?: number;
       symbolsOnly?: boolean;
       outlineQuery?: string;
+      outlineQueries?: string[];
       outlineLimit?: number;
       requestedLimit?: number;
       notice?: string;
@@ -3837,10 +4517,15 @@ export class ToolHandler {
 
     // symbolsOnly → the cheap structural overview, no source.
     if (opts.symbolsOnly) {
-      const query = opts.outlineQuery?.toLowerCase();
-      const filtered = query
+      const queries = (opts.outlineQueries?.length
+        ? opts.outlineQueries
+        : opts.outlineQuery ? opts.outlineQuery.split('|') : [])
+        .map((query) => query.trim().toLowerCase())
+        .filter(Boolean);
+      const query = queries.length === 1 ? queries[0] : undefined;
+      const filtered = queries.length > 0
         ? nodes.filter((n) => [n.name, n.qualifiedName, n.signature ?? '']
-          .some((value) => value.toLowerCase().includes(query)))
+          .some((value) => queries.some((needle) => value.toLowerCase().includes(needle))))
         : nodes;
       const outlineLimit = clamp(
         opts.outlineLimit ?? MCP_NODE_DEFAULT_OUTLINE_SYMBOLS,
@@ -3848,7 +4533,7 @@ export class ToolHandler {
         MCP_NODE_MAX_OUTLINE_SYMBOLS,
       );
       const broadQuery = Boolean(
-        query &&
+        queries.length === 1 && query &&
         filtered.length >= MCP_NODE_BROAD_OUTLINE_MIN_MATCHES &&
         filtered.length / Math.max(nodes.length, 1) >= MCP_NODE_BROAD_OUTLINE_MATCH_RATIO
       );
@@ -3869,7 +4554,11 @@ export class ToolHandler {
       const effectiveOutlineLimit = broadQuery
         ? Math.min(outlineLimit, MCP_NODE_BROAD_OUTLINE_RESULT_LIMIT)
         : outlineLimit;
-      const filterNote = query ? `; ${filtered.length} match outlineQuery="${opts.outlineQuery}"` : '';
+      const filterLabel = queries.join('|');
+      const filterDescription = queries.length === 1
+        ? `outlineQuery="${filterLabel}"`
+        : `outline OR="${filterLabel}"`;
+      const filterNote = queries.length > 0 ? `; ${filtered.length} match ${filterDescription}` : '';
       const out = [
         ...(opts.notice ? [opts.notice, ''] : []),
         `**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}${filterNote}, ${compactDepSummary}`,
@@ -3884,19 +4573,19 @@ export class ToolHandler {
         }).length;
         const qualifiedOnly = filtered.length - locallyNamed;
         out.push(
-          `> Query too broad: outlineQuery="${opts.outlineQuery}" matched ${filtered.length}/${nodes.length} symbols (${percentage}%). ` +
+          `> Query too broad: outline filter="${filterLabel}" matched ${filtered.length}/${nodes.length} symbols (${percentage}%). ` +
           `Showing only the ${effectiveOutlineLimit} best simple-name candidates${qualifiedOnly > 0 ? `; ${qualifiedOnly} match only through qualified/container names` : ''}. ` +
           'Refine with a leaf symbol/member token; do not increase outlineLimit or read the file.',
           '',
         );
       }
       if (filtered.length) out.push(...symbolMap(ranked, '### Symbols', effectiveOutlineLimit));
-      else if (query) out.push(`_No indexed symbols match outlineQuery="${opts.outlineQuery}"._`);
+      else if (queries.length > 0) out.push(`_No indexed symbols match outline OR="${filterLabel}"._`);
       else out.push('_No indexed symbols in this file._');
       if (!broadQuery && filtered.length > outlineLimit) {
         out.push('', `> Outline capped at ${outlineLimit} of ${filtered.length} matching symbols. Narrow with \`outlineQuery\`; do not read the file to recover the omitted list.`);
       }
-      out.push('', '> Choose exact names from this outline. Read one implementation with `codegraph_node`; batch 1–8 precise symbol/member/text/file-region targets with ONE `codegraph_context`. Do not page through the file.');
+      out.push('', '> Choose exact names from this outline. Read one implementation with `codegraph_node`; batch 1–8 precise symbol/member/text/file-region targets with ONE `codegraph_node(targets=[...])` implementation bundle (or `codegraph_context(targets=[...])`). Do not page through the file.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
 
@@ -3991,6 +4680,101 @@ export class ToolHandler {
     }
     return this.formatNodeDetails(node, code, outline) +
       (includeRelations ? this.formatTrail(cg, node) : this.formatDeclDef(cg, node, false));
+  }
+
+  /** Render every indexed endpoint of one logical overload, not just a pointer. */
+  private async renderImplementationGroup(
+    cg: CodeGraph,
+    nodes: Node[],
+    includeRelations: boolean,
+  ): Promise<string> {
+    const unique = this.rankExactSymbolNodes(
+      [...new Map(nodes.map((node) => [node.id, node])).values()],
+    );
+    const rendered: string[] = [];
+    for (const node of unique) {
+      rendered.push(await this.renderNodeSection(cg, node, true, includeRelations));
+    }
+    if (rendered.length <= 1) return rendered[0] ?? '';
+    return [
+      `> One logical overload has ${rendered.length} indexed declaration/definition endpoints; all source bodies are included below.`,
+      '',
+      rendered.join('\n\n---\n\n'),
+    ].join('\n');
+  }
+
+  /**
+   * A wrong C++/Java owner is not a graph miss when the exact leaf symbol is
+   * already indexed. Surface those structured candidates before considering a
+   * repository scan; this turns `OldOwner::create` into a cheap correction.
+   */
+  private async renderQualifiedOwnerRecovery(
+    cg: CodeGraph,
+    queryText: string,
+    query: string,
+    kinds: NodeKind[] | undefined,
+    pathHint: string | undefined,
+    pathValue: string | undefined,
+    lineHint: number | undefined,
+    signature: string | undefined,
+    limit: number,
+    includeCode: boolean,
+  ): Promise<string> {
+    const normalized = query.replace(/\./g, '::');
+    const parts = normalized.split('::').filter(Boolean);
+    const leaf = parts.at(-1);
+    if (!leaf || parts.length < 2) return '';
+
+    let candidates = cg.getNodesByName(leaf).filter((node) => !kinds || kinds.includes(node.kind));
+    if (candidates.length === 0) return '';
+    const requestedOwner = parts.slice(0, -1).join('::').toLowerCase();
+    const commonPrefix = (left: string, right: string): number => {
+      let i = 0;
+      while (i < left.length && i < right.length && left[i] === right[i]) i++;
+      return i;
+    };
+    candidates = [...candidates].sort((left, right) => {
+      const owner = (node: Node) => node.qualifiedName.replace(/\./g, '::').split('::').slice(0, -1).join('::').toLowerCase();
+      const score = (node: Node) => {
+        const candidateOwner = owner(node);
+        const pathScore = pathHint && node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint) ? 10_000 : 0;
+        const lineScore = lineHint !== undefined && node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint ? 5_000 : 0;
+        return pathScore + lineScore + commonPrefix(requestedOwner, candidateOwner) * 10 - Math.abs(requestedOwner.length - candidateOwner.length);
+      };
+      return score(right) - score(left) || left.filePath.localeCompare(right.filePath) || left.startLine - right.startLine;
+    });
+
+    const assertedPath = pathHint
+      ? candidates.filter((node) => node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint))
+      : candidates;
+    const assertedLine = lineHint !== undefined
+      ? assertedPath.filter((node) => node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint)
+      : assertedPath;
+    let scoped = assertedLine.length > 0 ? assertedLine : assertedPath.length > 0 ? assertedPath : candidates;
+    if (signature) {
+      const signatureMatches = this.matchingNodesBySignature(scoped, signature);
+      if (signatureMatches.length > 0) scoped = signatureMatches;
+    }
+    const groups = this.relationshipOverloadGroups(cg, scoped, candidates);
+    const out: string[] = [
+      `> Qualified owner mismatch: no exact symbol named \`${query}\`, but the exact leaf \`${leaf}\` has structured candidates. Raw-source fallback was skipped.`,
+    ];
+    if (pathHint && assertedPath.length === 0) out.push(`> Path assertion \`${pathValue}\` matched none of those candidates.`);
+    if (lineHint !== undefined && assertedLine.length === 0) out.push(`> Line assertion ${lineHint} matched none of those candidates.`);
+    if (signature && this.matchingNodesBySignature(scoped, signature).length === 0) {
+      out.push(`> Signature assertion \`${signature}\` was not used to guess a different overload.`);
+    }
+    if (includeCode && groups.length === 1) {
+      out.push('', await this.renderImplementationGroup(cg, groups[0]!, false));
+    } else {
+      const shown = this.rankExactSymbolNodes(scoped).slice(0, limit);
+      out.push('', this.formatSearchResults(cg, shown.map((node) => ({ node, score: 1.0 }))));
+      if (groups.length > 1 && includeCode) {
+        out.push('', `> Source was not inlined because ${groups.length} logical leaf candidates remain. Copy one qualified name/signature or add path/line.`);
+      }
+    }
+    out.push('', `> Correct \`${queryText}\` using one candidate above; do not Grep merely to verify the owner.`);
+    return out.join('\n');
   }
 
   /**
@@ -4593,6 +5377,25 @@ export class ToolHandler {
     return this.truncateOutput(out.join('\n'));
   }
 
+  /** Return the nearest C++ access label without dumping the intervening class body. */
+  private findCppAccessBoundaryLine(
+    cg: CodeGraph,
+    container: Node,
+    memberStartLine: number,
+  ): number | undefined {
+    if (container.language !== 'cpp' && container.language !== 'c') return undefined;
+    const abs = validatePathWithinRoot(cg.getProjectRoot(), container.filePath);
+    if (!abs) return undefined;
+    let lines: string[];
+    try { lines = readFileSync(abs, 'utf-8').split('\n'); } catch { return undefined; }
+    const start = Math.max(1, container.startLine);
+    const end = Math.min(lines.length, memberStartLine - 1);
+    for (let line = end; line >= start; line--) {
+      if (/^\s*(?:public|protected|private)\s*:\s*(?:\/\/.*)?$/.test(lines[line - 1] ?? '')) return line;
+    }
+    return undefined;
+  }
+
   /**
    * Find a symbol by name, handling disambiguation when multiple matches exist.
    * Returns the best match and a note about alternatives if any.
@@ -4732,16 +5535,27 @@ export class ToolHandler {
 
     const lookup = this.findAllSymbols(cg, symbol);
     if (lookup.nodes.length === 0) {
-      return { result: this.textResult(`Symbol "${symbol}" not found in the codebase`) };
+      const needle = this.rawEvidenceNeedle(symbol);
+      const evidence = needle
+        ? this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
+        : '';
+      return {
+        result: this.textResult([`Symbol "${symbol}" not found in the codebase`, evidence].filter(Boolean).join('\n\n')),
+      };
     }
     const allCandidates = lookup.nodes;
     const narrowed = this.narrowSymbolMatches(allCandidates, file, line);
     if (!narrowed.fileMatched || !narrowed.lineMatched) {
+      const needle = this.rawEvidenceNeedle(symbol);
+      const evidence = needle && file
+        ? this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
+        : '';
       return {
         result: this.textResult([
           this.formatSymbolHintWarning(symbol, narrowed),
           '',
           `> No ${tool} traversal was run. Correct the file/line assertion; do not infer one overload's relationships from these candidates.`,
+          evidence ? `\n${evidence}` : '',
         ].join('\n')),
       };
     }
@@ -4751,12 +5565,10 @@ export class ToolHandler {
       const signatureMatches = this.matchingNodesBySignature(selected, signature);
       if (signatureMatches.length === 0) {
         return {
-          result: this.textResult(this.formatRelationshipSignatureMiss(
-            tool,
-            symbol,
-            signature,
-            selected,
-          )),
+          result: this.textResult([
+            this.formatRelationshipSignatureMiss(tool, symbol, signature, selected),
+            '> Raw-source fallback was skipped: exact structured symbol candidates already exist, so this is a signature assertion mismatch rather than a graph miss.',
+          ].filter(Boolean).join('\n\n')),
         };
       }
       selected = signatureMatches;
@@ -4811,6 +5623,54 @@ export class ToolHandler {
       }
     }
     return groups.map((group) => this.rankExactSymbolNodes(group));
+  }
+
+  /**
+   * Expand one precise callable through authoritative virtual-dispatch links.
+   * C++ and nominal interface synthesis store these as heuristic `calls`
+   * edges; native `overrides` edges are also accepted. Same-name + compatible
+   * parameter checks keep overloaded methods out of the family.
+   */
+  private relationshipDispatchFamily(cg: CodeGraph, selected: Node[]): Node[] {
+    const family = new Map(selected.map((node) => [node.id, node]));
+    const queue = [...selected];
+    const isDispatchEdge = (edge: Edge): boolean => edge.kind === 'overrides' || (
+      edge.kind === 'calls' && edge.provenance === 'heuristic' &&
+      (edge.metadata?.synthesizedBy === 'cpp-override' || edge.metadata?.synthesizedBy === 'interface-impl')
+    );
+    const compatible = (left: Node, right: Node): boolean => {
+      if (left.name !== right.name) return false;
+      const leftKey = cppParameterKey(left);
+      const rightKey = cppParameterKey(right);
+      if (leftKey !== null && rightKey !== null) return cppParameterKeysMatch(leftKey, rightKey);
+      const normalize = (value: string | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const leftSignature = normalize(left.signature);
+      const rightSignature = normalize(right.signature);
+      return !leftSignature || !rightSignature || leftSignature === rightSignature;
+    };
+
+    for (let index = 0; index < queue.length && family.size < 64; index++) {
+      const node = queue[index]!;
+      const edges = [...cg.getIncomingEdges(node.id), ...cg.getOutgoingEdges(node.id)];
+      for (const edge of edges) {
+        if (!isDispatchEdge(edge)) continue;
+        const otherId = edge.source === node.id ? edge.target : edge.source;
+        const other = cg.getNode(otherId);
+        if (!other || family.has(other.id) || !compatible(node, other)) continue;
+        family.set(other.id, other);
+        queue.push(other);
+        // A dispatch endpoint may itself be a C++ declaration. Pull its exact
+        // definition/declaration partner into the same family before traversal.
+        const allSameName = this.findSymbolMatches(cg, other.name);
+        const group = this.relationshipOverloadGroups(cg, [other], allSameName)[0] ?? [other];
+        for (const partner of group) {
+          if (family.has(partner.id)) continue;
+          family.set(partner.id, partner);
+          queue.push(partner);
+        }
+      }
+    }
+    return this.rankExactSymbolNodes([...family.values()]);
   }
 
   /** True only for two indexed endpoints representing the same callable overload. */
@@ -5381,7 +6241,7 @@ export class ToolHandler {
       lines.push(
         `- … +${children.length - visible.length} more members omitted`,
         '',
-        '> Large container outline capped. Use ONE `codegraph_context` target `{ symbol, file, members: [...] }` for up to 32 already-known members; do not request a broader file outline or Read the class file.',
+        '> Large container outline capped. Use ONE `codegraph_node(targets=[{ symbol, file, members: [...] }])` implementation bundle for up to 32 already-known members; do not request a broader file outline or Read the class file.',
       );
     }
     return lines.join('\n');
@@ -5406,7 +6266,7 @@ export class ToolHandler {
 
     if (outline) {
       lines.push('', outline, '',
-        '> Structural outline only. Read one member with codegraph_node, or batch up to 32 named members with ONE codegraph_context `{ symbol, file, members: [...] }`; it also returns matching C++ out-of-line definitions. Use a file region only for a non-symbol edit boundary.');
+        '> Structural outline only. Read one member with codegraph_node, or batch up to 32 named members with ONE `codegraph_node(targets=[{ symbol, file, members: [...] }])` implementation bundle; it also returns matching C++ out-of-line definitions. Use a file region only for a non-symbol edit boundary.');
     } else if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
@@ -5415,6 +6275,46 @@ export class ToolHandler {
     }
 
     return lines.join('\n');
+  }
+
+  /** Convert an exact/qualified lookup into the identifier a raw scan can verify. */
+  private rawEvidenceNeedle(symbolOrSignature: string): string | undefined {
+    const symbol = parseCallableLookup(symbolOrSignature.trim()).symbol;
+    const leaf = symbol.replace(/\./g, '::').split('::').filter(Boolean).at(-1)?.replace(/^~/, '') ?? '';
+    return /^[A-Za-z_$][\w$]*$/.test(leaf) && leaf.length >= 3 ? leaf : undefined;
+  }
+
+  private renderRawEvidence(cg: CodeGraph, specs: RawEvidenceSpec[]): string {
+    const unique = new Map<string, RawEvidenceSpec>();
+    for (const spec of specs) {
+      // A global raw scan for `run`, `get`, etc. is expensive and proves little.
+      // Exact-file/path misses remain safe, while global scans require a
+      // distinctive code-shaped identifier.
+      if (!spec.path && !isDistinctiveIdentifier(spec.needle)) continue;
+      const key = `${spec.needle}\u0000${spec.path?.replace(/\\/g, '/').toLowerCase() ?? ''}`;
+      const existing = unique.get(key);
+      if (!existing || (existing.purpose !== 'declaration_only' && spec.purpose === 'declaration_only')) {
+        unique.set(key, spec);
+      }
+    }
+    if (unique.size === 0) return '';
+    return this.truncateAtLine(
+      formatRawSourceEvidence(scanRawSourceEvidence(cg, [...unique.values()])),
+      6_000,
+    );
+  }
+
+  /** Batch search collects misses so the bundled ripgrep scan runs once. */
+  private renderSearchRawEvidence(
+    cg: CodeGraph,
+    specs: RawEvidenceSpec[],
+    deferred?: RawEvidenceSpec[],
+  ): string {
+    if (deferred) {
+      deferred.push(...specs);
+      return '';
+    }
+    return this.renderRawEvidence(cg, specs);
   }
 
   private textResult(text: string): ToolResult {

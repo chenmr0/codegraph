@@ -32,9 +32,10 @@ const SOURCE_EXTENSIONS = new Set([
 ])
 
 const OUTPUT_SOURCE_RE = /(?:^|[\\\\/\\s(])[^:\\r\\n]*\\.(?:c|h|cc|cpp|cxx|hh|hpp|hxx|ipp|inl|tcc|m|mm|cs|cshtml|razor|java|kt|kts|scala|sc|go|rs|swift|dart|pas|dpr|dpk|lpr|dfm|fmx|py|pyw|rb|rake|php|module|install|theme|inc|ts|tsx|mts|cts|js|jsx|mjs|cjs|xsjs|xsjslib|vue|svelte|lua|luau|liquid|twig)(?=[:\\s)\\]\\r\\n]|$)/im
+const SOURCE_DISCOVERY_COMMAND_RE = /(?:^|[|;&]\\s*|\\b)(?:rg|grep|findstr|select-string|get-childitem|gci|dir|ls|get-content|gc|type)\\b/i
 const SYSTEM_REMINDER_MARKER = "[CODEGRAPH_DYNAMIC_SYSTEM_REMINDER]"
 const SYSTEM_REMINDER = SYSTEM_REMINDER_MARKER + "\\n" +
-  "优先使用 CodeGraph系列工具，而不是read、grep等。当前项目源码已建立CodeGraph索引；仅当CodeGraph无结果、目标文件已在本会话修改导致索引stale，或目标内容不受索引覆盖时，才使用read、grep。"
+  "优先使用 CodeGraph系列工具，而不是read、grep、Bash源码搜索等。当前项目源码已建立CodeGraph索引；仅当CodeGraph无结果、目标文件已在本会话修改导致索引stale，或目标内容不受索引覆盖时，才使用原生源码搜索/读取。"
 
 function findIndexRoot(start) {
   if (!start || typeof start !== "string") return null
@@ -62,6 +63,12 @@ function isSourcePath(value) {
 function toolPath(args) {
   if (!args || typeof args !== "object") return null
   return args.filePath ?? args.path ?? args.file ?? null
+}
+
+function shellCommand(args) {
+  if (!args || typeof args !== "object") return ""
+  const value = args.command ?? args.cmd ?? args.script
+  return typeof value === "string" ? value : ""
 }
 
 function sessionSet(map, sessionID) {
@@ -98,7 +105,11 @@ export const CodeGraphReminderPlugin = async ({ directory, worktree }) => {
         return
       }
 
-      if (tool !== "grep" && tool !== "read") return
+      const directSourceTool = tool === "grep" || tool === "read"
+      const command = shellCommand(args)
+      const shellSourceTool = (tool === "bash" || tool === "shell") &&
+        SOURCE_DISCOVERY_COMMAND_RE.test(command)
+      if (!directSourceTool && !shellSourceTool) return
 
       const indexRoot = findIndexRoot(projectDirectory)
       if (!indexRoot) return
@@ -109,7 +120,8 @@ export const CodeGraphReminderPlugin = async ({ directory, worktree }) => {
 
       const outputText = typeof output?.output === "string" ? output.output : ""
       const sourceMatch = (target && isSourcePath(target)) ||
-        (tool === "grep" && OUTPUT_SOURCE_RE.test(outputText))
+        ((tool === "grep" || shellSourceTool) && OUTPUT_SOURCE_RE.test(outputText)) ||
+        (shellSourceTool && OUTPUT_SOURCE_RE.test(command))
       if (!sourceMatch) return
 
       if (target && modifiedBySession.get(sessionID)?.has(target.toLowerCase())) return

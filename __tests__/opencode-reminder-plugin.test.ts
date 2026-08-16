@@ -45,7 +45,7 @@ describe('OpenCode CodeGraph native-tool reminder plugin', () => {
     await systemHook({ sessionID: 's1' }, firstSystem);
     expect(firstSystem.system).toHaveLength(2);
     expect(firstSystem.system[1]).toContain('[CODEGRAPH_DYNAMIC_SYSTEM_REMINDER]');
-    expect(firstSystem.system[1]).toContain('优先使用 CodeGraph系列工具，而不是read、grep等。');
+    expect(firstSystem.system[1]).toContain('优先使用 CodeGraph系列工具，而不是read、grep、Bash源码搜索等。');
     expect(firstSystem.system[1]).not.toContain('<system-reminder>');
 
     // The reminder stays armed across model requests so an auxiliary model
@@ -85,6 +85,29 @@ describe('OpenCode CodeGraph native-tool reminder plugin', () => {
 
     const nextGrep = { output: 'src/channel.cpp:42: get_dfc()', title: '', metadata: {} };
     await afterHook({ tool: 'grep', sessionID: 's1', args: { path: 'src', pattern: 'get_dfc' } }, nextGrep);
+    const rearmed = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, rearmed);
+    expect(rearmed.system.join('\n')).toContain('优先使用 CodeGraph系列工具');
+  });
+
+  it('recognizes Bash source discovery without intercepting build commands', async () => {
+    fs.mkdirSync(path.join(dir, '.codegraph'));
+
+    const listing = { output: 'src/channel.cpp\nsrc/channel.h', title: '', metadata: {} };
+    await afterHook({ tool: 'bash', sessionID: 's1', args: { command: 'Get-ChildItem src' } }, listing);
+    const armed = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, armed);
+    expect(armed.system.join('\n')).toContain('Bash源码搜索');
+
+    await afterHook({ tool: 'codegraph_files', sessionID: 's1', args: { path: 'src' } }, { output: 'hit' });
+    const build = { output: 'src/channel.cpp: compiling', title: '', metadata: {} };
+    await afterHook({ tool: 'bash', sessionID: 's1', args: { command: 'npm run build' } }, build);
+    const notArmed = { system: ['base'] };
+    await systemHook({ sessionID: 's1' }, notArmed);
+    expect(notArmed.system).toEqual(['base']);
+
+    const exactRead = { output: 'int channel();', title: '', metadata: {} };
+    await afterHook({ tool: 'bash', sessionID: 's1', args: { command: 'Get-Content src/channel.cpp' } }, exactRead);
     const rearmed = { system: ['base'] };
     await systemHook({ sessionID: 's1' }, rearmed);
     expect(rearmed.system.join('\n')).toContain('优先使用 CodeGraph系列工具');

@@ -47,14 +47,27 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     fs.writeFileSync(
       path.join(tempDir, 'src', 'c.ts'),
       `export function nonexistThing(): void { return; }\n` +
+      `export function missing_symbol_helper(): void { return; }\n` +
       // A class whose name shares the `helper` prefix (case-folded) — used by
       // the kind-filter test: an exact `helper` search filtered to kind=class
       // has no exact match, so it must fall back to fuzzy and surface this.
       `export class HelperUtils { value = 1; }\n`
     );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'service.h'),
+      'class Service { public: int execute(int value); };\n',
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'service.cpp'),
+      '#include "service.h"\nint Service::execute(int value) { return value + 1; }\n',
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'raw_markers.cpp'),
+      '// FIRST_RAW_MARKER and SECOND_RAW_MARKER intentionally remain comments.\n',
+    );
 
     cg = await CodeGraph.init(tempDir, {
-      config: { include: ['**/*.ts'], exclude: [] },
+      config: { include: ['**/*.ts', '**/*.h', '**/*.cpp'], exclude: [] },
     });
     await cg.indexAll();
     handler = new ToolHandler(cg);
@@ -91,6 +104,16 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(text).toContain('nonexistThing');
   });
 
+  it('adds exact raw evidence behind fuzzy results for a distinctive identifier', async () => {
+    const result = await handler.execute('search', { query: 'missing_symbol' });
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0]!.text;
+    expect(text).toMatch(/⚠️ No exact match for "missing_symbol"/);
+    expect(text).toContain('missing_symbol_helper');
+    expect(text).toMatch(/Grep-equivalent current-source evidence/i);
+    expect(text).toContain('CONFIRMED_ABSENT');
+  });
+
   it('falls back to fuzzy with a warning when the kind filter eliminates the exact match', async () => {
     // `helper` exists, but only as a function and a method — not as a class.
     // Filtering kind=class yields no exact match, so it must fall back to
@@ -104,6 +127,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     const text = result.content[0]!.text;
     expect(text).toMatch(/⚠️ No exact match for "helper"/);
     expect(text).toContain('HelperUtils');
+    expect(text).not.toMatch(/Grep-equivalent current-source evidence/i);
   });
 
   it('resolves a qualified input exactly and exposes the qualified name', async () => {
@@ -114,6 +138,17 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(text).toContain('Qualified: `Widget::helper`');
     expect(text).not.toContain('### helper (function)');
     expect(text).not.toMatch(/closest matches/i);
+  });
+
+  it('auto-corrects a stray quote in includeCode instead of failing the call', async () => {
+    const result = await handler.execute('search', {
+      query: 'helperSync',
+      includeCode: 'if_unique"',
+    });
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0]!.text;
+    expect(text).toMatch(/Automatically corrected includeCode/i);
+    expect(text).toContain('function helperSync');
   });
 
   it('uses path to disambiguate same-named exact symbols before limiting', async () => {
@@ -164,5 +199,48 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     const result = await handler.execute('search', { query: 'Foo.bar' });
     expect(result.isError).toBeFalsy();
     expect(result.content[0]!.text).toContain('No results found');
+  });
+
+  it('returns declaration and definition source for one exact logical overload', async () => {
+    const result = await handler.execute('search', {
+      query: 'Service::execute',
+      includeCode: 'if_unique',
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain('int execute(int value);');
+    expect(text).toContain('int Service::execute(int value) { return value + 1; }');
+    expect(text).toMatch(/all source bodies are included/i);
+  });
+
+  it('recovers a wrong qualified owner from exact leaf candidates without raw scanning', async () => {
+    const result = await handler.execute('search', {
+      query: 'LegacyService::execute',
+      includeCode: 'if_unique',
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toMatch(/Qualified owner mismatch/i);
+    expect(text).toContain('Service::execute');
+    expect(text).toContain('return value + 1');
+    expect(text).not.toMatch(/Grep-equivalent current-source evidence/i);
+  });
+
+  it('batches symbol queries and emits one shared multi-pattern raw fallback report', async () => {
+    const result = await handler.execute('search', {
+      queries: [
+        { query: 'helperSync', includeCode: 'if_unique' },
+        { query: 'FIRST_RAW_MARKER' },
+        { query: 'SECOND_RAW_MARKER' },
+      ],
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toMatch(/Batch symbol search \(3 queries\)/i);
+    expect(text).toContain('function helperSync');
+    expect(text.match(/## Grep-equivalent current-source evidence/g)).toHaveLength(1);
+    expect(text).toContain('### FIRST_RAW_MARKER');
+    expect(text).toContain('### SECOND_RAW_MARKER');
+    expect(text).toMatch(/One bounded server-side .* scan covered/i);
   });
 });

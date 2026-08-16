@@ -16,9 +16,19 @@ describe('MCP codegraph_node context-budget guidance', () => {
 
   it('publishes bounded file-window guidance without schema-rejecting an auto-correctable request', () => {
     const properties = nodeTool().inputSchema.properties;
+    expect(properties.targets?.minItems).toBe(1);
+    expect(properties.targets?.maxItems).toBe(8);
+    const nodeTarget = properties.targets?.items as any;
+    expect(nodeTarget.properties.symbols.maxItems).toBe(32);
+    expect(nodeTarget.properties.texts.maxItems).toBe(8);
+    expect(nodeTarget.properties.outlineQueries.maxItems).toBe(8);
+    expect(nodeTarget.properties.outlineLimit.maximum).toBe(80);
+    expect(properties.expand?.enum).toEqual(['declaration_definition', 'none']);
+    expect(properties.expectedMissing?.maxItems).toBe(8);
+    expect(nodeTool().description).toMatch(/Native BATCH MODE/i);
     expect(properties.limit?.minimum).toBe(1);
     expect(properties.limit?.maximum).toBeUndefined();
-    expect(properties.limit?.description).toMatch(/safely clamped to 120/i);
+    expect(properties.limit?.description).toMatch(/safely clamped to 500/i);
     expect(properties.offset?.minimum).toBe(1);
     expect(properties.outlineLimit?.maximum).toBe(80);
   });
@@ -29,11 +39,18 @@ describe('MCP codegraph_node context-budget guidance', () => {
     const textSearch = getStaticTools().find((tool) => tool.name === 'text_search')!;
     expect(search.inputSchema.properties.includeCode?.enum).toEqual(['never', 'if_unique']);
     expect(search.inputSchema.properties.signature?.type).toBe('string');
+    expect(search.inputSchema.properties.queries?.maxItems).toBe(8);
+    expect(search.inputSchema.required).toEqual([]);
     expect(context.inputSchema.properties.targets?.minItems).toBe(1);
     expect(context.inputSchema.properties.targets?.maxItems).toBe(8);
     const contextTarget = context.inputSchema.properties.targets?.items as any;
     expect(contextTarget.properties.members.maxItems).toBe(32);
     expect(contextTarget.properties.offset.description).toMatch(/defaults to 1/i);
+    expect(contextTarget.properties.limit.description).toMatch(/maximum 500/i);
+    expect(contextTarget.properties.text.description).toMatch(/assertion/i);
+    expect(contextTarget.properties.symbolsOnly.type).toBe('boolean');
+    expect(contextTarget.properties.outlineQueries.maxItems).toBe(8);
+    expect(contextTarget.properties.outlineLimit.maximum).toBe(80);
     expect(context.description).toMatch(/members.*offset.*text/i);
     expect(context.description).toMatch(/preflight/i);
     expect(context.description).toMatch(/bare.*file.*compact symbol outline/i);
@@ -56,16 +73,22 @@ describe('MCP codegraph_node context-budget guidance', () => {
 
   it('keeps server instructions aligned with runtime guards', () => {
     expect(SERVER_INSTRUCTIONS).toContain('{ file, symbolsOnly: true }');
-    expect(SERVER_INSTRUCTIONS).toContain('{ file, offset, limit<=120 }');
+    expect(SERVER_INSTRUCTIONS).toContain('{ file, offset, limit<=500 }');
     expect(SERVER_INSTRUCTIONS).toMatch(/rejects bare\/full-file reads/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_context` call/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/compact symbol preflight/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_(?:node|context).*targets/i);
+    expect(SERVER_INSTRUCTIONS).toContain('codegraph_node(targets=[...])');
+    expect(SERVER_INSTRUCTIONS).toMatch(/Preflight is decided by the 20K character budget/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/queries=.*multi-pattern raw-source scan/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/both declaration and definition source/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/virtual-dispatch family/i);
     expect(SERVER_INSTRUCTIONS).toContain('includeCode: "if_unique"');
     expect(SERVER_INSTRUCTIONS).toMatch(/selected container.*text.*file windows/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/bare.*file.*compact symbol outline/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/JSON-stringified.*parsed automatically/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_text_search` call/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/zero-match identifier/i);
+    expect(SERVER_INSTRUCTIONS).toContain('DECLARATION_ONLY');
+    expect(SERVER_INSTRUCTIONS).toMatch(/source epoch[^]*pending edits/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/file.*line.*signature/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/do not aggregate/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate file windows/i);
@@ -74,11 +97,17 @@ describe('MCP codegraph_node context-budget guidance', () => {
 
   it('keeps installed agent guidance aligned with runtime guards', () => {
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('symbolsOnly=true');
-    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('limit<=120');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('limit<=500');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_context');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('includeCode="if_unique"');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_search(queries=[...])');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/declaration and definition source/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/outlineQueries/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/base-declaration call sites/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_text_search');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node(targets=[...])');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('DECLARATION_ONLY');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/file.*line.*signature/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/refuse to aggregate distinct overloads/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).not.toContain('codegraph_codegraph_node');

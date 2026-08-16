@@ -1,7 +1,7 @@
 /**
  * Guarded codegraph_node MCP file mode. Agent calls must request either a
  * structural outline (`symbolsOnly`) or an explicit source window capped at
- * 120 lines. Oversized requests are corrected in-place; bare/full-file reads
+ * 500 lines. Oversized requests are corrected in-place; bare/full-file reads
  * and mixed symbol/file-window parameters are rejected before source reaches
  * the model.
  */
@@ -113,13 +113,13 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(onlyLimit.content[0]!.text).toMatch(/both offset and limit/i);
   });
 
-  it('auto-clamps file windows over 120 lines instead of requiring a correction call', async () => {
-    const result = await h.execute('node', { file: 'big.ts', offset: 1, limit: 145 });
+  it('auto-clamps file windows over 500 lines instead of requiring a correction call', async () => {
+    const result = await h.execute('node', { file: 'big.ts', offset: 1, limit: 545 });
     const out = result.content.map((item) => item.text).join('\n');
     expect(result.isError).not.toBe(true);
-    expect(out).toMatch(/Requested 145 lines; safely clamped to 120/i);
-    expect(out).toMatch(/^120\t/m);
-    expect(out).not.toMatch(/^121\t/m);
+    expect(out).toMatch(/Requested 545 lines; safely clamped to 500/i);
+    expect(out).toMatch(/^500\t/m);
+    expect(out).not.toMatch(/^501\t/m);
   });
 
   it('does NOT dump a config/data file (yaml/properties) — #383 secret safety', async () => {
@@ -135,7 +135,7 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('helper');
     expect(out).toContain('Widget');
     expect(out).not.toContain('return x + 1'); // bodies are NOT included in the map
-    expect(out).toMatch(/batch 1[–-]8 precise.*codegraph_context/i);
+    expect(out).toMatch(/batch 1[–-]8 precise.*codegraph_node\(targets/i);
     expect(out).not.toMatch(/drop `symbolsOnly`/i);
   });
 
@@ -160,7 +160,7 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('method39');
     expect(out).not.toContain('method74');
     expect(out).toMatch(/35 more members omitted/);
-    expect(out).toMatch(/codegraph_context.*members/i);
+    expect(out).toMatch(/codegraph_node\(targets.*members/i);
     expect(out).not.toMatch(/request a file outline/i);
   });
 
@@ -189,6 +189,19 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('fn99');
     expect(out).not.toMatch(/`fn9`/);
     expect(out).toMatch(/1 match outlineQuery="fn99"/i);
+  });
+
+  it('infers symbolsOnly for a file with outline knobs', async () => {
+    const result = await h.execute('node', {
+      file: 'many.ts',
+      outlineQuery: 'fn99',
+      outlineLimit: 5,
+    });
+    const out = result.content[0]!.text;
+    expect(result.isError).not.toBe(true);
+    expect(out).toMatch(/Automatically inferred `symbolsOnly=true`/i);
+    expect(out).toContain('fn99');
+    expect(out).not.toContain('return 99');
   });
 
   it('guards a non-selective outline filter instead of dumping most of the file', async () => {
