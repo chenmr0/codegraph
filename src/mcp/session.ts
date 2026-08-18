@@ -84,6 +84,7 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  private activeToolCalls = new Map<string | number, AbortController>();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -106,6 +107,8 @@ export class MCPSession {
    * other sessions) or call `process.exit` (the daemon decides when to exit).
    */
   stop(): void {
+    for (const controller of this.activeToolCalls.values()) controller.abort();
+    this.activeToolCalls.clear();
     this.transport.stop();
   }
 
@@ -128,6 +131,10 @@ export class MCPSession {
         break;
       case 'tools/call':
         if (isRequest) await this.handleToolsCall(message as JsonRpcRequest);
+        break;
+      case 'notifications/cancelled':
+      case '$/cancelRequest':
+        this.handleCancelled(message as JsonRpcNotification);
         break;
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
@@ -225,10 +232,30 @@ export class MCPSession {
       return;
     }
 
-    await this.retryInitIfNeeded();
+    const controller = new AbortController();
+    this.activeToolCalls.set(request.id, controller);
+    try {
+      await this.retryInitIfNeeded();
+      const result = await this.engine.getToolHandler().execute(toolName, toolArgs, {
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) {
+        this.transport.sendError(request.id, -32800, 'Request cancelled');
+      } else {
+        this.transport.sendResult(request.id, result);
+      }
+    } finally {
+      if (this.activeToolCalls.get(request.id) === controller) {
+        this.activeToolCalls.delete(request.id);
+      }
+    }
+  }
 
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs);
-    this.transport.sendResult(request.id, result);
+  private handleCancelled(notification: JsonRpcNotification): void {
+    const params = notification.params as { requestId?: unknown; id?: unknown } | undefined;
+    const requestId = params?.requestId ?? params?.id;
+    if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
+    this.activeToolCalls.get(requestId)?.abort();
   }
 
   /**

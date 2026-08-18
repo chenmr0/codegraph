@@ -207,6 +207,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
   let shuttingDown = false;
+  const localToolCalls = new Map<unknown, AbortController>();
   // Requests forwarded to the daemon and not yet answered, keyed by JSON-RPC id.
   // If the daemon dies mid-session (#662 — e.g. an MCP host SIGTERM's it when a
   // new session starts), these would otherwise hang forever; we re-serve them
@@ -226,6 +227,8 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   };
   const shutdown = (): void => {
     if (shuttingDown) return; shuttingDown = true;
+    for (const controller of localToolCalls.values()) controller.abort();
+    localToolCalls.clear();
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
     try { engine?.stop(); } catch { /* ignore */ }
     process.exit(0);
@@ -239,14 +242,29 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const handleLocally = async (line: string): Promise<void> => {
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
+    if (msg.method === 'notifications/cancelled' || msg.method === '$/cancelRequest') {
+      const params = (msg.params || {}) as { requestId?: unknown; id?: unknown };
+      localToolCalls.get(params.requestId ?? params.id)?.abort();
+      return;
+    }
     if (msg.method === 'tools/call' && id !== undefined) {
+      const controller = new AbortController();
+      localToolCalls.set(id, controller);
       try {
         await ensureEngine();
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
-        writeClient({ jsonrpc: '2.0', id, result });
+        const result = await engine!.getToolHandler().execute(params.name, params.arguments || {}, {
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) {
+          writeClient({ jsonrpc: '2.0', id, error: { code: -32800, message: 'Request cancelled' } });
+        } else {
+          writeClient({ jsonrpc: '2.0', id, result });
+        }
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
+      } finally {
+        if (localToolCalls.get(id) === controller) localToolCalls.delete(id);
       }
     } else if (msg.method === 'ping' && id !== undefined) {
       writeClient({ jsonrpc: '2.0', id, result: {} });

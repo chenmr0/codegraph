@@ -5,6 +5,7 @@
  */
 
 import type CodeGraph from '../index';
+import { AsyncLocalStorage } from 'async_hooks';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -89,6 +90,9 @@ const MCP_CONTEXT_MEMBER_NEIGHBOR_LINES = 2;
 
 /** Symbol search can resolve several exact lookups and one raw fallback scan. */
 const MCP_SEARCH_MAX_QUERIES = 8;
+
+/** Avoid quadratic overload grouping for ubiquitous leaf names such as reuse. */
+const MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES = 64;
 
 /** Literal text search is intentionally narrow and source-only. */
 const MCP_TEXT_SEARCH_MAX_QUERIES = 8;
@@ -419,6 +423,10 @@ export interface ToolResult {
     text: string;
   }>;
   isError?: boolean;
+}
+
+export interface ToolExecutionOptions {
+  signal?: AbortSignal;
 }
 
 interface ResolvedRelationshipTarget {
@@ -1125,6 +1133,10 @@ export class ToolHandler {
   // populated by the watcher, not by catch-up. Cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
+  // Daemon sessions may execute concurrently. AsyncLocalStorage keeps one
+  // request's cancellation signal attached to its raw-evidence subprocess
+  // without leaking it into another client's tool call.
+  private executionSignal = new AsyncLocalStorage<AbortSignal | undefined>();
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -1502,7 +1514,21 @@ export class ToolHandler {
   /**
    * Execute a tool by name
    */
-  async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  async execute(
+    toolName: string,
+    args: Record<string, unknown>,
+    options: ToolExecutionOptions = {},
+  ): Promise<ToolResult> {
+    return await this.executionSignal.run(
+      options.signal,
+      () => this.executeWithSignal(toolName, args),
+    );
+  }
+
+  private async executeWithSignal(
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResult> {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -1615,7 +1641,7 @@ export class ToolHandler {
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const evidence = this.renderRawEvidence(cg, deferredRawEvidence);
+    const evidence = await this.renderRawEvidence(cg, deferredRawEvidence);
     const out = [
       `# Batch symbol search (${args.queries.length} queries)`,
       '',
@@ -1737,7 +1763,7 @@ export class ToolHandler {
       );
       const declarationEvidenceNeedle = declarationOnly ? this.rawEvidenceNeedle(query) : undefined;
       const declarationEvidence = declarationEvidenceNeedle
-        ? this.renderSearchRawEvidence(cg, [{
+        ? await this.renderSearchRawEvidence(cg, [{
           label: signature ?? queryText,
           needle: declarationEvidenceNeedle,
           path: validatedPath,
@@ -1801,7 +1827,7 @@ export class ToolHandler {
       }
       const needle = this.rawEvidenceNeedle(query);
       const evidence = needle
-        ? this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
         : '';
       return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
@@ -1814,7 +1840,7 @@ export class ToolHandler {
     if (fuzzy.length === 0) {
       const needle = this.rawEvidenceNeedle(query);
       const evidence = needle
-        ? this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
         : '';
       return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
@@ -1822,7 +1848,7 @@ export class ToolHandler {
     const formatted = this.formatSearchResults(cg, this.rankSearchResults(fuzzy));
     const needle = exactAll.length === 0 ? this.rawEvidenceNeedle(query) : undefined;
     const evidence = needle
-      ? this.renderSearchRawEvidence(cg, [{ label: `exact identifier behind fuzzy results: ${queryText}`, needle, path: validatedPath }], deferredRawEvidence)
+      ? await this.renderSearchRawEvidence(cg, [{ label: `exact identifier behind fuzzy results: ${queryText}`, needle, path: validatedPath }], deferredRawEvidence)
       : '';
     return this.textResult(this.truncateOutput([
       includeCodeCorrection,
@@ -2488,7 +2514,7 @@ export class ToolHandler {
     const requestedWindowLines = fileWindowTargets.reduce((total, target) => total + target.limit!, 0);
     const broadFileWindowBatch = fileWindowTargets.length >= MCP_CONTEXT_BROAD_FILE_TARGETS &&
       requestedWindowLines >= MCP_CONTEXT_BROAD_FILE_LINES;
-    const evidenceText = this.renderRawEvidence(cg, rawEvidenceSpecs);
+    const evidenceText = await this.renderRawEvidence(cg, rawEvidenceSpecs);
     const manifestDriven = expectedMissing.length > 0 || targets.some((target) =>
       (target.mode === 'file' && Boolean(target.symbols?.length || target.texts?.length)) ||
       (target.mode === 'symbol' && Boolean(target.members?.length))
@@ -2781,7 +2807,7 @@ export class ToolHandler {
   private async handleCallers(args: Record<string, unknown>): Promise<ToolResult> {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
-    const resolved = this.resolveRelationshipTarget(cg, args, 'callers');
+    const resolved = await this.resolveRelationshipTarget(cg, args, 'callers');
     if ('result' in resolved) return resolved.result;
     const { target } = resolved;
 
@@ -2805,7 +2831,7 @@ export class ToolHandler {
     if (allCallers.length === 0) {
       const needle = this.rawEvidenceNeedle(target.symbol);
       const evidence = needle
-        ? this.renderRawEvidence(cg, [{ label: `zero callers: ${target.signature ?? target.symbol}`, needle }])
+        ? await this.renderRawEvidence(cg, [{ label: `zero callers: ${target.signature ?? target.symbol}`, needle }])
         : '';
       return this.textResult([
         `No callers found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`,
@@ -2830,7 +2856,7 @@ export class ToolHandler {
   private async handleCallees(args: Record<string, unknown>): Promise<ToolResult> {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
-    const resolved = this.resolveRelationshipTarget(cg, args, 'callees');
+    const resolved = await this.resolveRelationshipTarget(cg, args, 'callees');
     if ('result' in resolved) return resolved.result;
     const { target } = resolved;
 
@@ -2848,7 +2874,7 @@ export class ToolHandler {
     if (allCallees.length === 0) {
       const needle = this.rawEvidenceNeedle(target.symbol);
       const evidence = needle
-        ? this.renderRawEvidence(cg, [{ label: `zero callees: ${target.signature ?? target.symbol}`, needle }])
+        ? await this.renderRawEvidence(cg, [{ label: `zero callees: ${target.signature ?? target.symbol}`, needle }])
         : '';
       return this.textResult([
         `No callees found for ${this.formatRelationshipTarget(target)}${target.lookupNote}`,
@@ -2870,7 +2896,7 @@ export class ToolHandler {
   private async handleImpact(args: Record<string, unknown>): Promise<ToolResult> {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
-    const resolved = this.resolveRelationshipTarget(cg, args, 'impact');
+    const resolved = await this.resolveRelationshipTarget(cg, args, 'impact');
     if ('result' in resolved) return resolved.result;
     const { target } = resolved;
 
@@ -4333,7 +4359,7 @@ export class ToolHandler {
     if (matches.length === 0) {
       const needle = this.rawEvidenceNeedle(symbol);
       const evidence = needle
-        ? this.renderRawEvidence(cg, [{ label: symbol, needle, path: fileHint }])
+        ? await this.renderRawEvidence(cg, [{ label: symbol, needle, path: fileHint }])
         : '';
       return this.textResult([`Symbol "${symbol}" not found in the codebase`, evidence].filter(Boolean).join('\n\n'));
     }
@@ -4751,26 +4777,42 @@ export class ToolHandler {
       ? assertedPath.filter((node) => node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint)
       : assertedPath;
     let scoped = assertedLine.length > 0 ? assertedLine : assertedPath.length > 0 ? assertedPath : candidates;
+    let signatureAssertionMiss = false;
     if (signature) {
       const signatureMatches = this.matchingNodesBySignature(scoped, signature);
       if (signatureMatches.length > 0) scoped = signatureMatches;
+      else signatureAssertionMiss = true;
     }
-    const groups = this.relationshipOverloadGroups(cg, scoped, candidates);
+    // relationshipOverloadGroups is intentionally exact but quadratic in the
+    // selected set. A wrong owner on `reuse` can yield 1,000+ leaf candidates;
+    // grouping all of them is both expensive and unnecessary. Surface ranked
+    // structured candidates and ask for one narrowing assertion instead.
+    const groupingSkipped = scoped.length > MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES;
+    const groups = groupingSkipped
+      ? []
+      : this.relationshipOverloadGroups(cg, scoped, candidates);
     const out: string[] = [
       `> Qualified owner mismatch: no exact symbol named \`${query}\`, but the exact leaf \`${leaf}\` has structured candidates. Raw-source fallback was skipped.`,
     ];
     if (pathHint && assertedPath.length === 0) out.push(`> Path assertion \`${pathValue}\` matched none of those candidates.`);
     if (lineHint !== undefined && assertedLine.length === 0) out.push(`> Line assertion ${lineHint} matched none of those candidates.`);
-    if (signature && this.matchingNodesBySignature(scoped, signature).length === 0) {
+    if (signatureAssertionMiss) {
       out.push(`> Signature assertion \`${signature}\` was not used to guess a different overload.`);
     }
-    if (includeCode && groups.length === 1) {
+    if (groupingSkipped) {
+      out.push(
+        `> High-frequency leaf guard: ${scoped.length} candidates remain, above the ${MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES}-candidate overload-grouping cap. ` +
+        'Only ranked structured candidates are shown; no repository text scan or all-pairs overload comparison was run.'
+      );
+    }
+    if (includeCode && !groupingSkipped && groups.length === 1) {
       out.push('', await this.renderImplementationGroup(cg, groups[0]!, false));
     } else {
       const shown = this.rankExactSymbolNodes(scoped).slice(0, limit);
       out.push('', this.formatSearchResults(cg, shown.map((node) => ({ node, score: 1.0 }))));
-      if (groups.length > 1 && includeCode) {
-        out.push('', `> Source was not inlined because ${groups.length} logical leaf candidates remain. Copy one qualified name/signature or add path/line.`);
+      if (includeCode && (groupingSkipped || groups.length > 1)) {
+        const remaining = groupingSkipped ? scoped.length : groups.length;
+        out.push('', `> Source was not inlined because ${remaining} logical leaf candidate${remaining === 1 ? '' : 's'} remain. Copy one qualified name/signature or add path/line.`);
       }
     }
     out.push('', `> Correct \`${queryText}\` using one candidate above; do not Grep merely to verify the owner.`);
@@ -5498,11 +5540,11 @@ export class ToolHandler {
    * overloads or same-named symbols. A matching declaration and definition
    * are kept together because graph edges may attach to either endpoint.
    */
-  private resolveRelationshipTarget(
+  private async resolveRelationshipTarget(
     cg: CodeGraph,
     args: Record<string, unknown>,
     tool: 'callers' | 'callees' | 'impact',
-  ): RelationshipTargetResolution {
+  ): Promise<RelationshipTargetResolution> {
     const symbolValue = this.validateString(args.symbol, 'symbol', 512);
     if (typeof symbolValue !== 'string') return { result: symbolValue };
     const symbolText = symbolValue.trim();
@@ -5537,7 +5579,7 @@ export class ToolHandler {
     if (lookup.nodes.length === 0) {
       const needle = this.rawEvidenceNeedle(symbol);
       const evidence = needle
-        ? this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
+        ? await this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
         : '';
       return {
         result: this.textResult([`Symbol "${symbol}" not found in the codebase`, evidence].filter(Boolean).join('\n\n')),
@@ -5548,7 +5590,7 @@ export class ToolHandler {
     if (!narrowed.fileMatched || !narrowed.lineMatched) {
       const needle = this.rawEvidenceNeedle(symbol);
       const evidence = needle && file
-        ? this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
+        ? await this.renderRawEvidence(cg, [{ label: symbolText, needle, path: file }])
         : '';
       return {
         result: this.textResult([
@@ -6284,7 +6326,7 @@ export class ToolHandler {
     return /^[A-Za-z_$][\w$]*$/.test(leaf) && leaf.length >= 3 ? leaf : undefined;
   }
 
-  private renderRawEvidence(cg: CodeGraph, specs: RawEvidenceSpec[]): string {
+  private async renderRawEvidence(cg: CodeGraph, specs: RawEvidenceSpec[]): Promise<string> {
     const unique = new Map<string, RawEvidenceSpec>();
     for (const spec of specs) {
       // A global raw scan for `run`, `get`, etc. is expensive and proves little.
@@ -6299,22 +6341,27 @@ export class ToolHandler {
     }
     if (unique.size === 0) return '';
     return this.truncateAtLine(
-      formatRawSourceEvidence(scanRawSourceEvidence(cg, [...unique.values()])),
+      formatRawSourceEvidence(await scanRawSourceEvidence(
+        cg,
+        [...unique.values()],
+        undefined,
+        { signal: this.executionSignal.getStore() },
+      )),
       6_000,
     );
   }
 
   /** Batch search collects misses so the bundled ripgrep scan runs once. */
-  private renderSearchRawEvidence(
+  private async renderSearchRawEvidence(
     cg: CodeGraph,
     specs: RawEvidenceSpec[],
     deferred?: RawEvidenceSpec[],
-  ): string {
+  ): Promise<string> {
     if (deferred) {
       deferred.push(...specs);
       return '';
     }
-    return this.renderRawEvidence(cg, specs);
+    return await this.renderRawEvidence(cg, specs);
   }
 
   private textResult(text: string): ToolResult {

@@ -34,6 +34,14 @@ describe('MCP bounded batch context and literal search', () => {
       '// RAW_ONLY_MISSING_MARKER and SECOND_RAW_GAP are intentionally not AST symbols.\n',
     );
     fs.writeFileSync(
+      path.join(dir, 'src', 'raw_scope_target.ts'),
+      '// PATH_SCOPED_RAW_MARKER belongs to the requested file.\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'raw_scope_other.ts'),
+      '// PATH_SCOPED_RAW_MARKER must not leak through a different file scope.\n',
+    );
+    fs.writeFileSync(
       path.join(dir, 'src', 'overloads.h'),
       [
         'struct ObDtlLinkedBuffer {};',
@@ -391,11 +399,11 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/do not run Grep to reconfirm/i);
   });
 
-  it('uses bundled ripgrep for complete raw evidence when the indexed scope is visible', () => {
+  it('uses bundled ripgrep for complete raw evidence when the indexed scope is visible', async () => {
     const previous = process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
     process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = 'ripgrep';
     try {
-      const report = scanRawSourceEvidence(cg, [{
+      const report = await scanRawSourceEvidence(cg, [{
         label: 'RAW_ONLY_MISSING_MARKER',
         needle: 'RAW_ONLY_MISSING_MARKER',
       }]);
@@ -408,17 +416,96 @@ describe('MCP bounded batch context and literal search', () => {
     }
   });
 
-  it('reuses raw evidence only inside an unchanged actively-watched source epoch', () => {
+  it('pushes an exact path down to ripgrep instead of scanning then filtering the repository', async () => {
+    const previous = process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+    process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = 'ripgrep';
+    try {
+      const report = await scanRawSourceEvidence(cg, [{
+        label: 'PATH_SCOPED_RAW_MARKER',
+        needle: 'PATH_SCOPED_RAW_MARKER',
+        path: 'src/raw_scope_target.ts',
+      }]);
+      expect(report.backend).toMatch(/ripgrep|hybrid/);
+      expect(report.totalScannedFiles).toBe(1);
+      expect(report.states[0]?.eligibleFiles).toBe(1);
+      expect(report.states[0]?.matchingLines).toBe(1);
+      expect(report.states[0]?.snippets[0]?.file).toBe('src/raw_scope_target.ts');
+    } finally {
+      if (previous === undefined) delete process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+      else process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = previous;
+    }
+  });
+
+  it('returns inconclusive when the raw-evidence wall-clock budget is exhausted', async () => {
+    const previous = process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+    process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = 'ripgrep';
+    try {
+      const report = await scanRawSourceEvidence(cg, [{
+        label: 'DeadlineLimitedMissingSymbol',
+        needle: 'DeadlineLimitedMissingSymbol',
+      }], undefined, { timeoutMs: 1 });
+      const out = formatRawSourceEvidence(report);
+      expect(report.timeBudgetReached).toBe(true);
+      expect(out).toContain('INCONCLUSIVE');
+      expect(out).not.toContain('CONFIRMED_ABSENT');
+      expect(out).toMatch(/wall-clock scan budget was reached/i);
+    } finally {
+      if (previous === undefined) delete process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+      else process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = previous;
+    }
+  });
+
+  it('propagates request cancellation into raw evidence', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await handler.execute('search', {
+      query: 'CancelledMissingSymbol',
+    }, { signal: controller.signal });
+    const out = result.content.map((entry) => entry.text).join('\n');
+    expect(out).toContain('INCONCLUSIVE');
+    expect(out).not.toContain('CONFIRMED_ABSENT');
+    expect(out).toMatch(/request was cancelled/i);
+  });
+
+  it('caps wrong-owner recovery before grouping a high-frequency leaf', async () => {
+    const db = (cg as any).db.getDb();
+    const insert = db.prepare(
+      `INSERT INTO nodes (
+         id, kind, name, qualified_name, file_path, language,
+         start_line, end_line, start_column, end_column, signature, updated_at
+       ) VALUES (?, 'method', 'reuse', ?, 'src/flow.ts', 'cpp', 1, 1, 0, 1, ?, ?)`
+    );
+    for (let index = 0; index < 70; index++) {
+      insert.run(
+        `high-frequency-reuse-${index}`,
+        `IndexedOwner${index}::reuse`,
+        `int IndexedOwner${index}::reuse()`,
+        Date.now(),
+      );
+    }
+
+    const out = await output('search', {
+      query: 'MissingOwner::reuse',
+      includeCode: 'if_unique',
+      limit: 5,
+    });
+    expect(out).toMatch(/Qualified owner mismatch/i);
+    expect(out).toMatch(/High-frequency leaf guard: 70 candidates/i);
+    expect(out).toMatch(/no repository text scan or all-pairs overload comparison/i);
+    expect(out).not.toMatch(/Grep-equivalent current-source evidence/i);
+  });
+
+  it('reuses raw evidence only inside an unchanged actively-watched source epoch', async () => {
     const originalIsWatching = cg.isWatching.bind(cg);
     const originalPending = cg.getPendingFiles.bind(cg);
     (cg as any).isWatching = () => true;
     (cg as any).getPendingFiles = () => [];
     try {
-      const first = scanRawSourceEvidence(cg, [{
+      const first = await scanRawSourceEvidence(cg, [{
         label: 'first label',
         needle: 'RAW_ONLY_MISSING_MARKER',
       }]);
-      const second = scanRawSourceEvidence(cg, [{
+      const second = await scanRawSourceEvidence(cg, [{
         label: 'declaration-only label',
         needle: 'RAW_ONLY_MISSING_MARKER',
         purpose: 'declaration_only',
@@ -429,18 +516,18 @@ describe('MCP bounded batch context and literal search', () => {
       expect(formatRawSourceEvidence(second)).toContain('DECLARATION_ONLY');
 
       (cg as any).getPendingFiles = () => [{ path: 'src/raw_gap.ts' }];
-      const afterEdit = scanRawSourceEvidence(cg, [{
+      const afterEdit = await scanRawSourceEvidence(cg, [{
         label: 'after edit',
         needle: 'RAW_ONLY_MISSING_MARKER',
       }]);
       expect(afterEdit.cacheHit).toBe(false);
 
       (cg as any).getPendingFiles = () => [];
-      const partialOne = scanRawSourceEvidence(cg, [{
+      const partialOne = await scanRawSourceEvidence(cg, [{
         label: 'partial one',
         needle: 'BudgetLimitedMissingSymbol',
       }], 1);
-      const partialTwo = scanRawSourceEvidence(cg, [{
+      const partialTwo = await scanRawSourceEvidence(cg, [{
         label: 'partial two',
         needle: 'BudgetLimitedMissingSymbol',
       }], 1);
@@ -452,8 +539,8 @@ describe('MCP bounded batch context and literal search', () => {
     }
   });
 
-  it('marks a budget-limited raw scan inconclusive instead of claiming absence', () => {
-    const report = scanRawSourceEvidence(cg, [{
+  it('marks a budget-limited raw scan inconclusive instead of claiming absence', async () => {
+    const report = await scanRawSourceEvidence(cg, [{
       label: 'BudgetLimitedMissingSymbol',
       needle: 'BudgetLimitedMissingSymbol',
     }], 1);

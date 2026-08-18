@@ -270,7 +270,12 @@ export class Daemon {
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
       });
-      transport.onClose(() => this.dropClient(session));
+      transport.onClose(() => {
+        // Abort any request-scoped raw-evidence subprocess before dropping the
+        // disconnected client. SocketTransport.stop() is idempotent here.
+        session.stop();
+        this.dropClient(session);
+      });
       this.clients.add(session);
       this.clientPeers.set(session, peers);
       this.disarmIdleTimer();
