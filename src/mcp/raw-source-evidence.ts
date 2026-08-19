@@ -491,8 +491,8 @@ async function scanWithRipgrep(
 
 /**
  * Scan current on-disk contents of indexed source files once for several
- * graph misses. This is grep-equivalent evidence, but with explicit scope and
- * completeness accounting so a partial scan can never masquerade as absence.
+ * graph misses. Completeness accounting remains internal so a partial scan can
+ * never masquerade as absence, while model-facing output stays grep-like.
  */
 export async function scanRawSourceEvidence(
   cg: CodeGraph,
@@ -592,79 +592,83 @@ export async function scanRawSourceEvidence(
   return report;
 }
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
+function formatMatchCount(count: number): string {
+  return `${count} raw-source match${count === 1 ? '' : 'es'}`;
 }
 
-/** Render stable, auditable statuses for model consumption. */
+function appendCompactSnippets(out: string[], state: RawEvidenceState): void {
+  const byFile = new Map<string, RawEvidenceSnippet[]>();
+  for (const snippet of state.snippets) {
+    const entries = byFile.get(snippet.file) ?? [];
+    entries.push(snippet);
+    byFile.set(snippet.file, entries);
+  }
+  for (const [file, snippets] of byFile) {
+    out.push(`${file}:`);
+    for (const snippet of snippets) out.push(`  Line ${snippet.line}: ${snippet.text}`);
+  }
+  if (state.matchingLines > state.snippets.length) {
+    out.push(`  … ${state.matchingLines - state.snippets.length} more match(es) not shown`);
+  }
+}
+
+function incompleteReason(report: RawEvidenceReport, state: RawEvidenceState): string {
+  if (report.cancelled) return 'request cancelled';
+  if (report.timeBudgetReached) return 'time budget reached';
+  if (report.budgetReached) return 'scan budget reached';
+  if (state.unreadableFiles > 0) return `${state.unreadableFiles} unreadable file(s)`;
+  if (state.eligibleFiles === 0) return 'no eligible indexed files';
+  return 'scope not fully scanned';
+}
+
+/** Render compact grep-like results while preserving absence safety. */
 export function formatRawSourceEvidence(report: RawEvidenceReport): string {
-  const out: string[] = [
-    '## Grep-equivalent current-source evidence',
-    '',
-    report.cacheHit
-      ? `> Reused a source-epoch cache entry from a complete server-side ${report.backend === 'node' ? 'Node fallback' : report.backend} scan covering ${report.totalScannedFiles} indexed source file(s) (${formatBytes(report.totalScannedBytes)}). No pending source edits were observed.`
-      : `> One bounded server-side ${report.backend === 'node' ? 'Node fallback' : report.backend} scan covered ${report.totalScannedFiles} indexed source file(s) (${formatBytes(report.totalScannedBytes)}). Generated indexed source was included. This is raw text evidence, not an additional AST claim.`,
-  ];
+  const out: string[] = [];
   for (const state of report.states) {
     const complete = !report.budgetReached && !report.timeBudgetReached && !report.cancelled && state.eligibleFiles > 0 &&
       state.scannedFiles === state.eligibleFiles && state.unreadableFiles === 0;
     const declarationOnly = state.spec.purpose === 'declaration_only';
-    const status = declarationOnly
-      ? 'DECLARATION_ONLY'
-      : state.matchingLines > 0
-      ? 'RAW_MATCHES'
-      : complete
-        ? 'CONFIRMED_ABSENT'
-        : 'INCONCLUSIVE';
-    out.push(
-      '',
-      `### ${state.spec.label}`,
-      `- Status: **${status}**`,
-      `- Needle: \`${state.spec.needle.replace(/`/g, '\\`')}\` (${state.spec.mode ?? 'identifier'})`,
-      `- Scope: ${state.spec.path ? `indexed source paths containing \`${state.spec.path}\`` : 'all indexed source files'}`,
-      `- Coverage: ${state.scannedFiles}/${state.eligibleFiles} eligible files; ${formatBytes(state.scannedBytes)}; ${state.unreadableFiles} unreadable`,
-      `- Matching source lines: ${state.matchingLines}`,
-    );
-    for (const snippet of state.snippets) {
-      out.push(`  - \`${snippet.file}:${snippet.line}\`  ${snippet.text}`);
-    }
-    if (state.matchingLines > state.snippets.length) {
-      out.push(`  - … ${state.matchingLines - state.snippets.length} additional matching line(s) omitted from the response`);
-    }
+    const label = state.spec.label.replace(/`/g, '\\`');
+    const needle = state.spec.needle.replace(/`/g, '\\`');
+    if (out.length > 0) out.push('');
+
     if (declarationOnly) {
-      const rawCoverage = complete
-        ? state.matchingLines <= state.snippets.length
-          ? 'Every current-source line containing the callable identifier is shown above.'
-          : 'The complete current-source occurrence count is authoritative; representative lines are shown above.'
-        : 'Raw-source coverage is incomplete, but the structured declaration-only state is unchanged.';
+      out.push(`No indexed definition for \`${label}\` (DECLARATION_ONLY; do not rerun Grep).`);
+      if (state.matchingLines > 0) {
+        out.push(`Found ${formatMatchCount(state.matchingLines)} for \`${needle}\`:`);
+        appendCompactSnippets(out, state);
+        out.push('Raw matches may be other overloads or call sites, not definitions of this exact overload.');
+      }
+      if (!complete) {
+        out.push(`Scan incomplete: ${incompleteReason(report, state)}; ${state.scannedFiles}/${state.eligibleFiles} files scanned.`);
+      }
+      continue;
+    }
+
+    if (state.matchingLines > 0) {
+      out.push(`Found ${formatMatchCount(state.matchingLines)} for \`${label}\` (RAW_MATCHES; possible index/parser gap):`);
+      appendCompactSnippets(out, state);
+      if (!complete) {
+        out.push(`Scan incomplete: ${incompleteReason(report, state)}; more matches may exist (${state.scannedFiles}/${state.eligibleFiles} files scanned).`);
+      }
+      continue;
+    }
+
+    const scope = state.spec.path ? ` in \`${state.spec.path.replace(/`/g, '\\`')}\`` : '';
+    if (complete) {
       out.push(
-        '- Structured verdict: the exact callable overload has a declaration but no paired indexed definition.',
-        `- Raw-evidence verdict: ${rawCoverage} Other overloads and call sites are supporting text evidence, not definitions of this exact overload. Do not run Grep merely to repeat this occurrence scan.`,
+        `No raw-source matches for \`${label}\`${scope} — complete scan of ${state.scannedFiles} file(s) ` +
+        '(CONFIRMED_ABSENT; do not rerun Grep).',
       );
-    } else if (status === 'CONFIRMED_ABSENT') {
-      out.push('- Verdict: the identifier/literal is absent from the complete current-source scope; do not run Grep to reconfirm it.');
-    } else if (status === 'RAW_MATCHES') {
-      const completeness = complete
-        ? state.matchingLines <= state.snippets.length
-          ? 'The scan is complete and every matching source line is shown.'
-          : 'The scan is complete; the total match count is authoritative and representative lines are shown.'
-        : 'The scan scope is incomplete, but the displayed matches are current-source evidence.';
-      out.push(`- Verdict: current source contains the raw text above. ${completeness} If the graph lookup was empty, treat this as an index/parser gap; do not run Grep merely to rediscover these matches.`);
     } else {
-      const reason = report.cancelled
-        ? ' because the request was cancelled'
-        : report.timeBudgetReached
-          ? ' because the wall-clock scan budget was reached'
-          : report.budgetReached
-            ? ' because the byte scan budget was reached'
-            : '';
-      out.push(`- Verdict: absence is not proven${reason}; narrow the indexed path and retry before drawing a conclusion.`);
+      out.push(
+        `Raw-source scan incomplete for \`${label}\`${scope} ` +
+        `(INCONCLUSIVE: ${incompleteReason(report, state)}; ${state.scannedFiles}/${state.eligibleFiles} files scanned). Absence is not proven.`,
+      );
     }
   }
   if (report.omittedQueries > 0) {
-    out.push('', `> ${report.omittedQueries} additional evidence quer${report.omittedQueries === 1 ? 'y was' : 'ies were'} omitted by the ${RAW_EVIDENCE_MAX_QUERIES}-query cap.`);
+    out.push('', `${report.omittedQueries} additional quer${report.omittedQueries === 1 ? 'y was' : 'ies were'} omitted by the ${RAW_EVIDENCE_MAX_QUERIES}-query cap.`);
   }
   return out.join('\n');
 }

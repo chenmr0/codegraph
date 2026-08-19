@@ -45,16 +45,15 @@ direct relationships, and edit location are known. Raw Read/Grep is for
 unindexed files, stale files named by the pending-sync warning, configs/docs,
 or text/dynamic relationships the AST graph does not model.
 
-When an exact graph lookup is unexpectedly empty, CodeGraph may append one
-grep-equivalent scan of current indexed source. \`CONFIRMED_ABSENT\` is emitted
+When an exact graph lookup is unexpectedly empty, CodeGraph may append compact
+raw-source matches or one-line absence evidence. \`CONFIRMED_ABSENT\` is emitted
 only for a complete readable scope and needs no Grep recheck; \`DECLARATION_ONLY\`
 means an exact callable declaration has no paired indexed definition and its
 raw identifier occurrences are already included; \`RAW_MATCHES\`
 already contains representative Grep evidence and signals a possible parser/
 index gap; \`INCONCLUSIVE\` means the reported scan scope was incomplete and
-must be narrowed before drawing an absence conclusion. Identical evidence may
-reuse a cache only while the file watcher reports the same source epoch and no
-pending edits; an edit or completed sync invalidates it.
+must be narrowed before drawing an absence conclusion. Internal backend,
+coverage-byte, and cache details are intentionally omitted from normal output.
 
 The index normally trails writes by about one second. A staleness banner names
 the exact files that may require a temporary raw read. Compiler, tests, and

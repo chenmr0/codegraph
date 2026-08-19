@@ -110,7 +110,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     const text = result.content[0]!.text;
     expect(text).toMatch(/⚠️ No exact match for "missing_symbol"/);
     expect(text).toContain('missing_symbol_helper');
-    expect(text).toMatch(/Grep-equivalent current-source evidence/i);
+    expect(text).toMatch(/No raw-source matches/i);
     expect(text).toContain('CONFIRMED_ABSENT');
   });
 
@@ -127,7 +127,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     const text = result.content[0]!.text;
     expect(text).toMatch(/⚠️ No exact match for "helper"/);
     expect(text).toContain('HelperUtils');
-    expect(text).not.toMatch(/Grep-equivalent current-source evidence/i);
+    expect(text).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
   it('resolves a qualified input exactly and exposes the qualified name', async () => {
@@ -223,7 +223,7 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(text).toMatch(/Qualified owner mismatch/i);
     expect(text).toContain('Service::execute');
     expect(text).toContain('return value + 1');
-    expect(text).not.toMatch(/Grep-equivalent current-source evidence/i);
+    expect(text).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
   it('batches symbol queries and emits one shared multi-pattern raw fallback report', async () => {
@@ -238,9 +238,9 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(result.isError).toBeFalsy();
     expect(text).toMatch(/Batch symbol search \(3 queries\)/i);
     expect(text).toContain('function helperSync');
-    expect(text.match(/## Grep-equivalent current-source evidence/g)).toHaveLength(1);
-    expect(text).toContain('### FIRST_RAW_MARKER');
-    expect(text).toContain('### SECOND_RAW_MARKER');
-    expect(text).toMatch(/One bounded server-side .* scan covered/i);
+    expect(text.match(/Found 1 raw-source match/g)).toHaveLength(2);
+    expect(text).toMatch(/Found 1 raw-source match for `FIRST_RAW_MARKER`/i);
+    expect(text).toMatch(/Found 1 raw-source match for `SECOND_RAW_MARKER`/i);
+    expect(text).not.toMatch(/server-side|Coverage:|KiB|MiB/i);
   });
 });

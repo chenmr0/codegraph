@@ -93,7 +93,8 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_text_search` call/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/zero-match identifier/i);
     expect(SERVER_INSTRUCTIONS).toContain('DECLARATION_ONLY');
-    expect(SERVER_INSTRUCTIONS).toMatch(/source epoch[^]*pending edits/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/compact\s+raw-source matches/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/backend[^]*cache details[^]*omitted/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/file.*line.*signature/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/do not aggregate/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate file windows/i);
@@ -115,6 +116,7 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node(targets=[...])');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('DECLARATION_ONLY');
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/compact raw-source matches/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/file.*line.*signature/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/refuse to aggregate distinct overloads/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).not.toContain('codegraph_codegraph_node');

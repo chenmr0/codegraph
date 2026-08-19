@@ -341,7 +341,7 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/Manifest-driven implementation context/i);
     expect(out).toContain('expected-new: send_bytes_');
     expect(out).toContain('CONFIRMED_ABSENT');
-    expect(out).toMatch(/do not run Grep to reconfirm/i);
+    expect(out).toMatch(/do not rerun Grep/i);
   });
 
   it('batch-verifies unresolved manifest symbols against current source', async () => {
@@ -360,7 +360,7 @@ describe('MCP bounded batch context and literal search', () => {
   it('adds raw occurrences when a precise relationship traversal is empty', async () => {
     const out = await output('callers', { symbol: 'wide_alpha' });
     expect(out).toMatch(/No callers found/i);
-    expect(out).toMatch(/Grep-equivalent current-source evidence/i);
+    expect(out).toMatch(/Found 1 raw-source match/i);
     expect(out).toContain('RAW_MATCHES');
     expect(out).toMatch(/raw text alone is not classified as a caller/i);
   });
@@ -409,8 +409,8 @@ describe('MCP bounded batch context and literal search', () => {
     });
     expect(precise).toContain('push_back_send_list(ObDtlLinkedBuffer *buffer)');
     expect(precise).toMatch(/No indexed definition found/i);
-    expect(precise).toMatch(/Grep-equivalent current-source evidence/i);
     expect(precise).toContain('DECLARATION_ONLY');
+    expect(precise).toMatch(/Found 3 raw-source matches/i);
 
     const bad = await output('search', {
       query: 'push_back_send_list',
@@ -420,14 +420,14 @@ describe('MCP bounded batch context and literal search', () => {
     expect(bad).toMatch(/Signature hint did not match/i);
     expect(bad).toMatch(/No source was inlined/i);
     expect(bad).toMatch(/Raw-source fallback was skipped/i);
-    expect(bad).not.toMatch(/Grep-equivalent current-source evidence/i);
+    expect(bad).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
   it('returns raw source hits when an exact graph symbol is missing', async () => {
     const out = await output('search', { query: 'RAW_ONLY_MISSING_MARKER' });
     expect(out).toMatch(/No results found/i);
     expect(out).toContain('RAW_MATCHES');
-    expect(out).toContain('src/raw_gap.ts:1');
+    expect(out).toMatch(/src\/raw_gap\.ts:\s*\n\s*Line 1:/i);
     expect(out).toMatch(/index\/parser gap/i);
   });
 
@@ -435,8 +435,8 @@ describe('MCP bounded batch context and literal search', () => {
     const out = await output('search', { query: 'TotallyAbsentSymbol' });
     expect(out).toMatch(/No results found/i);
     expect(out).toContain('CONFIRMED_ABSENT');
-    expect(out).toMatch(/Coverage: \d+\/\d+ eligible files/i);
-    expect(out).toMatch(/do not run Grep to reconfirm/i);
+    expect(out).toMatch(/complete scan of \d+ file/i);
+    expect(out).toMatch(/do not rerun Grep/i);
   });
 
   it('uses bundled ripgrep for complete raw evidence when the indexed scope is visible', async () => {
@@ -449,7 +449,8 @@ describe('MCP bounded batch context and literal search', () => {
       }]);
       expect(report.backend).toMatch(/ripgrep|hybrid/);
       expect(report.states[0]?.matchingLines).toBe(1);
-      expect(formatRawSourceEvidence(report)).toMatch(/server-side (?:ripgrep|hybrid) scan/i);
+      expect(formatRawSourceEvidence(report)).toMatch(/Found 1 raw-source match/i);
+      expect(formatRawSourceEvidence(report)).not.toMatch(/server-side|KiB|MiB/i);
     } finally {
       if (previous === undefined) delete process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
       else process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = previous;
@@ -488,7 +489,7 @@ describe('MCP bounded batch context and literal search', () => {
       expect(report.timeBudgetReached).toBe(true);
       expect(out).toContain('INCONCLUSIVE');
       expect(out).not.toContain('CONFIRMED_ABSENT');
-      expect(out).toMatch(/wall-clock scan budget was reached/i);
+      expect(out).toMatch(/time budget reached/i);
     } finally {
       if (previous === undefined) delete process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
       else process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = previous;
@@ -504,7 +505,7 @@ describe('MCP bounded batch context and literal search', () => {
     const out = result.content.map((entry) => entry.text).join('\n');
     expect(out).toContain('INCONCLUSIVE');
     expect(out).not.toContain('CONFIRMED_ABSENT');
-    expect(out).toMatch(/request was cancelled/i);
+    expect(out).toMatch(/request cancelled/i);
   });
 
   it('caps wrong-owner recovery before grouping a high-frequency leaf', async () => {
@@ -532,7 +533,7 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/Qualified owner mismatch/i);
     expect(out).toMatch(/High-frequency leaf guard: 70 candidates/i);
     expect(out).toMatch(/no repository text scan or all-pairs overload comparison/i);
-    expect(out).not.toMatch(/Grep-equivalent current-source evidence/i);
+    expect(out).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
   it('reuses raw evidence only inside an unchanged actively-watched source epoch', async () => {
@@ -552,8 +553,9 @@ describe('MCP bounded batch context and literal search', () => {
       }]);
       expect(first.cacheHit).toBe(false);
       expect(second.cacheHit).toBe(true);
-      expect(formatRawSourceEvidence(second)).toMatch(/source-epoch cache entry/i);
-      expect(formatRawSourceEvidence(second)).toContain('DECLARATION_ONLY');
+      const cachedOut = formatRawSourceEvidence(second);
+      expect(cachedOut).toContain('DECLARATION_ONLY');
+      expect(cachedOut).not.toMatch(/source-epoch|server-side|KiB|MiB/i);
 
       (cg as any).getPendingFiles = () => [{ path: 'src/raw_gap.ts' }];
       const afterEdit = await scanRawSourceEvidence(cg, [{
@@ -587,7 +589,7 @@ describe('MCP bounded batch context and literal search', () => {
     const out = formatRawSourceEvidence(report);
     expect(out).toContain('INCONCLUSIVE');
     expect(out).not.toContain('CONFIRMED_ABSENT');
-    expect(out).toMatch(/scan budget was reached/i);
+    expect(out).toMatch(/scan budget reached/i);
   });
 
   it('does not misread a natural-language question containing parentheses as a signature', async () => {
@@ -831,7 +833,7 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).not.toContain('helper (function)');
     expect(out).not.toContain('second (function)');
     expect(out).toMatch(/Raw-source fallback was skipped/i);
-    expect(out).not.toMatch(/Grep-equivalent current-source evidence/i);
+    expect(out).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
   it('does not collapse a different overload behind a stale legacy defines edge', async () => {
@@ -977,7 +979,7 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/declaration — no indexed definition found for this exact overload/i);
     expect(out).toMatch(/authoritative for the current index/i);
     expect(out).toContain('DECLARATION_ONLY');
-    expect(out).toMatch(/Other overloads and call sites.*not definitions of this exact overload/i);
+    expect(out).toMatch(/other overloads or call sites.*not definitions of this exact overload/i);
   });
 
   it('does not pair same-signature declarations and definitions from unrelated owners', async () => {
