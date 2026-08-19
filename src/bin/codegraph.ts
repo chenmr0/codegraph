@@ -1596,10 +1596,10 @@ program
  *     structural outline instead. Config/data files are summarized by key
  *     only (values withheld for safety).
  *   - SYMBOL MODE: `codegraph node <symbol>` returns the symbol's location,
- *     signature, and (with `--code`) its full source or container outline,
- *     plus its call trail (callees/callers) and C/C++ declaration-definition
- *     links. `--file`/`--line` pin a specific overload; same-name overloads
- *     are all returned in one call.
+ *     signature, and (with `--code`) its bounded source,
+ *     plus C/C++ declaration-definition links. `--relations` adds the
+ *     caller/callee trail. `--file`/`--line` pin a specific overload;
+ *     same-name overloads are all returned in one call.
  */
 program
   .command('node [symbol]')
@@ -1609,7 +1609,8 @@ program
   .option('--line <number>', 'Line number to pin a specific overload (symbol mode)')
   .option('--offset <number>', 'File mode: 1-based start line (like Read)')
   .option('--limit <number>', 'File mode: maximum line count (like Read)')
-  .option('-c, --code', 'Symbol mode: include the symbol\'s full source (like includeCode)')
+  .option('-c, --code', 'Symbol mode: include source, safely truncated when oversized')
+  .option('--relations', 'Symbol mode: include caller/callee trails (default: off)')
   .option('-o, --symbols-only', 'File mode: return the symbol outline instead of the source')
   .option('-j, --json', 'Output as JSON')
   .action(async (symbolArg: string | undefined, options: {
@@ -1619,6 +1620,7 @@ program
     offset?: string;
     limit?: string;
     code?: boolean;
+    relations?: boolean;
     symbolsOnly?: boolean;
     json?: boolean;
   }) => {
@@ -1641,6 +1643,7 @@ program
         offset: options.offset ? parseInt(options.offset, 10) : undefined,
         limit: options.limit ? parseInt(options.limit, 10) : undefined,
         includeCode: options.code === true,
+        includeRelations: options.relations === true,
         symbolsOnly: options.symbolsOnly === true,
       });
 

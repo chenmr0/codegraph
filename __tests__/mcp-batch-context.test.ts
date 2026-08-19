@@ -86,6 +86,20 @@ describe('MCP bounded batch context and literal search', () => {
       ].join('\n'),
     );
     fs.writeFileSync(
+      path.join(dir, 'src', 'value_types.h'),
+      [
+        'enum DeliveryMode {',
+        '  DELIVERY_DISABLED = -2,',
+        '  DELIVERY_BUFFERED = 4, // wire-compatible value',
+        '};',
+        'struct PointerConfig {',
+        '  int64_t *count;',
+        '  const char *label;',
+        '};',
+        '',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
       path.join(dir, 'src', 'named_container.h'),
       [
         'class NamedContainer {',
@@ -360,6 +374,32 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/Unique exact result; source included/i);
     expect(out).toContain('return helper(1)');
     expect(out).toMatch(/Do not call codegraph_node/i);
+  });
+
+  it('returns exact enum and struct declarations across search, node, and manifest routes', async () => {
+    const search = await output('search', {
+      queries: [
+        { query: 'DeliveryMode', includeCode: 'if_unique' },
+        { query: 'PointerConfig', includeCode: 'if_unique' },
+      ],
+    });
+    expect(search.match(/Unique exact result; source included/gi)).toHaveLength(2);
+    expect(search).toContain('DELIVERY_DISABLED = -2');
+    expect(search).toContain('DELIVERY_BUFFERED = 4, // wire-compatible value');
+    expect(search).toContain('int64_t *count;');
+    expect(search).toContain('const char *label;');
+    expect(search).not.toMatch(/Members \(/);
+
+    const node = await output('node', { symbol: 'PointerConfig', includeCode: true });
+    expect(node).toContain('int64_t *count;');
+    expect(node).toContain('const char *label;');
+    expect(node).not.toMatch(/Members \(/);
+
+    const manifest = await output('node', {
+      targets: [{ file: 'src/value_types.h', symbols: ['DeliveryMode', 'PointerConfig'] }],
+    });
+    expect(manifest).toContain('DELIVERY_DISABLED = -2');
+    expect(manifest).toContain('int64_t *count;');
   });
 
   it('accepts a callable signature directly in search and never guesses a bad signature', async () => {
@@ -676,7 +716,9 @@ describe('MCP bounded batch context and literal search', () => {
       ],
     });
     expect(contextOut).toContain('NamedContainer (class)');
-    expect(contextOut).toContain('Members (3; showing 3)');
+    expect(contextOut).toContain('class NamedContainer {');
+    expect(contextOut).toContain('explicit NamedContainer(int value);');
+    expect(contextOut).not.toContain('Members (3; showing 3)');
     expect(contextOut).not.toMatch(/distinct overload candidates/i);
 
     const nodeOut = await output('node', {
@@ -685,6 +727,7 @@ describe('MCP bounded batch context and literal search', () => {
       includeCode: true,
     });
     expect(nodeOut).toContain('NamedContainer (class)');
+    expect(nodeOut).toContain('class NamedContainer {');
     expect(nodeOut).not.toMatch(/definitions named "NamedContainer"/i);
 
     const constructorOut = await output('context', {
@@ -981,19 +1024,20 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toContain('### Trail');
   });
 
-  it('suppresses trails automatically for an already-pinned single-symbol edit target', async () => {
-    const precise = await output('node', {
-      symbol: 'first',
-      file: 'flow.ts',
-      line: 2,
-      includeCode: true,
-    });
-    const exploratory = await output('node', {
+  it('omits relation trails by default and returns them only when explicitly requested', async () => {
+    const defaultOut = await output('node', {
       symbol: 'first',
       includeCode: true,
     });
-    expect(precise).not.toContain('### Trail');
-    expect(exploratory).toContain('### Trail');
+    const withRelations = await output('node', {
+      symbol: 'first',
+      includeCode: true,
+      includeRelations: true,
+    });
+    expect(defaultOut).not.toContain('### Trail');
+    expect(defaultOut).not.toContain('Called by');
+    expect(withRelations).toContain('### Trail');
+    expect(withRelations).toContain('Called by');
   });
 
   it('accepts one precise context target without forcing a correction call', async () => {

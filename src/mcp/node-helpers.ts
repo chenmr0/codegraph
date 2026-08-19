@@ -16,15 +16,51 @@ export {
   matchesSymbol,
 } from '../search/symbol-match';
 
-/**
- * Node kinds that contain other symbols. For these, `codegraph_node` with
- * `includeCode=true` returns a structural outline (member names + signatures
- * + line numbers) instead of the full body, which for a large class is a
- * multi-thousand-character wall of source that bloats the agent's context.
- */
+/** Node kinds that contain other symbols. */
 export const CONTAINER_NODE_KINDS = new Set<NodeKind>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
 ]);
+
+/** Maximum numbered source payload for one symbol endpoint. */
+export const SYMBOL_SOURCE_MAX_CHARS = 8_000;
+
+export interface BoundedNumberedSource {
+  text: string;
+  truncated: boolean;
+  shownEndLine: number;
+}
+
+/**
+ * Number symbol source while keeping a complete, bounded payload. Prefer a
+ * line boundary; only a single overlong first line is sliced mid-line.
+ */
+export function boundNumberedSource(
+  source: string,
+  firstLineNumber: number,
+  maxChars: number = SYMBOL_SOURCE_MAX_CHARS,
+): BoundedNumberedSource {
+  const lines = source.split('\n');
+  const kept: string[] = [];
+  let used = 0;
+  let truncated = false;
+  for (let i = 0; i < lines.length; i++) {
+    const numberedLine = `${firstLineNumber + i}\t${lines[i]}`;
+    const cost = numberedLine.length + (kept.length > 0 ? 1 : 0);
+    if (used + cost <= maxChars) {
+      kept.push(numberedLine);
+      used += cost;
+      continue;
+    }
+    if (kept.length === 0) kept.push(numberedLine.slice(0, maxChars));
+    truncated = true;
+    break;
+  }
+  return {
+    text: kept.join('\n'),
+    truncated,
+    shownEndLine: firstLineNumber + Math.max(0, kept.length - 1),
+  };
+}
 
 /**
  * Display name for a node in a disambiguation list: the qualifiedName when it

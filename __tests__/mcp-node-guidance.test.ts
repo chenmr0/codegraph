@@ -31,6 +31,9 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(properties.limit?.description).toMatch(/safely clamped to 500/i);
     expect(properties.offset?.minimum).toBe(1);
     expect(properties.outlineLimit?.maximum).toBe(80);
+    expect(properties.includeRelations?.default).toBe(false);
+    expect(properties.includeCode?.description).toMatch(/safely truncated/i);
+    expect(nodeTool().description).toMatch(/relations are omitted by default/i);
   });
 
   it('publishes bounded batch-context and literal-search schemas', () => {
@@ -82,6 +85,8 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(SERVER_INSTRUCTIONS).toMatch(/both declaration and definition source/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/virtual-dispatch family/i);
     expect(SERVER_INSTRUCTIONS).toContain('includeCode: "if_unique"');
+    expect(SERVER_INSTRUCTIONS).toMatch(/safely truncated.*rather than replaced by an outline/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/trails are off by default/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/selected container.*text.*file windows/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/bare.*file.*compact symbol outline/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/JSON-stringified.*parsed automatically/i);
@@ -102,6 +107,8 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('includeCode="if_unique"');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_search(queries=[...])');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/declaration and definition source/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/safely truncated.*rather than replaced by an outline/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/trails are off by default/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/outlineQueries/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/base-declaration call sites/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_text_search');

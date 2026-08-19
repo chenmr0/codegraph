@@ -11,9 +11,8 @@
  *      withheld for safety, #383); an unreadable file falls back to its
  *      symbol map.
  *   2. SYMBOL MODE (a `symbol`, optionally pinned by `file`/`line`) — a
- *      symbol's location / signature / docstring, plus its full source (or a
- *      container outline) and its call trail (callees / callers, with
- *      synthesized-edge notes) and C/C++ declaration-definition links.
+ *      symbol's location / signature / docstring, plus bounded source and
+ *      C/C++ declaration-definition links. Caller/callee trails are opt-in.
  *      Same-name overloads are all returned in one call.
  *
  * Output is plain text (no ANSI) plus a structured `json` payload for
@@ -27,9 +26,9 @@ import { validatePathWithinRoot, CONFIG_LEAF_LANGUAGES, canonicalFilePath } from
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { readFileSync } from 'fs';
 import {
-  CONTAINER_NODE_KINDS,
+  boundNumberedSource,
   displaySymbol,
-  numberSourceLines,
+  SYMBOL_SOURCE_MAX_CHARS,
   synthEdgeNote,
 } from '../mcp/node-helpers';
 
@@ -44,8 +43,10 @@ export interface NodeViewArgs {
   offset?: number;
   /** File mode: max line count (like Read). */
   limit?: number;
-  /** Symbol mode: include the symbol's full source (like `includeCode`). */
+  /** Symbol mode: include source, safely truncated when oversized. */
   includeCode?: boolean;
+  /** Symbol mode: include caller/callee trails (default: false). */
+  includeRelations?: boolean;
   /** File mode: return the symbol outline instead of the source. */
   symbolsOnly?: boolean;
 }
@@ -96,6 +97,7 @@ export async function buildNodeView(cg: CodeGraph, args: NodeViewArgs): Promise<
     fileHint,
     lineHint: args.line,
     includeCode: args.includeCode === true,
+    includeRelations: args.includeRelations === true,
   });
 }
 
@@ -250,6 +252,7 @@ interface SymbolViewOpts {
   fileHint?: string;
   lineHint?: number;
   includeCode: boolean;
+  includeRelations: boolean;
 }
 
 async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOpts): Promise<NodeViewResult> {
@@ -269,9 +272,9 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
 
   if (matches.length === 1) {
     const node = matches[0]!;
-    const rendered = await renderSymbolSection(cg, node, opts.includeCode);
+    const rendered = await renderSymbolSection(cg, node, opts.includeCode, opts.includeRelations);
     return result(
-      { mode: 'symbol', symbol, match: await symbolMatchJson(cg, node, opts.includeCode) },
+      { mode: 'symbol', symbol, match: await symbolMatchJson(cg, node, opts.includeCode, opts.includeRelations) },
       rendered,
     );
   }
@@ -291,7 +294,7 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
   let used = 0;
   for (const n of matches) {
     if (rendered.length >= MULTI_HARD_CAP) { listed.push(n); continue; }
-    const section = await renderSymbolSection(cg, n, true);
+    const section = await renderSymbolSection(cg, n, true, opts.includeRelations);
     if (rendered.length === 0 || used + section.length <= MULTI_BODY_BUDGET) {
       rendered.push(section);
       used += section.length;
@@ -374,33 +377,25 @@ function narrowMatches(matches: Node[], fileHint?: string, lineHint?: number): N
   return narrowed;
 }
 
-/** Render one symbol: details + (source or outline) + trail + decl/def links. */
-async function renderSymbolSection(cg: CodeGraph, node: Node, includeCode: boolean): Promise<string> {
-  let code: string | null = null;
-  let outline: string | null = null;
-  if (includeCode) {
-    if (CONTAINER_NODE_KINDS.has(node.kind)) {
-      outline = buildContainerOutline(cg, node);
-    }
-    if (!outline) {
-      code = await cg.getCode(node.id);
-    }
-  }
-  return formatNodeDetails(node, code, outline) + formatTrail(cg, node);
+/** Render one symbol: details + bounded source + trail + decl/def links. */
+async function renderSymbolSection(
+  cg: CodeGraph,
+  node: Node,
+  includeCode: boolean,
+  includeRelations: boolean,
+): Promise<string> {
+  const { code, outline } = await resolveSymbolContent(cg, node, includeCode);
+  return formatNodeDetails(node, code, outline) +
+    (includeRelations ? formatTrail(cg, node) : formatDeclDef(cg, node, false));
 }
 
-function buildContainerOutline(cg: CodeGraph, node: Node): string {
-  const children = cg.getChildren(node.id)
-    .filter((c) => c.kind !== 'import' && c.kind !== 'export')
-    .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
-  if (children.length === 0) return '';
-  const lines = [`**Members (${children.length}):**`, ''];
-  for (const c of children) {
-    const loc = c.startLine ? `:${c.startLine}` : '';
-    const sig = c.signature ? ` — \`${c.signature}\`` : '';
-    lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
-  }
-  return lines.join('\n');
+async function resolveSymbolContent(
+  cg: CodeGraph,
+  node: Node,
+  includeCode: boolean,
+): Promise<{ code: string | null; outline: string | null }> {
+  if (!includeCode) return { code: null, outline: null };
+  return { code: await cg.getCode(node.id), outline: null };
 }
 
 function formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
@@ -417,8 +412,13 @@ function formatNodeDetails(node: Node, code: string | null, outline?: string | n
     lines.push('', outline, '',
       `> Structural outline only. Read \`${node.filePath}\` or call codegraph node on a specific member for its body.`);
   } else if (code) {
-    const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
-    lines.push('', '```' + node.language, numbered, '```');
+    const bounded = boundNumberedSource(code, node.startLine || 1, SYMBOL_SOURCE_MAX_CHARS);
+    lines.push('', '```' + node.language, bounded.text, '```');
+    if (bounded.truncated) {
+      lines.push('',
+        `> Source truncated at line ${bounded.shownEndLine} to fit the ${SYMBOL_SOURCE_MAX_CHARS.toLocaleString('en-US')}-character symbol budget; ` +
+        `the indexed symbol continues through line ${node.endLine ?? node.startLine}.`);
+    }
   }
   return lines.join('\n');
 }
@@ -465,7 +465,7 @@ function dedupeTrail(edges: Array<{ node: Node; edge: Edge }>, selfId: string): 
 }
 
 /** C/C++ declaration ↔ definition link, surfacing a dead-end declaration's real trail. */
-function formatDeclDef(cg: CodeGraph, node: Node): string {
+function formatDeclDef(cg: CodeGraph, node: Node, includeDefinitionTrail: boolean = true): string {
   const out = cg.getOutgoingEdges(node.id).filter((e) => e.kind === 'defines');
   const inc = cg.getIncomingEdges(node.id).filter((e) => e.kind === 'defines');
   if (out.length === 0 && inc.length === 0) return '';
@@ -490,7 +490,7 @@ function formatDeclDef(cg: CodeGraph, node: Node): string {
     lines.push(`${label} ${refs}${more}`);
 
     const firstInc = inc[0];
-    if (firstInc) {
+    if (firstInc && includeDefinitionTrail) {
       const defCallees = dedupeTrail(cg.getCallees(firstInc.source), node.id);
       const defCallers = dedupeTrail(cg.getCallers(firstInc.source), node.id);
       if (defCallees.length > 0) {
@@ -526,19 +526,19 @@ function nodeJson(n: Node) {
   };
 }
 
-async function symbolMatchJson(cg: CodeGraph, node: Node, includeCode: boolean) {
-  let code: string | null = null;
-  let outline: string | null = null;
-  if (includeCode) {
-    if (CONTAINER_NODE_KINDS.has(node.kind)) outline = buildContainerOutline(cg, node);
-    if (!outline) code = await cg.getCode(node.id);
-  }
+async function symbolMatchJson(
+  cg: CodeGraph,
+  node: Node,
+  includeCode: boolean,
+  includeRelations: boolean,
+) {
+  const { code, outline } = await resolveSymbolContent(cg, node, includeCode);
   return {
     node: nodeJson(node),
     code,
     outline,
-    callees: dedupeTrail(cg.getCallees(node.id), node.id),
-    callers: dedupeTrail(cg.getCallers(node.id), node.id),
+    callees: includeRelations ? dedupeTrail(cg.getCallees(node.id), node.id) : [],
+    callers: includeRelations ? dedupeTrail(cg.getCallers(node.id), node.id) : [],
     declDef: declDefJson(cg, node),
   };
 }

@@ -42,9 +42,11 @@ import {
 } from '../resolution/cpp-signature';
 import { resolve as resolvePath } from 'path';
 import {
+  boundNumberedSource,
   CONTAINER_NODE_KINDS,
   displaySymbol,
   numberSourceLines,
+  SYMBOL_SOURCE_MAX_CHARS,
   synthEdgeNote,
 } from './node-helpers';
 import {
@@ -485,6 +487,23 @@ interface ContextSectionCandidate {
   ranges?: ContextFileRange[];
 }
 
+type RenderedContentMode = 'metadata' | 'source' | 'source_truncated' | 'outline' | 'mixed';
+
+interface RenderedNodeSection {
+  text: string;
+  contentMode: Exclude<RenderedContentMode, 'mixed'>;
+}
+
+interface RenderedImplementationGroup {
+  text: string;
+  contentMode: RenderedContentMode;
+}
+
+interface FormattedNodeDetails {
+  text: string;
+  sourceTruncated: boolean;
+}
+
 type RelationshipTargetResolution =
   | { target: ResolvedRelationshipTarget }
   | { result: ToolResult };
@@ -522,7 +541,7 @@ export const tools: ToolDefinition[] = [
     description:
       '按符号名搜索：`query` 查一个，`queries` 原生批量查 1–8 个；批量查无结果只执行一次多模式 raw-source 扫描。精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
       '支持裸名称和限定名（如 rtl::OString、Session.request），重名时可用 path/line 消歧。' +
-      '可直接传入可调用签名；唯一逻辑重载可用 includeCode="if_unique" 在同一次返回声明和定义源码。限定 owner 写错但 leaf symbol 存在时先返回结构化候选，不做全仓 raw 扫描。' +
+      '可直接传入可调用签名；唯一逻辑重载可用 includeCode="if_unique" 在同一次返回声明和定义源码，超出预算时安全截断源码而不替换为结构大纲。限定 owner 写错但 leaf symbol 存在时先返回结构化候选，不做全仓 raw 扫描。' +
       '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
       '"how does auth work?"（自然语言问题）。' +
       '正面示例："signIn"、"UserService"、"handleAuth"、"TRMDBG"',
@@ -550,7 +569,7 @@ export const tools: ToolDefinition[] = [
               path: { type: 'string', description: '可选文件路径子串。' },
               line: { type: 'number', description: '可选 1-based 行号。', minimum: 1 },
               signature: { type: 'string', description: '可选精确/显著签名。' },
-              includeCode: { type: 'string', description: '唯一逻辑重载时内联声明和定义源码。', enum: ['never', 'if_unique'] },
+              includeCode: { type: 'string', description: '唯一逻辑重载时内联声明和定义源码；超预算源码会安全截断。', enum: ['never', 'if_unique'] },
             },
             required: ['query'],
           },
@@ -579,7 +598,7 @@ export const tools: ToolDefinition[] = [
         },
         includeCode: {
           type: 'string',
-          description: 'Return the body in this same call only when the exact result collapses to one logical symbol/overload.',
+          description: 'Return source in this same call when the exact result collapses to one logical symbol/overload. Oversized source is safely truncated, never silently replaced by an outline.',
           enum: ['never', 'if_unique'],
           default: 'never',
         },
@@ -872,7 +891,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'node',
-    description: 'Read the smallest useful code context. Native BATCH MODE accepts `targets=[...]` with 1–8 precise symbol/member/text/file-region targets, including grouped `{file, symbols:[...], texts:[...]}` manifests and filtered file outlines, and automatically returns one merged implementation bundle; prefer it over looping codegraph_node or context. Exact C/C++ symbol source includes paired declaration and definition bodies. Member focus includes access labels and small comment/neighbor edit context. Prefer SYMBOL MODE for one known implementation: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery="a|b"` or `outlineQueries`. Use an explicit `offset` + `limit` (maximum 500, subject to the output character budget) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
+    description: 'Read the smallest useful code context. Native BATCH MODE accepts `targets=[...]` with 1–8 precise symbol/member/text/file-region targets, including grouped `{file, symbols:[...], texts:[...]}` manifests and filtered file outlines, and automatically returns one merged implementation bundle; prefer it over looping codegraph_node or context. Exact C/C++ symbol source includes paired declaration and definition bodies. Member focus includes access labels and small comment/neighbor edit context. Prefer SYMBOL MODE for one known implementation: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`; every symbol kind returns source, safely truncated when oversized. Caller/callee relations are omitted by default; set `includeRelations=true` only when that trail is needed. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery="a|b"` or `outlineQueries`. Use an explicit `offset` + `limit` (maximum 500, subject to the output character budget) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -955,12 +974,13 @@ export const tools: ToolDefinition[] = [
         },
         includeCode: {
           type: 'boolean',
-          description: 'Symbol mode only: include the symbol body (default: false). Rejected in file mode.',
+          description: 'Symbol mode only: include source (default: false). Oversized source is safely truncated. Rejected in file mode.',
           default: false,
         },
         includeRelations: {
           type: 'boolean',
-          description: 'Symbol mode only: include the caller/callee trail. Omitted = auto (suppressed for an already-disambiguated file/line or qualified symbol; included for a bare exploratory symbol). Set explicitly for deterministic behavior.',
+          description: 'Symbol mode only: include the caller/callee trail (default: false). Prefer callers/callees tools when only one relationship direction is needed.',
+          default: false,
         },
         expand: {
           type: 'string',
@@ -1773,14 +1793,24 @@ export class ToolHandler {
       if (includeCode === 'if_unique' && groups.length === 1) {
         const primary = this.rankExactSymbolNodes(groups[0]!)[0]!;
         const section = await this.renderImplementationGroup(cg, groups[0]!, false);
-        const notice = caseCorrected
+        const correctionNotice = caseCorrected
           ? `> Case-insensitive unique correction: \`${queryText}\` → \`${primary.signature ?? displaySymbol(primary)}\`.`
-          : `> Unique exact result; source included in this search response. Do not call codegraph_node for it.`;
+          : '';
+        const deliveryNotice = section.contentMode === 'source'
+          ? '> Unique exact result; source included in this search response. Do not call codegraph_node for it.'
+          : section.contentMode === 'source_truncated'
+            ? '> Unique exact result; source included and safely truncated to the response budget. Do not repeat the same symbol lookup; request only a precise omitted tail window if it is genuinely required.'
+          : section.contentMode === 'outline'
+            ? '> Unique exact result; a structural outline was explicitly requested. Use includeCode without outline controls when source is required.'
+            : section.contentMode === 'mixed'
+              ? '> Unique exact result; a mixed source/outline/metadata result was included. Follow the exact-source bundle guidance below only for an outlined endpoint.'
+              : '> Unique exact result, but indexed source was unavailable; structural metadata is included.';
         return this.textResult(this.truncateOutput([
           includeCodeCorrection,
-          notice,
+          correctionNotice,
+          deliveryNotice,
           '',
-          section,
+          section.text,
           this.formatOtherOverloadSummary(cg, query, primary),
           declarationEvidence,
         ].filter(Boolean).join('\n')));
@@ -2466,8 +2496,9 @@ export class ToolHandler {
       const overloadGroups = this.relationshipOverloadGroups(cg, matches, allMatches);
       if (overloadGroups.length === 1) {
         const selected = this.rankExactSymbolNodes(overloadGroups[0]!)[0]!;
+        const implementation = await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations);
         section = [
-          await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations),
+          implementation.text,
           this.formatOtherOverloadSummary(cg, target.symbol, selected),
         ].filter(Boolean).join('\n\n');
       } else {
@@ -4286,12 +4317,11 @@ export class ToolHandler {
     // `symbolsOnly=true` expresses an intent to inspect structure, so preserve
     // that intent by rendering the named container outline in symbol mode.
     const includeCode = args.includeCode === true || autoCorrectedOutlineArgs;
+    const forceOutline = autoCorrectedOutlineArgs;
+    const includeRelations = args.includeRelations === true;
     const preciseSymbolTarget = /[.]|::/.test(symbolRaw) || Boolean(fileHint && lineHint !== undefined);
-    const includeRelations = typeof args.includeRelations === 'boolean'
-      ? args.includeRelations
-      : !preciseSymbolTarget;
     const relationshipRouteNotice = preciseSymbolTarget && !includeRelations
-      ? '> Caller/callee relations were omitted for this precise source read. For lifecycle or control-flow tracing, use `codegraph_callers` or `codegraph_callees` (and `codegraph_impact` for change scope), not Grep.'
+      ? '> Caller/callee relations were omitted. Use `codegraph_callers` or `codegraph_callees` only if that relationship direction is needed.'
       : '';
 
     // File windows and symbol reads are genuinely different requests, so keep
@@ -4375,19 +4405,19 @@ export class ToolHandler {
     matches = this.preferContainerMatches(matches, lineHint);
     const hintWarning = this.formatSymbolHintWarning(symbol, narrowed);
     const autoCorrectionNotice = autoCorrectedOutlineArgs
-      ? '> Automatically used symbol mode and ignored `symbolsOnly`/`outlineQuery`/`outlineLimit` because an exact `symbol` was supplied.'
+      ? '> Automatically used symbol mode with a named-container outline and ignored `outlineQuery`/`outlineLimit` because an exact `symbol` was supplied.'
       : '';
 
     // Single definition — the common case.
     const overloadGroups = this.relationshipOverloadGroups(cg, matches, allMatches);
     if (overloadGroups.length === 1) {
       const primary = this.rankExactSymbolNodes(overloadGroups[0]!)[0]!;
-      const section = includeCode
-        ? await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations)
+      const renderedSection = includeCode
+        ? await this.renderImplementationGroup(cg, overloadGroups[0]!, includeRelations, forceOutline)
         : await this.renderNodeSection(cg, primary, false, includeRelations);
       const overloadSummary = this.formatOtherOverloadSummary(cg, symbol, primary);
       return this.textResult(this.truncateOutput(
-        [autoCorrectionNotice, hintWarning, section, overloadSummary, relationshipRouteNotice].filter(Boolean).join('\n\n')
+        [autoCorrectionNotice, hintWarning, renderedSection.text, overloadSummary, relationshipRouteNotice].filter(Boolean).join('\n\n')
       ));
     }
 
@@ -4421,11 +4451,11 @@ export class ToolHandler {
     let used = 0;
     for (const n of matches) {
       if (rendered.length >= HARD_CAP) { listed.push(n); continue; }
-      const section = await this.renderNodeSection(cg, n, true, includeRelations);
+      const section = await this.renderNodeSection(cg, n, true, includeRelations, forceOutline);
       // Always emit the first; emit the rest only while within the char budget.
-      if (rendered.length === 0 || used + section.length <= BODY_BUDGET) {
-        rendered.push(section);
-        used += section.length;
+      if (rendered.length === 0 || used + section.text.length <= BODY_BUDGET) {
+        rendered.push(section.text);
+        used += section.text.length;
       } else {
         listed.push(n);
       }
@@ -4688,24 +4718,28 @@ export class ToolHandler {
     cg: CodeGraph,
     node: Node,
     includeCode: boolean,
-    includeRelations: boolean = true,
-  ): Promise<string> {
+    includeRelations: boolean = false,
+    forceOutline: boolean = false,
+    sourceCharBudget: number = SYMBOL_SOURCE_MAX_CHARS,
+  ): Promise<RenderedNodeSection> {
     let code: string | null = null;
     let outline: string | null = null;
     if (includeCode) {
-      // For container symbols (class/interface/struct/…), the full body is the
-      // sum of every method body — a wall of source. Return a structural outline
-      // (members + signatures + line numbers) instead; leaf symbols return their
-      // full body.
-      if (CONTAINER_NODE_KINDS.has(node.kind)) {
-        outline = this.buildContainerOutline(cg, node);
+      if (forceOutline && CONTAINER_NODE_KINDS.has(node.kind)) {
+        outline = this.buildContainerOutlineFromChildren(this.containerChildren(cg, node));
       }
-      if (!outline) {
-        code = await cg.getCode(node.id);
-      }
+      if (!outline) code = await cg.getCode(node.id);
     }
-    return this.formatNodeDetails(node, code, outline) +
-      (includeRelations ? this.formatTrail(cg, node) : this.formatDeclDef(cg, node, false));
+    const details = this.formatNodeDetails(node, code, outline, sourceCharBudget);
+    return {
+      text: details.text +
+        (includeRelations ? this.formatTrail(cg, node) : this.formatDeclDef(cg, node, false)),
+      contentMode: outline
+        ? 'outline'
+        : code
+          ? details.sourceTruncated ? 'source_truncated' : 'source'
+          : 'metadata',
+    };
   }
 
   /** Render every indexed endpoint of one logical overload, not just a pointer. */
@@ -4713,20 +4747,54 @@ export class ToolHandler {
     cg: CodeGraph,
     nodes: Node[],
     includeRelations: boolean,
-  ): Promise<string> {
+    forceOutline: boolean = false,
+  ): Promise<RenderedImplementationGroup> {
     const unique = this.rankExactSymbolNodes(
       [...new Map(nodes.map((node) => [node.id, node])).values()],
     );
-    const rendered: string[] = [];
+    const reservedChars = 2_000 + unique.length * 300;
+    const perEndpointSourceBudget = Math.min(
+      SYMBOL_SOURCE_MAX_CHARS,
+      Math.max(256, Math.floor((MAX_OUTPUT_LENGTH - reservedChars) / Math.max(1, unique.length))),
+    );
+    const rendered: RenderedNodeSection[] = [];
     for (const node of unique) {
-      rendered.push(await this.renderNodeSection(cg, node, true, includeRelations));
+      rendered.push(await this.renderNodeSection(
+        cg,
+        node,
+        true,
+        includeRelations,
+        forceOutline,
+        perEndpointSourceBudget,
+      ));
     }
-    if (rendered.length <= 1) return rendered[0] ?? '';
-    return [
-      `> One logical overload has ${rendered.length} indexed declaration/definition endpoints; all source bodies are included below.`,
-      '',
-      rendered.join('\n\n---\n\n'),
-    ].join('\n');
+    const modes = new Set(rendered.map((section) => section.contentMode));
+    const sourceOnly = [...modes].every((mode) => mode === 'source' || mode === 'source_truncated');
+    const contentMode: RenderedContentMode = sourceOnly
+      ? modes.has('source_truncated') ? 'source_truncated' : 'source'
+      : modes.size === 1
+        ? rendered[0]?.contentMode ?? 'metadata'
+        : 'mixed';
+    if (rendered.length <= 1) {
+      return { text: rendered[0]?.text ?? '', contentMode };
+    }
+    const delivery = contentMode === 'source'
+      ? 'all source bodies are included below.'
+      : contentMode === 'source_truncated'
+        ? 'all endpoints include source, safely truncated to the response budget where necessary.'
+        : contentMode === 'outline'
+          ? 'all endpoints are represented by structural outlines below.'
+          : contentMode === 'metadata'
+            ? 'indexed source was unavailable, so structural metadata is included below.'
+            : 'a mixture of source, outline, and/or structural metadata is included below.';
+    return {
+      text: [
+        `> One logical overload has ${rendered.length} indexed declaration/definition endpoints; ${delivery}`,
+        '',
+        rendered.map((section) => section.text).join('\n\n---\n\n'),
+      ].join('\n'),
+      contentMode,
+    };
   }
 
   /**
@@ -4806,7 +4874,8 @@ export class ToolHandler {
       );
     }
     if (includeCode && !groupingSkipped && groups.length === 1) {
-      out.push('', await this.renderImplementationGroup(cg, groups[0]!, false));
+      const implementation = await this.renderImplementationGroup(cg, groups[0]!, false);
+      out.push('', implementation.text);
     } else {
       const shown = this.rankExactSymbolNodes(scoped).slice(0, limit);
       out.push('', this.formatSearchResults(cg, shown.map((node) => ({ node, score: 1.0 }))));
@@ -6034,9 +6103,9 @@ export class ToolHandler {
     const omitted: Node[] = [];
     for (const node of candidates) {
       const section = await this.renderNodeSection(cg, node, true, includeRelations);
-      if (rendered.length === 0 || used + section.length <= bodyBudget) {
-        rendered.push(section);
-        used += section.length;
+      if (rendered.length === 0 || used + section.text.length <= bodyBudget) {
+        rendered.push(section.text);
+        used += section.text.length;
       } else {
         omitted.push(node);
       }
@@ -6259,17 +6328,15 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  /**
-   * Build a compact structural outline of a container symbol from its
-   * indexed children (methods, fields, properties, …) — name, kind,
-   * line number, and signature — so the agent gets the shape of a class
-   * without the full source of every method. Returns '' when the container
-   * has no indexed children, so the caller can fall back to full source.
-   */
-  private buildContainerOutline(cg: CodeGraph, node: Node): string {
-    const children = cg.getChildren(node.id)
+  /** Return stable, source-ordered children for explicit named-container outlines. */
+  private containerChildren(cg: CodeGraph, node: Node): Node[] {
+    return cg.getChildren(node.id)
       .filter(c => c.kind !== 'import' && c.kind !== 'export')
       .sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+  }
+
+  /** Build a compact outline only for an explicit named-container outline request. */
+  private buildContainerOutlineFromChildren(children: Node[]): string {
     if (children.length === 0) return '';
 
     const visible = children.slice(0, MCP_NODE_CONTAINER_OUTLINE_SYMBOLS);
@@ -6289,7 +6356,12 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
+  private formatNodeDetails(
+    node: Node,
+    code: string | null,
+    outline?: string | null,
+    sourceCharBudget: number = SYMBOL_SOURCE_MAX_CHARS,
+  ): FormattedNodeDetails {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `## ${node.name} (${node.kind})`,
@@ -6306,17 +6378,27 @@ export class ToolHandler {
       lines.push('', node.docstring);
     }
 
+    let sourceTruncated = false;
     if (outline) {
+      const exactSourceTarget = `{ file: ${JSON.stringify(node.filePath)}, symbols: [${JSON.stringify(displaySymbol(node))}] }`;
       lines.push('', outline, '',
-        '> Structural outline only. Read one member with codegraph_node, or batch up to 32 named members with ONE `codegraph_node(targets=[{ symbol, file, members: [...] }])` implementation bundle; it also returns matching C++ out-of-line definitions. Use a file region only for a non-symbol edit boundary.');
+        `> Structural outline only. For this container's exact declaration source, use ONE ` +
+        `\`codegraph_node(targets=[${exactSourceTarget}])\` implementation bundle; ` +
+        'for selected implementations use `{ symbol, file, members: [...] }`, which also returns matching C++ out-of-line definitions. Do not Read the file.');
     } else if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
-      const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
-      lines.push('', '```' + node.language, numbered, '```');
+      const bounded = boundNumberedSource(code, node.startLine || 1, sourceCharBudget);
+      sourceTruncated = bounded.truncated;
+      lines.push('', '```' + node.language, bounded.text, '```');
+      if (bounded.truncated) {
+        lines.push('',
+          `> Source truncated at line ${bounded.shownEndLine} to fit the ${sourceCharBudget.toLocaleString('en-US')}-character symbol budget; ` +
+          `the indexed symbol continues through line ${node.endLine ?? node.startLine}.`);
+      }
     }
 
-    return lines.join('\n');
+    return { text: lines.join('\n'), sourceTruncated };
   }
 
   /** Convert an exact/qualified lookup into the identifier a raw scan can verify. */

@@ -36,6 +36,18 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
         Array.from({ length: 2000 }, (_, i) => `  const v${i} = ${i};`).join('\n') +
         '\n  return 0;\n}\n',
     );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'large-class.ts'),
+      'export class LargeClass {\n' +
+        Array.from({ length: 75 }, (_, i) => `  method${i}() { return ${i}; }`).join('\n') +
+        '\n}\n',
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'huge-class.ts'),
+      'export class HugeClass {\n' +
+        Array.from({ length: 400 }, (_, i) => `  method${i}() { return "${'x'.repeat(40)}-${i}"; }`).join('\n') +
+        '\n}\n',
+    );
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.properties'], exclude: [] } });
     await cg.indexAll();
   });
@@ -118,16 +130,18 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
   // Symbol mode
   // --------------------------------------------------------------------------
 
-  it('symbol mode returns location + signature, and trail with callees/callers', async () => {
-    const out = await view({ symbol: 'useHelper' });
-    expect(out.text).toContain('## useHelper');
-    expect(out.text).toMatch(/Location:.*src\/b\.ts:\d+/);
-    // useHelper calls helper; that callee shows up in the trail.
-    expect(out.text).toMatch(/Calls →.*helper.*src\/a\.ts/);
+  it('symbol mode omits relations by default and supports an explicit trail', async () => {
+    const defaultOut = await view({ symbol: 'useHelper' });
+    expect(defaultOut.text).toContain('## useHelper');
+    expect(defaultOut.text).toMatch(/Location:.*src\/b\.ts:\d+/);
+    expect(defaultOut.text).not.toContain('### Trail');
+
+    const withRelations = await view({ symbol: 'useHelper', includeRelations: true });
+    expect(withRelations.text).toMatch(/Calls →.*helper.*src\/a\.ts/);
   });
 
   it('--code includes the symbol body (numbered like Read)', async () => {
-    const out = await view({ symbol: 'helper', includeCode: true });
+    const out = await view({ symbol: 'helper', includeCode: true, includeRelations: true });
     expect(out.text).toContain('```typescript');
     expect(out.text).toContain('return x + 1');
     const json = out.json as any;
@@ -136,12 +150,28 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
     expect(json.match.callers.length).toBeGreaterThan(0); // Widget.build + useHelper call it
   });
 
-  it('a container symbol returns a member outline, not a wall of source', async () => {
+  it('a small container returns exact source with --code', async () => {
     const out = await view({ symbol: 'Widget', includeCode: true });
-    expect(out.text).toContain('**Members');
-    expect(out.text).toContain('build');
-    // The class body source is NOT dumped for a container.
-    expect(out.text).not.toMatch(/```typescript/);
+    expect(out.text).toContain('```typescript');
+    expect(out.text).toContain('build() { return helper(1); }');
+    expect(out.text).not.toContain('**Members');
+    expect(out.json).toMatchObject({ mode: 'symbol', match: { outline: null } });
+  });
+
+  it('a many-member container returns source rather than an outline', async () => {
+    const out = await view({ symbol: 'LargeClass', includeCode: true });
+    expect(out.text).toContain('```typescript');
+    expect(out.text).toContain('method74()');
+    expect(out.text).not.toContain('**Members');
+    expect(out.json).toMatchObject({ mode: 'symbol', match: { outline: null } });
+  });
+
+  it('oversized container source is truncated with a closed code block', async () => {
+    const out = await view({ symbol: 'HugeClass', includeCode: true });
+    expect(out.text).toContain('```typescript');
+    expect(out.text).toMatch(/Source truncated at line/i);
+    expect(out.text.match(/```/g)).toHaveLength(2);
+    expect(out.text).not.toContain('**Members');
   });
 
   it('same-name overloads are all listed in one call (no --code)', async () => {

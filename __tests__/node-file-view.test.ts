@@ -52,6 +52,12 @@ describe('codegraph_node guarded MCP file mode', () => {
         Array.from({ length: 75 }, (_, i) => `  method${i}() { return ${i}; }`).join('\n') +
         '\n}\n',
     );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'huge-class.ts'),
+      'export class HugeClass {\n' +
+        Array.from({ length: 400 }, (_, i) => `  method${i}() { return "${'x'.repeat(40)}-${i}"; }`).join('\n') +
+        '\n}\n',
+    );
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.properties'], exclude: [] } });
     await cg.indexAll();
     h = new ToolHandler(cg);
@@ -154,14 +160,29 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toMatch(/do not read the file/i);
   });
 
-  it('caps a directly requested large container instead of dumping every member', async () => {
+  it('returns source for a many-member container and truncates only oversized source', async () => {
     const out = await text({ symbol: 'LargeClass', includeCode: true });
-    expect(out).toMatch(/Members \(75; showing 40\)/);
-    expect(out).toContain('method39');
-    expect(out).not.toContain('method74');
-    expect(out).toMatch(/35 more members omitted/);
-    expect(out).toMatch(/codegraph_node\(targets.*members/i);
-    expect(out).not.toMatch(/request a file outline/i);
+    expect(out).toContain('```typescript');
+    expect(out).toContain('export class LargeClass');
+    expect(out).toContain('method74()');
+    expect(out).not.toMatch(/Members \(/);
+    expect(out).not.toMatch(/Source truncated at line/i);
+
+    const huge = await text({ symbol: 'HugeClass', includeCode: true });
+    expect(huge).toContain('```typescript');
+    expect(huge).toContain('export class HugeClass');
+    expect(huge).toMatch(/Source truncated at line/i);
+    expect(huge.match(/```/g)).toHaveLength(2);
+    expect(huge).not.toMatch(/Members \(/);
+
+    const search = await h.execute('search', {
+      query: 'HugeClass',
+      includeCode: 'if_unique',
+    });
+    const searchText = search.content.map((item) => item.text).join('\n');
+    expect(searchText).toMatch(/source included and safely truncated/i);
+    expect(searchText).toMatch(/Source truncated at line/i);
+    expect(searchText).not.toMatch(/structural outline was included/i);
   });
 
   it('auto-corrects copied file-outline knobs when an exact symbol is supplied', async () => {
