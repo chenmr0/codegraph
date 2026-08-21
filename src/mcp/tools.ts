@@ -539,12 +539,7 @@ export const tools: ToolDefinition[] = [
   {
     name: 'search',
     description:
-      '按符号名搜索：`query` 查一个，`queries` 原生批量查 1–8 个；批量查无结果只执行一次多模式 raw-source 扫描。精确匹配优先，无精确命中时回退到模糊匹配并标注警告。返回符号位置信息。' +
-      '支持裸名称和限定名（如 rtl::OString、Session.request），重名时可用 path/line 消歧。' +
-      '可直接传入可调用签名；唯一逻辑重载可用 includeCode="if_unique" 在同一次返回声明和定义源码，超出预算时安全截断源码而不替换为结构大纲。限定 owner 写错但 leaf symbol 存在时先返回结构化候选，不做全仓 raw 扫描。' +
-      '反面示例（禁止传入）："0x4237F001"（十六进制值）、"ADD TRMDBG"（空格分隔）、' +
-      '"how does auth work?"（自然语言问题）。' +
-      '正面示例："signIn"、"UserService"、"handleAuth"、"TRMDBG"',
+      'Search 1–8 exact symbol names, qualified names, or callable signatures. Batch with `queries`; true misses share one raw scan. Use path/line/signature to disambiguate. `includeCode="if_unique"` returns one implementation body plus compact declaration pointers; oversized source is safely truncated. Natural-language questions and literal values are rejected.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -569,7 +564,7 @@ export const tools: ToolDefinition[] = [
               path: { type: 'string', description: '可选文件路径子串。' },
               line: { type: 'number', description: '可选 1-based 行号。', minimum: 1 },
               signature: { type: 'string', description: '可选精确/显著签名。' },
-              includeCode: { type: 'string', description: '唯一逻辑重载时内联声明和定义源码；超预算源码会安全截断。', enum: ['never', 'if_unique'] },
+              includeCode: { type: 'string', description: '唯一逻辑重载时内联实现源码并紧凑引用声明；超预算源码会安全截断。', enum: ['never', 'if_unique'] },
             },
             required: ['query'],
           },
@@ -598,7 +593,7 @@ export const tools: ToolDefinition[] = [
         },
         includeCode: {
           type: 'string',
-          description: 'Return source in this same call when the exact result collapses to one logical symbol/overload. Oversized source is safely truncated, never silently replaced by an outline.',
+          description: 'For one logical overload, return implementation source plus compact declaration pointers. Oversized source is safely truncated, never silently replaced by an outline.',
           enum: ['never', 'if_unique'],
           default: 'never',
         },
@@ -609,7 +604,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'context',
-    description: 'Manifest-driven implementation context: read 1–8 explicit target groups in ONE bounded call without natural-language inference. Use `{symbol, members:[...]}` for a container; member focus includes access labels and small comment/neighbor edit context. Exact `offset`/`limit` windows and singular `text` anchors remain supported; when singular `text` is combined with `offset+limit`, the explicit window is returned and text is checked as an assertion. Or use `{file, symbols:[...], texts:[...]}` to group up to 32 exact symbols and 8 literal edit anchors in one file. File-scoped and exact symbol targets include matching declaration/definition source bodies by default. `expectedMissing` verifies explicitly named new identifiers without using them for retrieval. File ranges are merged and deduplicated; unresolved symbols receive compact raw-source matches or one-line absence evidence in the same response. A bare `{file}` returns a compact symbol outline; batch outlines support symbolsOnly, outlineQuery/outlineQueries OR filters, and outlineLimit. A JSON-stringified targets array is parsed automatically. Preflight is character-budget driven: fitting precise windows are returned; over-budget non-manifest batches stop before partial source.',
+    description: 'Bounded 1–8 target manifest. Supports container members, exact offset/limit windows, text assertions, and grouped `{file, symbols, texts}` anchors. Decl/def partners and ranges are deduplicated; `expectedMissing` verifies new names. A bare file returns a compact symbol outline with name-only filters. A JSON-stringified targets array is parsed automatically. Preflight stops over-budget plain windows before partial source.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -694,7 +689,7 @@ export const tools: ToolDefinition[] = [
               },
               outlineQuery: {
                 type: 'string',
-                description: 'File outline mode: one substring or `a|b|c` OR expression over name/qualified name/signature.',
+                description: 'File outline mode: one leaf-name substring or `a|b|c` OR expression. Parameter/signature text is not matched.',
               },
               outlineQueries: {
                 type: 'array',
@@ -891,7 +886,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'node',
-    description: 'Read the smallest useful code context. Native BATCH MODE accepts `targets=[...]` with 1–8 precise symbol/member/text/file-region targets, including grouped `{file, symbols:[...], texts:[...]}` manifests and filtered file outlines, and automatically returns one merged implementation bundle; prefer it over looping codegraph_node or context. Exact C/C++ symbol source includes paired declaration and definition bodies. Member focus includes access labels and small comment/neighbor edit context. Prefer SYMBOL MODE for one known implementation: pass `symbol`, optional `file`/`line` for disambiguation, and `includeCode=true`; every symbol kind returns source, safely truncated when oversized. Caller/callee relations are omitted by default; set `includeRelations=true` only when that trail is needed. FILE MODE is guarded: use `file` + `symbolsOnly=true` for a compact outline when the symbol is unknown, optionally filtered by `outlineQuery="a|b"` or `outlineQueries`. Use an explicit `offset` + `limit` (maximum 500, subject to the output character budget) only for non-symbol source or an exact edit boundary. Bare-file/full-file reads are rejected. Never combine `symbol` with `offset`/`limit`, and never use `includeCode` in file mode.',
+    description: 'Read minimal indexed context. Prefer SYMBOL MODE for one named implementation; source is safely truncated and relations are omitted by default. Native BATCH MODE accepts 1–8 symbol/member/text/file-region targets and deduplicates ranges and decl/def partners. FILE MODE supports a name-filtered outline or exact offset+limit boundary. Bare-file/full-file reads are rejected.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1016,7 +1011,7 @@ export const tools: ToolDefinition[] = [
         },
         outlineQuery: {
           type: 'string',
-          description: 'symbolsOnly mode: optional case-insensitive substring filter over symbol/qualified name/signature. Use when the task gives partial names.',
+          description: 'symbolsOnly mode: optional case-insensitive leaf-name substring. Parameter/signature text is not matched.',
         },
         outlineQueries: {
           type: 'array',
@@ -1643,7 +1638,7 @@ export class ToolHandler {
     }
 
     const deferredRawEvidence: RawEvidenceSpec[] = [];
-    const sections: string[] = [];
+    const sections: Array<{ label: string; text: string }> = [];
     const defaults = { ...args };
     delete defaults.queries;
     for (let i = 0; i < args.queries.length; i++) {
@@ -1657,20 +1652,41 @@ export class ToolHandler {
       const result = await this.handleSearchSingle({ ...defaults, ...item }, deferredRawEvidence);
       if (result.isError) return result;
       const queryLabel = typeof item.query === 'string' ? item.query : `queries[${i}]`;
-      sections.push(`## ${queryLabel}\n\n${result.content.map((entry) => entry.text).join('\n')}`);
+      sections.push({
+        label: queryLabel,
+        text: `## ${queryLabel}\n\n${result.content.map((entry) => entry.text).join('\n')}`,
+      });
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const evidence = await this.renderRawEvidence(cg, deferredRawEvidence);
+    const deduplicatedSections = this.dedupeBatchSourceBlocks(sections);
     const out = [
       `# Batch symbol search (${args.queries.length} queries)`,
       '',
-      '> Exact/structured resolution was completed for every query. All true graph misses below shared one multi-pattern raw-source fallback scan.',
+      '> Exact resolution completed for all queries; true graph misses share one raw-source fallback scan below.',
       '',
-      sections.join('\n\n---\n\n'),
+      deduplicatedSections.join('\n\n---\n\n'),
       evidence,
     ].filter(Boolean).join('\n\n');
     return this.textResult(this.truncateOutput(out));
+  }
+
+  /** Remove repeated fenced source bodies across independent batch queries. */
+  private dedupeBatchSourceBlocks(sections: Array<{ label: string; text: string }>): string[] {
+    const seen = new Map<string, string>();
+    return sections.map(({ label, text }) => text.replace(
+      /```([^\r\n]*)\r?\n([\s\S]*?)\r?\n```/g,
+      (block, language: string, body: string) => {
+        const key = `${language.trim().toLowerCase()}\n${body.replace(/\r\n/g, '\n').trimEnd()}`;
+        const firstLabel = seen.get(key);
+        if (firstLabel !== undefined) {
+          return `> Identical source already included for \`${firstLabel}\`; duplicate block omitted.`;
+        }
+        seen.set(key, label);
+        return block;
+      },
+    ));
   }
 
   private async handleSearchSingle(
@@ -1797,13 +1813,13 @@ export class ToolHandler {
           ? `> Case-insensitive unique correction: \`${queryText}\` → \`${primary.signature ?? displaySymbol(primary)}\`.`
           : '';
         const deliveryNotice = section.contentMode === 'source'
-          ? '> Unique exact result; source included in this search response. Do not call codegraph_node for it.'
+          ? '> Unique exact result; source included in this response.'
           : section.contentMode === 'source_truncated'
-            ? '> Unique exact result; source included and safely truncated to the response budget. Do not repeat the same symbol lookup; request only a precise omitted tail window if it is genuinely required.'
+            ? '> Unique exact result; source included and safely truncated to the response budget.'
           : section.contentMode === 'outline'
-            ? '> Unique exact result; a structural outline was explicitly requested. Use includeCode without outline controls when source is required.'
+            ? '> Unique exact result; a structural outline was explicitly requested.'
             : section.contentMode === 'mixed'
-              ? '> Unique exact result; a mixed source/outline/metadata result was included. Follow the exact-source bundle guidance below only for an outlined endpoint.'
+              ? '> Unique exact result; a mixed source/outline/metadata result was included.'
               : '> Unique exact result, but indexed source was unavailable; structural metadata is included.';
         return this.textResult(this.truncateOutput([
           includeCodeCorrection,
@@ -2523,7 +2539,11 @@ export class ToolHandler {
     for (const entry of fileRanges.values()) {
       let section = this.renderContextFileRanges(cg, entry.file, entry.ranges);
       const estimatedChars = section.length;
-      if (section.length > MCP_CONTEXT_MAX_CHARS_PER_TARGET * 1.5) {
+      const explicitWindowOnly = [...entry.targetIndexes].every((targetIndex) => {
+        const target = targets[targetIndex];
+        return target?.mode === 'file' && target.offset !== undefined && target.limit !== undefined;
+      });
+      if (!explicitWindowOnly && section.length > MCP_CONTEXT_MAX_CHARS_PER_TARGET * 1.5) {
         section = this.truncateAtLine(section, Math.floor(MCP_CONTEXT_MAX_CHARS_PER_TARGET * 1.5)) +
           '\n\n... (precise file batch truncated by the per-file budget; narrow only the missing range)';
       }
@@ -2598,7 +2618,7 @@ export class ToolHandler {
       for (const candidate of omittedCandidates) {
         out.push(`- ${candidate.label}: about ${candidate.section.length} rendered characters`);
       }
-      out.push('', '> The sections above are complete. Request the omitted labels together in the next `codegraph_context` call; do not re-read sections already shown.');
+      out.push('', '> The sections above are complete. Request the omitted labels together in the next `codegraph_context` call.');
     }
     if (misses.length > 0) out.push('', '## Unresolved / omitted targets', ...misses);
     if (corrections.length > 0) {
@@ -2608,8 +2628,8 @@ export class ToolHandler {
     out.push(
       '',
       includeRelations
-        ? '> Source and requested relation trails are included above. Merged file ranges are current on-disk source; do not re-read them.'
-        : '> Exact symbols and merged file ranges are included above without repetitive dependency metadata. Treat them as already read; request only unresolved targets or genuinely missing edit boundaries.',
+        ? '> Source and requested relation trails are included above. Merged file ranges are current on-disk source.'
+        : '> Exact symbols and merged file ranges are included above without repetitive dependency metadata.',
     );
     return this.textResult(out.join('\n'));
   }
@@ -4578,35 +4598,46 @@ export class ToolHandler {
         : opts.outlineQuery ? opts.outlineQuery.split('|') : [])
         .map((query) => query.trim().toLowerCase())
         .filter(Boolean);
-      const query = queries.length === 1 ? queries[0] : undefined;
+      const matchesByQuery = queries.map((needle) => nodes.filter((node) =>
+        node.name.toLowerCase().includes(needle)
+      ));
       const filtered = queries.length > 0
-        ? nodes.filter((n) => [n.name, n.qualifiedName, n.signature ?? '']
-          .some((value) => queries.some((needle) => value.toLowerCase().includes(needle))))
+        ? [...new Map(matchesByQuery.flat().map((node) => [node.id, node])).values()]
         : nodes;
       const outlineLimit = clamp(
         opts.outlineLimit ?? MCP_NODE_DEFAULT_OUTLINE_SYMBOLS,
         1,
         MCP_NODE_MAX_OUTLINE_SYMBOLS,
       );
-      const broadQuery = Boolean(
-        queries.length === 1 && query &&
-        filtered.length >= MCP_NODE_BROAD_OUTLINE_MIN_MATCHES &&
-        filtered.length / Math.max(nodes.length, 1) >= MCP_NODE_BROAD_OUTLINE_MATCH_RATIO
+      const broadQuery = matchesByQuery.some((matches) =>
+        matches.length >= MCP_NODE_BROAD_OUTLINE_MIN_MATCHES &&
+        matches.length / Math.max(nodes.length, 1) >= MCP_NODE_BROAD_OUTLINE_MATCH_RATIO
       );
-      const ranked = broadQuery
-        ? [...filtered].sort((a, b) => {
-          const score = (node: Node): number => {
-            const name = node.name.toLowerCase();
-            const signature = (node.signature ?? '').toLowerCase();
-            if (name === query) return 0;
-            if (name.startsWith(query!)) return 1;
-            if (name.includes(query!)) return 2;
-            if (signature.includes(query!)) return 3;
-            return 4; // Match came only from the qualified name.
-          };
-          return score(a) - score(b) || a.startLine - b.startLine || a.name.localeCompare(b.name);
-        })
-        : filtered;
+      const rankFor = (needle: string, candidates: Node[]): Node[] => [...candidates].sort((a, b) => {
+        const score = (node: Node): number => {
+          const name = node.name.toLowerCase();
+          if (name === needle) return 0;
+          if (name.startsWith(needle)) return 1;
+          return 2;
+        };
+        return score(a) - score(b) || a.startLine - b.startLine || a.name.localeCompare(b.name);
+      });
+      const ranked = queries.length === 0
+        ? filtered
+        : (() => {
+          const queues = matchesByQuery.map((matches, index) => rankFor(queries[index]!, matches));
+          const seen = new Set<string>();
+          const interleaved: Node[] = [];
+          for (let offset = 0; queues.some((queue) => offset < queue.length); offset++) {
+            for (const queue of queues) {
+              const node = queue[offset];
+              if (!node || seen.has(node.id)) continue;
+              seen.add(node.id);
+              interleaved.push(node);
+            }
+          }
+          return interleaved;
+        })();
       const effectiveOutlineLimit = broadQuery
         ? Math.min(outlineLimit, MCP_NODE_BROAD_OUTLINE_RESULT_LIMIT)
         : outlineLimit;
@@ -4622,16 +4653,10 @@ export class ToolHandler {
       ];
       if (broadQuery) {
         const percentage = Math.round((filtered.length / Math.max(nodes.length, 1)) * 100);
-        const locallyNamed = filtered.filter((node) => {
-          const name = node.name.toLowerCase();
-          const signature = (node.signature ?? '').toLowerCase();
-          return name.includes(query!) || signature.includes(query!);
-        }).length;
-        const qualifiedOnly = filtered.length - locallyNamed;
         out.push(
           `> Query too broad: outline filter="${filterLabel}" matched ${filtered.length}/${nodes.length} symbols (${percentage}%). ` +
-          `Showing only the ${effectiveOutlineLimit} best simple-name candidates${qualifiedOnly > 0 ? `; ${qualifiedOnly} match only through qualified/container names` : ''}. ` +
-          'Refine with a leaf symbol/member token; do not increase outlineLimit or read the file.',
+          `Showing only the ${effectiveOutlineLimit} best leaf-name candidates. ` +
+          'Refine with a more specific leaf symbol/member token.',
           '',
         );
       }
@@ -4742,7 +4767,7 @@ export class ToolHandler {
     };
   }
 
-  /** Render every indexed endpoint of one logical overload, not just a pointer. */
+  /** Render implementation bodies once; declarations remain compact pointers. */
   private async renderImplementationGroup(
     cg: CodeGraph,
     nodes: Node[],
@@ -4752,13 +4777,16 @@ export class ToolHandler {
     const unique = this.rankExactSymbolNodes(
       [...new Map(nodes.map((node) => [node.id, node])).values()],
     );
-    const reservedChars = 2_000 + unique.length * 300;
+    const definitions = unique.filter((node) => node.isDeclaration !== true);
+    const sourceNodes = definitions.length > 0 ? definitions : unique;
+    const compactDeclarationCount = definitions.length > 0 ? unique.length - definitions.length : 0;
+    const reservedChars = 2_000 + sourceNodes.length * 300;
     const perEndpointSourceBudget = Math.min(
       SYMBOL_SOURCE_MAX_CHARS,
-      Math.max(256, Math.floor((MAX_OUTPUT_LENGTH - reservedChars) / Math.max(1, unique.length))),
+      Math.max(256, Math.floor((MAX_OUTPUT_LENGTH - reservedChars) / Math.max(1, sourceNodes.length))),
     );
     const rendered: RenderedNodeSection[] = [];
-    for (const node of unique) {
+    for (const node of sourceNodes) {
       rendered.push(await this.renderNodeSection(
         cg,
         node,
@@ -4768,6 +4796,9 @@ export class ToolHandler {
         perEndpointSourceBudget,
       ));
     }
+    const missingDeclarationPointers = unique
+      .filter((node) => node.isDeclaration === true)
+      .filter((node) => !rendered.some((section) => section.text.includes(`(${node.filePath}:${node.startLine})`)));
     const modes = new Set(rendered.map((section) => section.contentMode));
     const sourceOnly = [...modes].every((mode) => mode === 'source' || mode === 'source_truncated');
     const contentMode: RenderedContentMode = sourceOnly
@@ -4775,13 +4806,17 @@ export class ToolHandler {
       : modes.size === 1
         ? rendered[0]?.contentMode ?? 'metadata'
         : 'mixed';
-    if (rendered.length <= 1) {
+    if (unique.length <= 1) {
       return { text: rendered[0]?.text ?? '', contentMode };
     }
     const delivery = contentMode === 'source'
-      ? 'all source bodies are included below.'
+      ? compactDeclarationCount > 0
+        ? `implementation source included; ${compactDeclarationCount} declaration endpoint${compactDeclarationCount === 1 ? '' : 's'} referenced compactly.`
+        : 'all endpoint source included below.'
       : contentMode === 'source_truncated'
-        ? 'all endpoints include source, safely truncated to the response budget where necessary.'
+        ? compactDeclarationCount > 0
+          ? `implementation source safely truncated; ${compactDeclarationCount} declaration endpoint${compactDeclarationCount === 1 ? '' : 's'} referenced compactly.`
+          : 'all endpoints include source, safely truncated to the response budget where necessary.'
         : contentMode === 'outline'
           ? 'all endpoints are represented by structural outlines below.'
           : contentMode === 'metadata'
@@ -4789,9 +4824,16 @@ export class ToolHandler {
             : 'a mixture of source, outline, and/or structural metadata is included below.';
     return {
       text: [
-        `> One logical overload has ${rendered.length} indexed declaration/definition endpoints; ${delivery}`,
+        `> One logical overload; ${delivery}`,
         '',
         rendered.map((section) => section.text).join('\n\n---\n\n'),
+        ...(missingDeclarationPointers.length > 0
+          ? [
+            '',
+            '### Declaration endpoints',
+            ...missingDeclarationPointers.map((node) => `- ${this.formatCompactEndpointRef(cg, node)}`),
+          ]
+          : []),
       ].join('\n'),
       contentMode,
     };
@@ -4822,6 +4864,39 @@ export class ToolHandler {
     let candidates = cg.getNodesByName(leaf).filter((node) => !kinds || kinds.includes(node.kind));
     if (candidates.length === 0) return '';
     const requestedOwner = parts.slice(0, -1).join('::').toLowerCase();
+    const requestedOwnerText = parts.slice(0, -1).join('::');
+    const requestedOwnerLeaf = parts.at(-2)!;
+    const normalizeQualified = (value: string): string => value.replace(/\./g, '::').toLowerCase();
+    const ownerNodes = this.findSymbolMatches(cg, requestedOwnerText).filter((node) => {
+      if (!CONTAINER_NODE_KINDS.has(node.kind)) return false;
+      const qualified = normalizeQualified(node.qualifiedName);
+      return qualified === requestedOwner || (
+        node.name.toLowerCase() === requestedOwnerLeaf.toLowerCase() &&
+        qualified.endsWith(`::${requestedOwner}`)
+      );
+    });
+    if (ownerNodes.length > 0) {
+      const ownerLocations = ownerNodes.slice(0, 3)
+        .map((node) => `${node.filePath}:${node.startLine}`)
+        .join(', ');
+      const otherOwners = this.rankExactSymbolNodes(candidates)
+        .filter((node) => normalizeQualified(node.qualifiedName)
+          .split('::').slice(0, -1).join('::') !== requestedOwner)
+        .slice(0, Math.min(limit, 5));
+      const out = [
+        `> Qualified owner mismatch: owner \`${requestedOwnerText}\` is indexed at ${ownerLocations}, but it has no direct member \`${leaf}\`.`,
+        '> No unrelated leaf source was inlined.',
+      ];
+      if (otherOwners.length > 0) {
+        out.push('', '### Same leaf on other owners (summary only)');
+        for (const node of otherOwners) {
+          const signatureText = node.signature?.replace(/\s+/g, ' ').trim() || displaySymbol(node);
+          out.push(`- \`${signatureText}\` — ${node.filePath}:${node.startLine}`);
+        }
+      }
+      out.push('', `Inspect \`${requestedOwnerText}\` with a filtered owner outline or search one listed qualified candidate explicitly.`);
+      return out.join('\n');
+    }
     const commonPrefix = (left: string, right: string): number => {
       let i = 0;
       while (i < left.length && i < right.length && left[i] === right[i]) i++;
@@ -4928,6 +5003,26 @@ export class ToolHandler {
     return (declDefSection ? declDefSection + '\n' : '') + lines.join('\n');
   }
 
+  /** One-line endpoint reference that preserves declaration-only qualifiers/defaults. */
+  private formatCompactEndpointRef(cg: CodeGraph, node: Node): string {
+    let label = node.signature?.replace(/\s+/g, ' ').trim() || node.name;
+    if (node.isDeclaration === true) {
+      const abs = validatePathWithinRoot(cg.getProjectRoot(), node.filePath);
+      if (abs) {
+        try {
+          const lines = readFileSync(abs, 'utf-8').split('\n');
+          const source = lines
+            .slice(Math.max(0, node.startLine - 1), Math.max(node.startLine, node.endLine ?? node.startLine))
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (source && source.length <= 500) label = source;
+        } catch { /* retain the indexed signature */ }
+      }
+    }
+    return `\`${label}\` (${node.filePath}:${node.startLine})`;
+  }
+
   /**
    * Format the declaration/definition link for a C++ node. When a method's
    * .h declaration and .cpp definition are paired (cppDeclDefEdges
@@ -4965,7 +5060,7 @@ export class ToolHandler {
 
     const ref = (id: string): string => {
       const n = cg.getNode(id);
-      return n ? `\`${n.name}\` (${n.filePath}:${n.startLine})` : id;
+      return n ? this.formatCompactEndpointRef(cg, n) : id;
     };
     const trailFmt = (e: { node: Node; edge: Edge }): string => {
       const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
@@ -5733,7 +5828,32 @@ export class ToolHandler {
         }
       }
     }
-    return groups.map((group) => this.rankExactSymbolNodes(group));
+    return groups.map((group) => this.expandDeclarationDefinitionEndpoints(cg, group));
+  }
+
+  /** Expand a selected overload through authoritative or canonical decl/def pairing. */
+  private expandDeclarationDefinitionEndpoints(cg: CodeGraph, selected: Node[]): Node[] {
+    const endpoints = new Map(selected.map((node) => [node.id, node]));
+    const queue = [...selected];
+    const add = (candidate: Node | null | undefined, source: Node): void => {
+      if (!candidate || endpoints.has(candidate.id)) return;
+      if (!this.sameRelationshipOverload(cg, source, candidate)) return;
+      endpoints.set(candidate.id, candidate);
+      queue.push(candidate);
+    };
+
+    for (let index = 0; index < queue.length; index++) {
+      const node = queue[index]!;
+      if (node.isDeclaration === true) {
+        add(this.indexedDefinitionForDeclaration(cg, node), node);
+      }
+      for (const edge of [...cg.getIncomingEdges(node.id), ...cg.getOutgoingEdges(node.id)]) {
+        if (edge.kind !== 'defines') continue;
+        const otherId = edge.source === node.id ? edge.target : edge.source;
+        add(cg.getNode(otherId), node);
+      }
+    }
+    return this.rankExactSymbolNodes([...endpoints.values()]);
   }
 
   /**

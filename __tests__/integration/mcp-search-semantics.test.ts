@@ -201,16 +201,34 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(result.content[0]!.text).toContain('No results found');
   });
 
-  it('returns declaration and definition source for one exact logical overload', async () => {
+  it('returns one implementation body plus a compact declaration pointer for one exact overload', async () => {
     const result = await handler.execute('search', {
       query: 'Service::execute',
       includeCode: 'if_unique',
     });
     const text = result.content[0]!.text;
     expect(result.isError).toBeFalsy();
-    expect(text).toContain('int execute(int value);');
     expect(text).toContain('int Service::execute(int value) { return value + 1; }');
-    expect(text).toMatch(/all source bodies are included/i);
+    expect(text).toMatch(/Declaration:.*int execute\(int value\).*service\.h:1/i);
+    expect(text.match(/```cpp/g)).toHaveLength(1);
+    expect(text).toMatch(/implementation source included/i);
+  });
+
+  it('expands a qualified declaration hit through its defines edge when the definition name is less qualified', async () => {
+    const db = (cg as any).db.getDb();
+    db.prepare(
+      `UPDATE nodes SET qualified_name = 'execute'
+       WHERE name = 'execute' AND file_path = 'src/service.cpp'`,
+    ).run();
+
+    const result = await handler.execute('search', {
+      query: 'Service::execute',
+      includeCode: 'if_unique',
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain('return value + 1');
+    expect(text).toMatch(/Declaration:.*service\.h:1/i);
   });
 
   it('recovers a wrong qualified owner from exact leaf candidates without raw scanning', async () => {
@@ -224,6 +242,32 @@ describe('codegraph_search semantics — exact-first, fuzzy-fallback', () => {
     expect(text).toContain('Service::execute');
     expect(text).toContain('return value + 1');
     expect(text).not.toMatch(/raw-source (?:match|scan)/i);
+  });
+
+  it('does not inline unrelated leaf candidates when the requested owner exists', async () => {
+    const result = await handler.execute('search', {
+      query: 'Widget::execute',
+      includeCode: 'if_unique',
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toMatch(/Qualified owner mismatch/i);
+    expect(text).toMatch(/owner `Widget` is indexed.*no direct member `execute`/i);
+    expect(text).not.toContain('return value + 1');
+    expect(text).not.toMatch(/Source was not inlined because \d+ logical leaf candidates/i);
+  });
+
+  it('deduplicates identical source blocks across batch query sections', async () => {
+    const result = await handler.execute('search', {
+      queries: [
+        { query: 'LegacyService::execute', includeCode: 'if_unique' },
+        { query: 'Service::execute', includeCode: 'if_unique' },
+      ],
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text.match(/return value \+ 1/g)).toHaveLength(1);
+    expect(text).toMatch(/identical source already included for `LegacyService::execute`/i);
   });
 
   it('batches symbol queries and emits one shared multi-pattern raw fallback report', async () => {

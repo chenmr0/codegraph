@@ -167,6 +167,10 @@ describe('MCP bounded batch context and literal search', () => {
         ].join('\n'),
       );
     }
+    fs.writeFileSync(
+      path.join(dir, 'src', 'wide_combined.ts'),
+      Array.from({ length: 360 }, (_, index) => `// combined-${index} ${'z'.repeat(120)}`).join('\n') + '\n',
+    );
     for (const name of ['one', 'two', 'three']) {
       fs.writeFileSync(
         path.join(dir, 'src', `manifest_${name}.ts`),
@@ -249,7 +253,7 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toContain('return helper(1)');
     expect(out).toContain('return first()');
     expect(out).not.toContain('### Trail');
-    expect(out).toMatch(/Treat them as already read/i);
+    expect(out).toMatch(/Exact symbols and merged file ranges are included above/i);
   });
 
   it('accepts native node targets and routes them through one merged implementation bundle', async () => {
@@ -373,7 +377,7 @@ describe('MCP bounded batch context and literal search', () => {
     });
     expect(out).toMatch(/Unique exact result; source included/i);
     expect(out).toContain('return helper(1)');
-    expect(out).toMatch(/Do not call codegraph_node/i);
+    expect(out).toMatch(/source included in this response/i);
   });
 
   it('returns exact enum and struct declarations across search, node, and manifest routes', async () => {
@@ -710,6 +714,20 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).toMatch(/Do not use Read/i);
   });
 
+  it('preflights merged same-file windows instead of truncating the trailing range', async () => {
+    const out = await output('context', {
+      targets: [
+        { file: 'src/wide_combined.ts', offset: 1, limit: 120 },
+        { file: 'src/wide_combined.ts', offset: 121, limit: 120 },
+        { file: 'src/wide_combined.ts', offset: 241, limit: 120 },
+      ],
+    });
+    expect(out).toMatch(/Context preflight.*source not emitted/i);
+    expect(out).toMatch(/3 windows totaling 360 requested lines/i);
+    expect(out).not.toContain('combined-0');
+    expect(out).not.toMatch(/precise file batch truncated/i);
+  });
+
   it('prefers a named container over same-name constructors unless precisely pinned', async () => {
     const contextOut = await output('context', {
       targets: [
@@ -944,7 +962,8 @@ describe('MCP bounded batch context and literal search', () => {
       line: 5,
       includeCode: true,
     });
-    expect(out).toMatch(/Definition:.*metrics\.cpp:4/i);
+    expect(out).toMatch(/Location:.*metrics\.cpp:4/i);
+    expect(out).toMatch(/Declaration endpoints[^]*metrics\.h:5/i);
     expect(out).not.toMatch(/No indexed definition found/i);
 
     const batchOut = await output('context', {
@@ -953,7 +972,7 @@ describe('MCP bounded batch context and literal search', () => {
         { symbol: 'first', file: 'flow.ts' },
       ],
     });
-    expect(batchOut).toMatch(/One logical overload has 2 indexed declaration\/definition endpoints/i);
+    expect(batchOut).toMatch(/implementation source included.*declaration endpoint referenced compactly/i);
     expect(batchOut).toContain('int TransferMetrics::get_row');
 
     db.prepare(
@@ -970,7 +989,8 @@ describe('MCP bounded batch context and literal search', () => {
       line: 6,
       includeCode: true,
     });
-    expect(qualifiedTypeOut).toMatch(/Definition:.*metrics\.cpp:5/i);
+    expect(qualifiedTypeOut).toMatch(/Location:.*metrics\.cpp:5/i);
+    expect(qualifiedTypeOut).toMatch(/Declaration endpoints[^]*metrics\.h:6/i);
     expect(qualifiedTypeOut).not.toMatch(/No indexed definition found/i);
   });
 

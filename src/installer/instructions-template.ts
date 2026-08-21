@@ -53,21 +53,36 @@ export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
 export const CODEGRAPH_INSTRUCTIONS_BLOCK = `${CODEGRAPH_SECTION_START}
 ## CodeGraph
 
-In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), use it to retrieve the smallest relevant code context before grep/find or file reads:
+Use CodeGraph only when a \`.codegraph/\` directory exists. If the task already
+gives an exact file and line and only neighboring code is needed, use host Read;
+reserve CodeGraph for symbol pairing and relationships.
 
-The CodeGraph server publishes short raw names so Claude Code exposes the tools exactly as \`codegraph_search\`, \`codegraph_node\`, \`codegraph_context\`, and the other \`codegraph_*\` names below.
-
-- Find one symbol by name/signature → \`codegraph_search\`; find 2–8 symbols with ONE \`codegraph_search(queries=[...])\` call so true misses share one raw scan. Add \`includeCode="if_unique"\` when a unique logical result should include declaration and definition source immediately; oversized source is safely truncated rather than replaced by an outline. A wrong qualified owner is corrected from structured leaf candidates before raw scanning.
-- Read one known symbol → \`codegraph_node(symbol=..., includeCode=true)\`; read 2–8 known targets → ONE native \`codegraph_node(targets=[...])\` batch, which returns the same merged implementation bundle as context. Caller/callee trails are off by default; set \`includeRelations=true\` only when both directions are useful, otherwise use the dedicated relationship tool.
-- Batch precise context → ONE manifest-driven \`codegraph_context(targets=[...])\` call. Group existing anchors as \`{file, symbols:[...], texts:[...]}\` or \`{symbol:<container>, members:[...]}\`; declarations/definitions and overlapping ranges are joined automatically, and member focus includes access labels plus small edit-neighbor context. A singular \`text\` combined with \`offset+limit\` is treated as an assertion on that explicit window instead of failing. Do not pass natural-language tasks. Put explicitly new identifiers in \`expectedMissing\` for absence verification only. Bare \`{file}\` targets return compact outlines. Fitting precise multi-file windows are emitted; preflight is reserved for over-budget output.
-- Known file but unknown symbol → \`codegraph_node(file=..., symbolsOnly=true, outlineQuery=optional)\`, then select or batch symbols. Inside \`targets\`, use \`symbolsOnly\`, \`outlineQuery="a|b"\`/\`outlineQueries=[...]\`, and \`outlineLimit\` to filter several file outlines in one call.
-- Search literal strings/macros/registrations → ONE \`codegraph_text_search(queries=[...], path=...)\` call; zero-match identifiers recover exact symbols in the same response, and an exact generated-file path is auto-included.
-- Generated artifact → batch its source-of-truth generator definition and one exact generated function/tail anchor; do not page generated files, and run the repository generator after editing its source.
-- Non-symbol text / exact edit boundary only → \`codegraph_node(file=..., offset=..., limit<=500)\`; larger limits are auto-clamped and output character budgets still apply. Bare/full-file MCP reads are rejected.
-- Who calls this / what does this call / what would changing this break → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`. For overloaded/same-named symbols, pass \`file\` + \`line\` or \`signature\`; these tools refuse to aggregate distinct overloads. Callers includes base-declaration call sites for an exact C++/interface override dispatch family.
-- Unexpected empty graph results include compact raw-source matches or one-line absence evidence when safe: trust \`CONFIRMED_ABSENT\`; \`DECLARATION_ONLY\` means the exact overload has a declaration but no paired indexed definition and the relevant identifier occurrences are already shown; treat \`RAW_MATCHES\` as an index/parser-gap signal; narrow scope after \`INCONCLUSIVE\`.
-- What's in a directory → \`codegraph_files\`.
-- No MCP client? The \`codegraph query\`, \`codegraph callers\`, \`codegraph callees\`, and \`codegraph impact\` shell commands print the same kind of answer.
+- Symbol → \`codegraph_search\`; batch names with ONE
+  \`codegraph_search(queries=[...])\`. Set \`includeCode="if_unique"\` for
+  implementation source plus a compact declaration pointer. Oversized source is
+  safely truncated rather than replaced by an outline.
+- Precise bundle → ONE \`codegraph_node(targets=[...])\` or
+  \`codegraph_context(targets=[...])\`. Use \`{file, symbols:[...], texts:[...]}\`
+  or \`{symbol:<container>, members:[...]}\`; ranges and decl/def partners are
+  deduplicated. Caller/callee trails are off by default.
+- Known file, unknown leaf →
+  \`codegraph_node(file=..., symbolsOnly=true, outlineQuery=...)\`. Batch outlines
+  support \`outlineQueries\`; filters match leaf names, not parameter signatures.
+- Literals → \`codegraph_text_search\` with one narrow path and several queries.
+  Exact generated-file paths are included; directory scans need
+  \`includeGenerated=true\` for generated files.
+- Exact non-symbol boundary → \`codegraph_node(file=..., offset=..., limit<=500)\`.
+  Bare/full-file MCP reads are rejected; over-budget window batches preflight
+  before emitting partial source.
+- Relationships → \`codegraph_callers\`, \`codegraph_callees\`, or
+  \`codegraph_impact\`. Pass file + line or signature for overloads; these tools
+  refuse to aggregate distinct overloads. Callers includes base-declaration call
+  sites for an exact override dispatch family.
+- Miss evidence: trust \`CONFIRMED_ABSENT\`; \`DECLARATION_ONLY\` means no paired
+  definition; compact raw-source matches/\`RAW_MATCHES\` signal an index gap;
+  narrow after \`INCONCLUSIVE\`.
+- Directory inventory → \`codegraph_files\`. Without MCP, use the equivalent
+  \`codegraph query|callers|callees|impact\` commands.
 
 If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
 ${CODEGRAPH_SECTION_END}`;

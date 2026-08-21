@@ -75,6 +75,8 @@ describe('MCP codegraph_node context-budget guidance', () => {
   });
 
   it('keeps server instructions aligned with runtime guards', () => {
+    expect(Buffer.byteLength(SERVER_INSTRUCTIONS, 'utf8')).toBeLessThan(5_000);
+    expect(SERVER_INSTRUCTIONS).toMatch(/exact file[^]*line[^]*host Read/i);
     expect(SERVER_INSTRUCTIONS).toContain('{ file, symbolsOnly: true }');
     expect(SERVER_INSTRUCTIONS).toContain('{ file, offset, limit<=500 }');
     expect(SERVER_INSTRUCTIONS).toMatch(/rejects bare\/full-file reads/i);
@@ -82,36 +84,38 @@ describe('MCP codegraph_node context-budget guidance', () => {
     expect(SERVER_INSTRUCTIONS).toContain('codegraph_node(targets=[...])');
     expect(SERVER_INSTRUCTIONS).toMatch(/Preflight is decided by the 20K character budget/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/queries=.*multi-pattern raw-source scan/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/both declaration and definition source/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/virtual-dispatch family/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/implementation source[^]*compact[^]*declaration pointer/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/virtual-dispatch[^]*family/i);
     expect(SERVER_INSTRUCTIONS).toContain('includeCode: "if_unique"');
-    expect(SERVER_INSTRUCTIONS).toMatch(/safely truncated.*rather than replaced by an outline/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/trails are off by default/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/selected container.*text.*file windows/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/bare.*file.*compact symbol outline/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/JSON-stringified.*parsed automatically/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/safely truncated[^]*rather than replaced by an outline/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/trails are off[^]*by default/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/selected container[^]*text[^]*file windows/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/bare[^]*file[^]*compact symbol outline/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/JSON-stringified[^]*parsed automatically/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/ONE `codegraph_text_search` call/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/zero-match identifier/i);
     expect(SERVER_INSTRUCTIONS).toContain('DECLARATION_ONLY');
     expect(SERVER_INSTRUCTIONS).toMatch(/compact\s+raw-source matches/i);
     expect(SERVER_INSTRUCTIONS).toMatch(/backend[^]*cache details[^]*omitted/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/file.*line.*signature/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/do not aggregate/i);
-    expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate file windows/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/file[^]*line[^]*signature/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/do[^]*not aggregate/i);
+    expect(SERVER_INSTRUCTIONS).toMatch(/Do not paginate[^]*file windows/i);
     expect(SERVER_INSTRUCTIONS).not.toMatch(/any time you'd use the `Read` tool/i);
   });
 
   it('keeps installed agent guidance aligned with runtime guards', () => {
+    expect(Buffer.byteLength(CODEGRAPH_INSTRUCTIONS_BLOCK, 'utf8')).toBeLessThan(3_500);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/exact file[^]*line[^]*host Read/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('symbolsOnly=true');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('limit<=500');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_context');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('includeCode="if_unique"');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_search(queries=[...])');
-    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/declaration and definition source/i);
-    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/safely truncated.*rather than replaced by an outline/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/implementation source[^]*compact declaration pointer/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/safely truncated[^]*rather than replaced by an outline/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/trails are off by default/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/outlineQueries/i);
-    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/base-declaration call sites/i);
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toMatch(/base-declaration call[^]*sites/i);
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_text_search');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node');
     expect(CODEGRAPH_INSTRUCTIONS_BLOCK).toContain('codegraph_node(targets=[...])');

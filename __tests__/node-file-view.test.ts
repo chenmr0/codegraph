@@ -58,7 +58,19 @@ describe('codegraph_node guarded MCP file mode', () => {
         Array.from({ length: 400 }, (_, i) => `  method${i}() { return "${'x'.repeat(40)}-${i}"; }`).join('\n') +
         '\n}\n',
     );
-    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.properties'], exclude: [] } });
+    fs.writeFileSync(
+      path.join(dir, 'src', 'signature-noise.cpp'),
+      [
+        'class Buffer {',
+        'public:',
+        '  int pos() const;',
+        '  int size() const;',
+        '  int serialize(char *buf, int &pos);',
+        '};',
+        '',
+      ].join('\n'),
+    );
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.cpp', '**/*.properties'], exclude: [] } });
     await cg.indexAll();
     h = new ToolHandler(cg);
   });
@@ -200,7 +212,7 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).not.toContain('method74');
   });
 
-  it('filters an outline by symbol/signature substring', async () => {
+  it('filters an outline by leaf symbol name', async () => {
     const out = await text({
       file: 'many.ts',
       symbolsOnly: true,
@@ -210,6 +222,18 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).toContain('fn99');
     expect(out).not.toMatch(/`fn9`/);
     expect(out).toMatch(/1 match outlineQuery="fn99"/i);
+  });
+
+  it('does not match outline filters against parameter names in signatures', async () => {
+    const out = await text({
+      file: 'signature-noise.cpp',
+      symbolsOnly: true,
+      outlineQuery: 'pos|size',
+      outlineLimit: 5,
+    });
+    expect(out).toContain('Buffer::pos');
+    expect(out).toContain('Buffer::size');
+    expect(out).not.toContain('Buffer::serialize');
   });
 
   it('infers symbolsOnly for a file with outline knobs', async () => {
@@ -225,19 +249,16 @@ describe('codegraph_node guarded MCP file mode', () => {
     expect(out).not.toContain('return 99');
   });
 
-  it('guards a non-selective outline filter instead of dumping most of the file', async () => {
+  it('does not expand a container-name outline query through qualified member names', async () => {
     const out = await text({
       file: 'large-class.ts',
       symbolsOnly: true,
       outlineQuery: 'LargeClass',
       outlineLimit: 50,
     });
-    expect(out).toMatch(/query too broad/i);
-    expect(out).toMatch(/qualified\/container names/i);
-    expect(out).toMatch(/leaf symbol\/member token/i);
-    expect(out).toContain('method0');
-    expect(out).not.toContain('method39');
-    expect(out).not.toMatch(/capped at 50/i);
+    expect(out).toMatch(/1 match outlineQuery="LargeClass"/i);
+    expect(out).toContain('LargeClass');
+    expect(out).not.toContain('method0');
   });
 
   it('steers a partial file window away from pagination', async () => {
