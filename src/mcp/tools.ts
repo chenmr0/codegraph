@@ -93,8 +93,9 @@ const MCP_CONTEXT_MEMBER_NEIGHBOR_LINES = 2;
 /** Symbol search can resolve several exact lookups and one raw fallback scan. */
 const MCP_SEARCH_MAX_QUERIES = 8;
 
-/** Avoid quadratic overload grouping for ubiquitous leaf names such as reuse. */
-const MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES = 64;
+/** Keep synchronous overload grouping bounded for ubiquitous names such as process. */
+const MCP_RELATIONSHIP_MAX_GROUPING_CANDIDATES = 64;
+const MCP_RELATIONSHIP_MAX_FALLBACK_COMPARISONS = 50_000;
 
 /** Literal text search is intentionally narrow and source-only. */
 const MCP_TEXT_SEARCH_MAX_QUERIES = 8;
@@ -437,6 +438,14 @@ interface ResolvedRelationshipTarget {
   nodes: Node[];
   primary: Node;
   lookupNote: string;
+}
+
+/** Per-grouping memoization; never survives a request or graph mutation. */
+interface RelationshipOverloadCache {
+  parameterKeys: Map<string, string | null>;
+  definitionsByDeclaration: Map<string, Node | null>;
+  candidatesByName: Map<string, Node[]>;
+  definitionEdgeSources: Map<string, Set<string>>;
 }
 
 interface ContextSymbolTarget {
@@ -4930,7 +4939,9 @@ export class ToolHandler {
     // selected set. A wrong owner on `reuse` can yield 1,000+ leaf candidates;
     // grouping all of them is both expensive and unnecessary. Surface ranked
     // structured candidates and ask for one narrowing assertion instead.
-    const groupingSkipped = scoped.length > MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES;
+    const groupingSkipped = scoped.length > MCP_RELATIONSHIP_MAX_GROUPING_CANDIDATES;
+    const legacyFallbackSkipped = !groupingSkipped &&
+      this.relationshipFallbackExceedsBudget(scoped.length, candidates.length);
     const groups = groupingSkipped
       ? []
       : this.relationshipOverloadGroups(cg, scoped, candidates);
@@ -4944,8 +4955,14 @@ export class ToolHandler {
     }
     if (groupingSkipped) {
       out.push(
-        `> High-frequency leaf guard: ${scoped.length} candidates remain, above the ${MCP_OWNER_RECOVERY_MAX_GROUPING_CANDIDATES}-candidate overload-grouping cap. ` +
+        `> High-frequency leaf guard: ${scoped.length} candidates remain, above the ${MCP_RELATIONSHIP_MAX_GROUPING_CANDIDATES}-candidate overload-grouping cap. ` +
         'Only ranked structured candidates are shown; no repository text scan or all-pairs overload comparison was run.'
+      );
+    } else if (legacyFallbackSkipped) {
+      out.push(
+        `> High-frequency leaf guard: ${scoped.length} scoped candidates × ${candidates.length} same-leaf candidates exceeds the ` +
+        `${MCP_RELATIONSHIP_MAX_FALLBACK_COMPARISONS}-comparison legacy pairing budget. ` +
+        'Direct declaration/definition edges are still expanded; the all-candidates legacy fallback was skipped.'
       );
     }
     if (includeCode && !groupingSkipped && groups.length === 1) {
@@ -5809,35 +5826,92 @@ export class ToolHandler {
     selected: Node[],
     allCandidates: Node[],
   ): Node[][] {
+    const uniqueSelected = [...new Map(selected.map((node) => [node.id, node])).values()];
+    if (uniqueSelected.length > MCP_RELATIONSHIP_MAX_GROUPING_CANDIDATES) {
+      // A high-frequency bare symbol is already ambiguous. Returning stable
+      // singleton groups preserves that fact without running synchronous
+      // all-pairs work or declaration fallback lookups on the MCP event loop.
+      return this.rankExactSymbolNodes(uniqueSelected).map((node) => [node]);
+    }
+
+    const legacyFallbackSkipped = this.relationshipFallbackExceedsBudget(
+      uniqueSelected.length,
+      allCandidates.length,
+    );
+    // When the legacy all-candidate pass is too broad, keep the cache scoped to
+    // the selected nodes. Modern indexes still expand authoritative `defines`
+    // edges below; an old edge-less index may omit a compact partner pointer,
+    // but it cannot wedge the daemon.
+    const cache = this.createRelationshipOverloadCache(
+      legacyFallbackSkipped ? uniqueSelected : allCandidates,
+    );
     const groups: Node[][] = [];
-    for (const node of selected) {
+    for (const node of uniqueSelected) {
       const existing = groups.find((group) =>
-        group.some((member) => this.sameRelationshipOverload(cg, member, node))
+        group.some((member) => this.sameRelationshipOverload(cg, member, node, cache))
       );
       if (existing) existing.push(node);
       else groups.push([node]);
     }
 
-    for (const group of groups) {
-      for (const candidate of allCandidates) {
-        if (
-          !group.some((member) => member.id === candidate.id) &&
-          group.some((member) => this.sameRelationshipOverload(cg, member, candidate))
-        ) {
-          group.push(candidate);
+    if (!legacyFallbackSkipped) {
+      // Compare candidates only with the selected anchors, not with endpoints
+      // appended during this pass. This makes the comparison count exactly
+      // bounded by selected.length × allCandidates.length.
+      const anchors = groups.map((group) => [...group]);
+      for (let index = 0; index < groups.length; index++) {
+        const group = groups[index]!;
+        const groupAnchors = anchors[index]!;
+        const memberIds = new Set(group.map((member) => member.id));
+        for (const candidate of allCandidates) {
+          if (
+            !memberIds.has(candidate.id) &&
+            groupAnchors.some((member) => this.sameRelationshipOverload(cg, member, candidate, cache))
+          ) {
+            group.push(candidate);
+            memberIds.add(candidate.id);
+          }
         }
       }
     }
-    return groups.map((group) => this.expandDeclarationDefinitionEndpoints(cg, group));
+    return groups.map((group) => this.expandDeclarationDefinitionEndpoints(cg, group, cache));
+  }
+
+  private relationshipFallbackExceedsBudget(selectedCount: number, candidateCount: number): boolean {
+    return selectedCount > 0 &&
+      candidateCount > Math.floor(MCP_RELATIONSHIP_MAX_FALLBACK_COMPARISONS / selectedCount);
+  }
+
+  private createRelationshipOverloadCache(candidates: Node[]): RelationshipOverloadCache {
+    const candidatesByName = new Map<string, Node[]>();
+    for (const candidate of candidates) {
+      const bucket = candidatesByName.get(candidate.name);
+      if (bucket) bucket.push(candidate);
+      else candidatesByName.set(candidate.name, [candidate]);
+    }
+    for (const [name, bucket] of candidatesByName) {
+      const unique = [...new Map(bucket.map((node) => [node.id, node])).values()];
+      candidatesByName.set(name, unique);
+    }
+    return {
+      parameterKeys: new Map(),
+      definitionsByDeclaration: new Map(),
+      candidatesByName,
+      definitionEdgeSources: new Map(),
+    };
   }
 
   /** Expand a selected overload through authoritative or canonical decl/def pairing. */
-  private expandDeclarationDefinitionEndpoints(cg: CodeGraph, selected: Node[]): Node[] {
+  private expandDeclarationDefinitionEndpoints(
+    cg: CodeGraph,
+    selected: Node[],
+    cache?: RelationshipOverloadCache,
+  ): Node[] {
     const endpoints = new Map(selected.map((node) => [node.id, node]));
     const queue = [...selected];
     const add = (candidate: Node | null | undefined, source: Node): void => {
       if (!candidate || endpoints.has(candidate.id)) return;
-      if (!this.sameRelationshipOverload(cg, source, candidate)) return;
+      if (!this.sameRelationshipOverload(cg, source, candidate, cache)) return;
       endpoints.set(candidate.id, candidate);
       queue.push(candidate);
     };
@@ -5845,7 +5919,7 @@ export class ToolHandler {
     for (let index = 0; index < queue.length; index++) {
       const node = queue[index]!;
       if (node.isDeclaration === true) {
-        add(this.indexedDefinitionForDeclaration(cg, node), node);
+        add(this.indexedDefinitionForDeclaration(cg, node, cache), node);
       }
       for (const edge of [...cg.getIncomingEdges(node.id), ...cg.getOutgoingEdges(node.id)]) {
         if (edge.kind !== 'defines') continue;
@@ -5905,7 +5979,12 @@ export class ToolHandler {
   }
 
   /** True only for two indexed endpoints representing the same callable overload. */
-  private sameRelationshipOverload(cg: CodeGraph, left: Node, right: Node): boolean {
+  private sameRelationshipOverload(
+    cg: CodeGraph,
+    left: Node,
+    right: Node,
+    cache?: RelationshipOverloadCache,
+  ): boolean {
     if (left.id === right.id) return true;
     if (left.name !== right.name) return false;
     // Two concrete definitions are distinct graph roots even when their text
@@ -5913,8 +5992,8 @@ export class ToolHandler {
     // and duplicate definitions should never be silently merged).
     if (left.isDeclaration !== true && right.isDeclaration !== true) return false;
 
-    const leftParameters = cppParameterKey(left);
-    const rightParameters = cppParameterKey(right);
+    const leftParameters = this.relationshipParameterKey(left, cache);
+    const rightParameters = this.relationshipParameterKey(right, cache);
     const bothCFamily = (left.language === 'c' || left.language === 'cpp') &&
       (right.language === 'c' || right.language === 'cpp');
     if (
@@ -5929,12 +6008,34 @@ export class ToolHandler {
       ) return true;
     }
 
-    // A valid synthesized declaration/definition edge is definitive. Do not
-    // trust stale cross-overload edges: indexedDefinitionForDeclaration also
-    // checks the canonical parameter list before returning a definition.
-    if (left.isDeclaration && this.indexedDefinitionForDeclaration(cg, left)?.id === right.id) return true;
-    if (right.isDeclaration && this.indexedDefinitionForDeclaration(cg, right)?.id === left.id) return true;
+    // A valid synthesized declaration/definition edge is definitive. Check the
+    // requested pair directly instead of resolving the declaration through a
+    // fresh same-name query and sort for every comparison.
+    const linkedDefinition = (declaration: Node, definition: Node): boolean => {
+      if (definition.isDeclaration === true || leftParameters === null || rightParameters === null) return false;
+      if (!cppParameterKeysMatch(leftParameters, rightParameters)) return false;
+      let sources = cache?.definitionEdgeSources.get(declaration.id);
+      if (!sources) {
+        sources = new Set(
+          cg.getIncomingEdges(declaration.id)
+            .filter((edge) => edge.kind === 'defines')
+            .map((edge) => edge.source),
+        );
+        cache?.definitionEdgeSources.set(declaration.id, sources);
+      }
+      return sources.has(definition.id);
+    };
+    if (left.isDeclaration && linkedDefinition(left, right)) return true;
+    if (right.isDeclaration && linkedDefinition(right, left)) return true;
     return false;
+  }
+
+  private relationshipParameterKey(node: Node, cache?: RelationshipOverloadCache): string | null {
+    if (!cache) return cppParameterKey(node);
+    if (!cache.parameterKeys.has(node.id)) {
+      cache.parameterKeys.set(node.id, cppParameterKey(node));
+    }
+    return cache.parameterKeys.get(node.id) ?? null;
   }
 
   private formatRelationshipTarget(target: ResolvedRelationshipTarget): string {
@@ -6126,14 +6227,24 @@ export class ToolHandler {
    * same overload. Parameter keys prevent a stale cross-overload `defines`
    * edge from making a declaration-only overload look implemented.
    */
-  private indexedDefinitionForDeclaration(cg: CodeGraph, declaration: Node): Node | null {
+  private indexedDefinitionForDeclaration(
+    cg: CodeGraph,
+    declaration: Node,
+    cache?: RelationshipOverloadCache,
+  ): Node | null {
     if (!declaration.isDeclaration) return null;
-    const declarationParameters = cppParameterKey(declaration);
-    if (declarationParameters === null) return null;
+    if (cache?.definitionsByDeclaration.has(declaration.id)) {
+      return cache.definitionsByDeclaration.get(declaration.id) ?? null;
+    }
+    const declarationParameters = this.relationshipParameterKey(declaration, cache);
+    if (declarationParameters === null) {
+      cache?.definitionsByDeclaration.set(declaration.id, null);
+      return null;
+    }
 
     const sameOverload = (candidate: Node): boolean => {
       if (candidate.isDeclaration === true) return false;
-      const candidateParameters = cppParameterKey(candidate);
+      const candidateParameters = this.relationshipParameterKey(candidate, cache);
       return candidateParameters !== null &&
         cppParameterKeysMatch(candidateParameters, declarationParameters);
     };
@@ -6141,16 +6252,26 @@ export class ToolHandler {
     for (const edge of cg.getIncomingEdges(declaration.id)) {
       if (edge.kind !== 'defines') continue;
       const candidate = cg.getNode(edge.source);
-      if (candidate && sameOverload(candidate)) return candidate;
+      if (candidate && sameOverload(candidate)) {
+        cache?.definitionsByDeclaration.set(declaration.id, candidate);
+        return candidate;
+      }
     }
 
     // Be robust to an older index that contains both nodes but is missing the
     // synthesized edge. Compare the immediate callable owner so same-signature
     // methods on unrelated classes do not get paired.
-    return this.findSymbolMatches(cg, declaration.name).find((candidate) =>
+    const candidates = cache?.candidatesByName.get(declaration.name) ??
+      cg.getNodesByName(declaration.name);
+    const matchingDefinitions = candidates.filter((candidate) =>
       sameOverload(candidate) &&
       cppCallableOwnersMatch(candidate, declaration)
-    ) ?? null;
+    );
+    const definition = matchingDefinitions.length > 0
+      ? this.rankExactSymbolNodes(matchingDefinitions)[0] ?? null
+      : null;
+    cache?.definitionsByDeclaration.set(declaration.id, definition);
+    return definition;
   }
 
   /** Compact role text shared by node/context overload summaries. */
@@ -6354,10 +6475,17 @@ export class ToolHandler {
 
   /** Stable exact-symbol ranking shared by search/node/callers helpers. */
   private rankExactSymbolNodes(nodes: Node[]): Node[] {
+    const generatedByPath = new Map<string, boolean>();
+    const generated = (filePath: string): boolean => {
+      if (!generatedByPath.has(filePath)) {
+        generatedByPath.set(filePath, isGeneratedFile(filePath));
+      }
+      return generatedByPath.get(filePath) ?? false;
+    };
     return [...nodes].sort((a, b) => {
       const declarationOrder = Number(a.isDeclaration === true) - Number(b.isDeclaration === true);
       if (declarationOrder !== 0) return declarationOrder;
-      const generatedOrder = Number(isGeneratedFile(a.filePath)) - Number(isGeneratedFile(b.filePath));
+      const generatedOrder = Number(generated(a.filePath)) - Number(generated(b.filePath));
       if (generatedOrder !== 0) return generatedOrder;
       const qualifiedOrder = a.qualifiedName.localeCompare(b.qualifiedName);
       if (qualifiedOrder !== 0) return qualifiedOrder;
@@ -6372,6 +6500,15 @@ export class ToolHandler {
   private formatSearchResults(cg: CodeGraph, results: SearchResult[]): string {
     const lines: string[] = [`## Search Results (${results.length} found)`, ''];
     let declarationOnlyCount = 0;
+    const overloadCaches = new Map<string, RelationshipOverloadCache>();
+    const overloadCacheFor = (node: Node): RelationshipOverloadCache => {
+      let cache = overloadCaches.get(node.name);
+      if (!cache) {
+        cache = this.createRelationshipOverloadCache(cg.getNodesByName(node.name));
+        overloadCaches.set(node.name, cache);
+      }
+      return cache;
+    };
 
     for (const result of results) {
       const { node } = result;
@@ -6379,10 +6516,11 @@ export class ToolHandler {
       // Compact format: one line per result with key info.
       // Tag prototypes so the agent knows to follow the `defines` edge to
       // the definition for the real body/callees rather than dead-ending.
-      const callableKey = cppParameterKey(node);
+      const overloadCache = node.isDeclaration === true ? overloadCacheFor(node) : undefined;
+      const callableKey = this.relationshipParameterKey(node, overloadCache);
       const declarationOnly = node.isDeclaration === true &&
         callableKey !== null &&
-        this.indexedDefinitionForDeclaration(cg, node) === null;
+        this.indexedDefinitionForDeclaration(cg, node, overloadCache) === null;
       if (declarationOnly) declarationOnlyCount++;
       const declTag = node.isDeclaration === true
         ? declarationOnly

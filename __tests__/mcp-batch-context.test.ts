@@ -540,6 +540,91 @@ describe('MCP bounded batch context and literal search', () => {
     expect(out).not.toMatch(/raw-source (?:match|scan)/i);
   });
 
+  it('bounds legacy owner pairing when path narrows a high-frequency leaf below the candidate cap', async () => {
+    const db = (cg as any).db.getDb();
+    const insert = db.prepare(
+      `INSERT INTO nodes (
+         id, kind, name, qualified_name, file_path, language,
+         start_line, end_line, start_column, end_column, signature,
+         is_declaration, updated_at
+       ) VALUES (?, 'method', 'process', ?, ?, 'cpp', 1, 1, 0, 1, ?, ?, ?)`
+    );
+    db.exec('BEGIN');
+    try {
+      for (let index = 0; index < 1_000; index++) {
+        const scoped = index < 60;
+        const owner = scoped ? `ScopedOwner${index}` : `OtherOwner${index}`;
+        insert.run(
+          `bounded-process-${index}`,
+          `${owner}::process`,
+          index === 0
+            ? 'src/single-process.cpp'
+            : scoped ? 'src/scoped-process.cpp' : 'src/other-process.cpp',
+          `int ${owner}::process()`,
+          scoped ? 1 : 0,
+          Date.now(),
+        );
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const originalExact = cg.getNodesBySymbolExact.bind(cg);
+    const originalByName = cg.getNodesByName.bind(cg);
+    let repeatedLeafLookups = 0;
+    let sameNameQueries = 0;
+    (cg as any).getNodesBySymbolExact = (symbol: string) => {
+      if (symbol === 'process') repeatedLeafLookups++;
+      return originalExact(symbol);
+    };
+    (cg as any).getNodesByName = (name: string) => {
+      if (name === 'process') sameNameQueries++;
+      return originalByName(name);
+    };
+    try {
+      const narrowOut = await output('search', {
+        query: 'MissingOwner::process',
+        path: 'single-process.cpp',
+        limit: 5,
+      });
+      expect(narrowOut).toMatch(/Qualified owner mismatch/i);
+      expect(narrowOut).not.toMatch(/legacy pairing budget/i);
+      expect(repeatedLeafLookups).toBe(0);
+      expect(sameNameQueries).toBeLessThanOrEqual(2);
+
+      repeatedLeafLookups = 0;
+      sameNameQueries = 0;
+      const out = await output('search', {
+        query: 'MissingOwner::process',
+        path: 'scoped-process.cpp',
+        includeCode: 'if_unique',
+        limit: 5,
+      });
+      expect(out).toMatch(/Qualified owner mismatch/i);
+      expect(out).toMatch(/59 scoped candidates × 1000 same-leaf candidates/i);
+      expect(out).toMatch(/50000-comparison legacy pairing budget/i);
+      expect(out).toMatch(/all-candidates legacy fallback was skipped/i);
+      expect(repeatedLeafLookups).toBe(0);
+      expect(sameNameQueries).toBeLessThanOrEqual(2);
+
+      repeatedLeafLookups = 0;
+      sameNameQueries = 0;
+      const bareOut = await output('search', {
+        query: 'process',
+        limit: 5,
+      });
+      expect(bareOut).toMatch(/Search Results \(5 found\)/i);
+      expect(repeatedLeafLookups).toBeLessThanOrEqual(1);
+      expect(sameNameQueries).toBeLessThanOrEqual(1);
+    } finally {
+      (cg as any).getNodesBySymbolExact = originalExact;
+      (cg as any).getNodesByName = originalByName;
+      db.prepare(`DELETE FROM nodes WHERE id LIKE 'bounded-process-%'`).run();
+    }
+  });
+
   it('reuses raw evidence only inside an unchanged actively-watched source epoch', async () => {
     const originalIsWatching = cg.isWatching.bind(cg);
     const originalPending = cg.getPendingFiles.bind(cg);
