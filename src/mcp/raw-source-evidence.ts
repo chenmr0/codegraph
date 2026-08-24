@@ -6,10 +6,10 @@ import { rgPath as bundledRgPath } from '@vscode/ripgrep';
 import { CONFIG_LEAF_LANGUAGES, validatePathWithinRoot } from '../utils';
 
 /**
- * A deliberately high, but finite, ceiling for rare negative-evidence scans.
- * Unlike text_search this path only runs after an exact graph lookup failed.
- * A response may claim absence only when every eligible indexed source file
- * was read successfully; reaching this ceiling produces INCONCLUSIVE instead.
+ * A deliberately high, but finite, ceiling for the Node fallback used by rare
+ * negative-evidence scans. Ripgrep streams source and has its own output cap,
+ * so this budget must not prevent the accelerated backend from running.
+ * Reaching the ceiling while Node is needed produces INCONCLUSIVE instead.
  */
 const RAW_EVIDENCE_MAX_SCANNED_BYTES = 512 * 1024 * 1024;
 const RAW_EVIDENCE_DEFAULT_TIMEOUT_MS = 8_000;
@@ -411,7 +411,6 @@ async function scanWithRipgrep(
   // in-process scan there; rg becomes the clear win once file count or bytes
   // are material (the OceanBase case is 14k files / 374 MiB).
   if (!forceRipgrep && files.length < 200 && indexedBytes < 4 * 1024 * 1024) return null;
-  if (indexedBytes > maxScannedBytes) return null;
   const globArgs = rgGlobArgs(files);
   if (!globArgs) return null;
   const executable = process.env.CODEGRAPH_RG_PATH?.trim() || bundledRgPath;

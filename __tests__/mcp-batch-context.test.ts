@@ -461,6 +461,26 @@ describe('MCP bounded batch context and literal search', () => {
     }
   });
 
+  it('does not apply the Node byte budget to a complete ripgrep scan', async () => {
+    const previous = process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+    process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = 'ripgrep';
+    try {
+      const report = await scanRawSourceEvidence(cg, [{
+        label: 'RipgrepBudgetIndependentMissingSymbol',
+        needle: 'RipgrepBudgetIndependentMissingSymbol',
+      }], 1);
+      const out = formatRawSourceEvidence(report);
+      expect(report.backend).toBe('ripgrep');
+      expect(report.totalScannedBytes).toBeGreaterThan(1);
+      expect(report.budgetReached).toBe(false);
+      expect(out).toContain('CONFIRMED_ABSENT');
+      expect(out).not.toContain('INCONCLUSIVE');
+    } finally {
+      if (previous === undefined) delete process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
+      else process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = previous;
+    }
+  });
+
   it('pushes an exact path down to ripgrep instead of scanning then filtering the repository', async () => {
     const previous = process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND;
     process.env.CODEGRAPH_RAW_EVIDENCE_BACKEND = 'ripgrep';
