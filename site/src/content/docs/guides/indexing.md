@@ -61,7 +61,9 @@ Pending files **not** referenced by the response surface as a small footer inste
 
 ### 3. Connect-time catch-up — covers gaps when the MCP server wasn't running
 
-When your editor / agent (re)connects to the MCP server, codegraph runs a fast filesystem-based reconciliation (a `(size, mtime)` stat pre-filter, then a content hash on the rest) before answering the first query. So files changed while no MCP server was running — a `git pull` from the terminal, an edit from another editor, an agent that finished and exited — are caught up automatically on the next session's first tool call.
+When your editor / agent (re)connects to the MCP server, codegraph starts a filesystem-based reconciliation (a `(size, mtime)` stat pre-filter, then a content hash on the rest). Tool calls wait up to 5 seconds for it, so the common no-change path remains fully current. If a hot file takes longer, the call proceeds instead of appearing hung; the sync keeps running in the background and every released response carries a concise freshness warning until it finishes. The warning is deliberately non-directive and limits the possible stale scope to recently changed files, so the agent can continue using unaffected results without being pushed into a retry or status-check loop.
+
+**Tunable**: `CODEGRAPH_MCP_CATCHUP_BUDGET_MS` overrides the 5000ms interaction budget in the range `[0ms, 60s]`. Setting it to `0` makes catch-up fully non-blocking; it does not disable or cancel the background sync.
 
 ### Verify what the watcher sees
 

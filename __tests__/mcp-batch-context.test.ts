@@ -243,6 +243,15 @@ describe('MCP bounded batch context and literal search', () => {
     expect(banner).toMatch(/Every unlisted file.*fresh/i);
   });
 
+  it('does not claim unlisted files are fresh while startup catch-up is unfinished', () => {
+    const banner = formatStaleBanner([
+      { path: 'src/stale.cpp', lastSeenMs: Date.now(), indexing: true },
+    ], true);
+    expect(banner).toMatch(/watcher-confirmed stale files/i);
+    expect(banner).toMatch(/additional recently changed files may be stale/i);
+    expect(banner).not.toMatch(/Every unlisted file.*fresh/i);
+  });
+
   it('returns several exact symbol bodies in one call without repetitive trails', async () => {
     const out = await output('context', {
       targets: [

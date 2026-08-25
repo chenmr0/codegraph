@@ -1,7 +1,8 @@
 /**
- * MCP catch-up gate — first tool call blocks on the engine's post-open
- * filesystem reconcile so it never serves rows for files that were
- * deleted (or edited) while no MCP server was running.
+ * MCP catch-up interaction budget — concurrent tool calls share one bounded
+ * wait for the engine's post-open filesystem reconcile. Fast catch-up stays
+ * strongly consistent; slow catch-up continues in the background while every
+ * released response carries an explicit project-wide stale warning.
  *
  * Background: `MCPEngine.catchUpSync()` fires `cg.sync()` in the background.
  * Before this fix it was fire-and-forget — a tool call could race past it
@@ -9,10 +10,9 @@
  * staleness banner (`withStalenessNotice`) couldn't help, because
  * `getPendingFiles()` is populated by the watcher, not by catch-up.
  *
- * The fix: `catchUpSync()` pushes its promise into the `ToolHandler` via
- * `setCatchUpGate(p)`; the first `execute()` call awaits the gate and then
- * clears it. These tests exercise the gate directly (deterministic) and
- * the engine-driven path (proves the engine actually pokes the gate).
+ * `catchUpSync()` pushes its promise into the `ToolHandler` via
+ * `setCatchUpGate(p)`. These tests exercise the shared gate directly,
+ * including completion, timeout, concurrency, and failure semantics.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -20,7 +20,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
-import { ToolHandler } from '../src/mcp/tools';
+import {
+  MCP_CATCH_UP_DEFAULT_BUDGET_MS,
+  resolveMcpCatchUpBudgetMs,
+  ToolHandler,
+} from '../src/mcp/tools';
 
 describe('MCP catch-up gate', () => {
   let testDir: string;
@@ -45,6 +49,7 @@ describe('MCP catch-up gate', () => {
   });
 
   afterEach(() => {
+    try { handler.closeAll(); } catch { /* ignore */ }
     try { cg.unwatch(); } catch { /* ignore */ }
     try { cg.close(); } catch { /* ignore */ }
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
@@ -61,22 +66,67 @@ describe('MCP catch-up gate', () => {
     expect(gateResolved).toBe(true);
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toMatch(/survivor/);
+    expect(res.content[0].text).not.toMatch(/index refresh/i);
   });
 
-  it('drops the gate after first await — second call does not re-wait', async () => {
-    let awaitCount = 0;
-    const gate = new Promise<void>((resolve) => {
-      awaitCount++;
-      setTimeout(resolve, 20);
-    });
-    handler.setCatchUpGate(gate);
+  it('clears the shared gate after catch-up completes', async () => {
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+    handler.setCatchUpGate(gate, 1_000);
 
-    await handler.execute('search', { query: 'survivor' });
-    const before = awaitCount;
-    await handler.execute('search', { query: 'survivor' });
-    // The promise body runs once when constructed; second execute never
-    // resubscribes to a fresh promise because the gate field was nulled.
-    expect(awaitCount).toBe(before);
+    const first = handler.execute('search', { query: 'survivor' });
+    resolveGate();
+    expect((await first).content[0].text).not.toMatch(/index refresh/i);
+
+    const second = await handler.execute('search', { query: 'survivor' });
+    expect(second.content[0].text).not.toMatch(/index refresh/i);
+  });
+
+  it('keeps every concurrent request behind the same gate until completion', async () => {
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
+    handler.setCatchUpGate(gate, 1_000);
+
+    let firstDone = false;
+    let secondDone = false;
+    const first = handler.execute('search', { query: 'survivor' })
+      .then((result) => { firstDone = true; return result; });
+    const second = handler.execute('search', { query: 'survivor' })
+      .then((result) => { secondDone = true; return result; });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(firstDone).toBe(false);
+    expect(secondDone).toBe(false);
+
+    resolveGate();
+    const results = await Promise.all([first, second]);
+    expect(results.every((result) => !/index refresh/i.test(result.content[0].text))).toBe(true);
+  });
+
+  it('releases after the budget, warns, and lets catch-up continue in background', async () => {
+    let resolveGate!: () => void;
+    let gateCompleted = false;
+    const gate = new Promise<void>((resolve) => {
+      resolveGate = () => { gateCompleted = true; resolve(); };
+    });
+    handler.setCatchUpGate(gate, 0);
+
+    const stale = await handler.execute('search', { query: 'survivor' });
+    expect(gateCompleted).toBe(false);
+    expect(stale.isError).toBeFalsy();
+    expect(stale.content[0].text).toContain(
+      '⚠️ Index refresh is still running; results for recently changed files may be stale.',
+    );
+    expect(stale.content[0].text).not.toMatch(
+      /interaction budget|elapsed|retry this query|codegraph sync|codegraph_status|provisional/i,
+    );
+    expect(stale.content[0].text).toMatch(/survivor/);
+
+    resolveGate();
+    await gate;
+    const fresh = await handler.execute('search', { query: 'survivor' });
+    expect(gateCompleted).toBe(true);
+    expect(fresh.content[0].text).not.toMatch(/index refresh/i);
   });
 
   it('catch-up reconciles a deleted file before the first tool call sees it', async () => {
@@ -110,13 +160,37 @@ describe('MCP catch-up gate', () => {
     expect(cg.getStats().fileCount).toBe(0);
   });
 
-  it('gate that rejects does not break the tool call', async () => {
+  it('a rejected catch-up stays visible without breaking tool calls', async () => {
     // A catch-up sync failure (lock contention, transient FS error) must
-    // not poison tool dispatch — the engine logs it, the handler proceeds.
+    // not poison tool dispatch, but the old index must not be presented as fresh.
     handler.setCatchUpGate(Promise.reject(new Error('simulated sync failure')));
 
     const res = await handler.execute('search', { query: 'survivor' });
     expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain(
+      '⚠️ Startup index refresh was incomplete; results for recently changed files may be stale.',
+    );
+    expect(res.content[0].text).not.toContain('simulated sync failure');
+    expect(res.content[0].text).not.toMatch(/codegraph sync|codegraph_status|retry/i);
     expect(res.content[0].text).toMatch(/survivor/);
+
+    const status = await handler.execute('status', {});
+    expect(status.content[0].text).toMatch(/startup index refresh was incomplete/i);
+    expect(status.content[0].text).toContain('simulated sync failure');
+
+    // A later retry generation replaces the conservative failure state.
+    handler.setCatchUpGate(Promise.resolve());
+    const recovered = await handler.execute('search', { query: 'survivor' });
+    expect(recovered.content[0].text).not.toMatch(/index refresh/i);
+  });
+
+  it('validates the environment budget and permits an explicit zero budget', () => {
+    expect(resolveMcpCatchUpBudgetMs(undefined)).toBe(MCP_CATCH_UP_DEFAULT_BUDGET_MS);
+    expect(resolveMcpCatchUpBudgetMs('')).toBe(MCP_CATCH_UP_DEFAULT_BUDGET_MS);
+    expect(resolveMcpCatchUpBudgetMs('invalid')).toBe(MCP_CATCH_UP_DEFAULT_BUDGET_MS);
+    expect(resolveMcpCatchUpBudgetMs('-1')).toBe(MCP_CATCH_UP_DEFAULT_BUDGET_MS);
+    expect(resolveMcpCatchUpBudgetMs('60001')).toBe(MCP_CATCH_UP_DEFAULT_BUDGET_MS);
+    expect(resolveMcpCatchUpBudgetMs('0')).toBe(0);
+    expect(resolveMcpCatchUpBudgetMs('2500')).toBe(2_500);
   });
 });

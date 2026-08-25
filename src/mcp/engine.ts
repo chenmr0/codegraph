@@ -231,12 +231,10 @@ export class MCPEngine {
   /**
    * Reconcile the index with the current filesystem once, right after open —
    * catches edits, adds, deletes, and `git pull`/`checkout` changes made while
-   * no watcher was running. Runs in the background, but the returned promise
-   * is pushed into the ToolHandler as a one-shot gate so the *first* tool
-   * call awaits completion before serving (without this, a tool call that
-   * races past sync returns rows for files that no longer exist on disk —
-   * and the per-file staleness banner can't help because `getPendingFiles()`
-   * is populated by the watcher, not by catch-up).
+   * no watcher was running. Runs in the background; ToolHandler gives every
+   * concurrent request the same bounded wait. If the interaction budget
+   * expires, requests proceed with an explicit project-wide stale warning and
+   * this promise keeps running to completion.
    */
   private catchUpSync(): void {
     const cg = this.cg;
@@ -252,6 +250,9 @@ export class MCPEngine {
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
+        // ToolHandler consumes the rejection immediately: tools stay usable,
+        // but retain an explicit catch-up-failed freshness warning.
+        throw err;
       });
     this.toolHandler.setCatchUpGate(p);
   }

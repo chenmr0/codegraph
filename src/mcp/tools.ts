@@ -58,6 +58,27 @@ import {
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
 
+/**
+ * Maximum time a tool call waits for the startup filesystem catch-up. Most
+ * no-change reconciles finish inside this window; a pathological changed file
+ * must not make the MCP surface appear hung for tens of seconds.
+ */
+export const MCP_CATCH_UP_DEFAULT_BUDGET_MS = 5_000;
+const MCP_CATCH_UP_MAX_BUDGET_MS = 60_000;
+
+/** Resolve CODEGRAPH_MCP_CATCHUP_BUDGET_MS without letting bad input disable the gate. */
+export function resolveMcpCatchUpBudgetMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return MCP_CATCH_UP_DEFAULT_BUDGET_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    return MCP_CATCH_UP_DEFAULT_BUDGET_MS;
+  }
+  if (parsed < 0 || parsed > MCP_CATCH_UP_MAX_BUDGET_MS) {
+    return MCP_CATCH_UP_DEFAULT_BUDGET_MS;
+  }
+  return parsed;
+}
+
 /** Maximum source lines returned by one MCP codegraph_node file window. */
 const MCP_NODE_MAX_FILE_WINDOW_LINES = 500;
 
@@ -373,21 +394,61 @@ function isExactSymbolLookup(value: string): boolean {
  * The agent uses this to fall back to Read for those specific files
  * without waiting for the debounced sync (issue #403).
  */
-export function formatStaleBanner(stale: PendingFile[]): string {
+export function formatStaleBanner(
+  stale: PendingFile[],
+  startupCatchUpPending = false,
+): string {
   const now = Date.now();
   const lines = stale.map((p) => {
     const ageMs = Math.max(0, now - p.lastSeenMs);
     const label = p.indexing ? 'indexing in progress' : 'pending sync';
     return `  - ${p.path} (edited ${ageMs}ms ago, ${label})`;
   });
+  const scope = startupCatchUpPending
+    ? 'These are watcher-confirmed stale files. Startup index refresh is also unfinished, so additional recently changed files may be stale. '
+    : 'Scope: ONLY the files listed above are stale; do not treat any other indexed file as stale. ' +
+      'Every unlisted file in this response is fresh. ';
   return (
     '⚠️ Some files referenced below were edited since the last index sync — ' +
     'their codegraph entries may be stale:\n' +
     lines.join('\n') +
-    '\nScope: ONLY the files listed above are stale; do not treat any other indexed file as stale. ' +
-    'For accurate content of a listed file, read only the required range directly. ' +
-    'Every unlisted file in this response is fresh.'
+    `\n${scope}` +
+    'For accurate content of a listed file, read only the required range directly.'
   );
+}
+
+type CatchUpStatus = 'running' | 'complete' | 'failed';
+
+interface CatchUpState {
+  status: CatchUpStatus;
+  startedAt: number;
+  budgetMs: number;
+  release: Promise<void>;
+  releaseNow: () => void;
+  timer: ReturnType<typeof setTimeout> | null;
+  error?: string;
+}
+
+interface CatchUpAdmission {
+  status: 'running' | 'failed';
+  startedAt: number;
+  budgetMs: number;
+  error?: string;
+}
+
+/** Low-distraction freshness warning used after the bounded startup gate releases. */
+function formatCatchUpNotice(
+  admission: CatchUpAdmission,
+  includeFailureDetail = false,
+): string {
+  if (admission.status === 'failed') {
+    const notice =
+      '⚠️ Startup index refresh was incomplete; results for recently changed files may be stale.';
+    if (!includeFailureDetail) return notice;
+    const safeError = admission.error?.replace(/\s+/g, ' ').trim().slice(0, 300);
+    return safeError ? `${notice} Details: ${safeError}` : notice;
+  }
+  return '⚠️ Index refresh is still running; results for recently changed files may be stale.';
 }
 
 /**
@@ -1149,14 +1210,12 @@ export class ToolHandler {
   // once and every later tool call reuses the result — never shelling out to
   // git on the hot path. `undefined` = not computed yet; `null` = no mismatch.
   private worktreeMismatchCache: Map<string, WorktreeIndexMismatch | null> = new Map();
-  // Gate that the MCP engine pokes after `cg.open()` so the first tool call
-  // blocks on the post-open filesystem reconcile (catch-up sync). Without
-  // this, a tool call that races past `catchUpSync()` serves rows for files
-  // that were deleted (or edited) while no MCP server was running — and the
-  // per-file staleness banner can't help, because `getPendingFiles()` is
-  // populated by the watcher, not by catch-up. Cleared on first await so
-  // subsequent calls don't pay any cost.
-  private catchUpGate: Promise<void> | null = null;
+  // Shared startup-reconcile gate. Every concurrent request observes the same
+  // state: all wait until catch-up finishes or its interaction budget expires.
+  // After budget expiry the sync continues in the background and responses get
+  // a project-wide stale notice until completion. A failure remains visible
+  // instead of silently blessing the previous index as fresh.
+  private catchUpState: CatchUpState | null = null;
   // Daemon sessions may execute concurrently. AsyncLocalStorage keeps one
   // request's cancellation signal attached to its raw-evidence subprocess
   // without leaking it into another client's tool call.
@@ -1172,14 +1231,61 @@ export class ToolHandler {
   }
 
   /**
-   * Engine-only: register the catch-up sync promise so the next `execute()`
-   * call awaits it before serving. The handler swallows rejections (the
-   * engine logs them) so a sync failure never propagates as a tool error;
-   * we still want to serve a best-effort result over the same potentially-
-   * stale data, which is what would have happened without the gate.
+   * Engine-only: register the catch-up sync promise. Tool calls share a bounded
+   * wait; expiry releases them with an explicit stale notice while the promise
+   * keeps running. Rejections never become tool errors, but remain visible as a
+   * conservative freshness warning.
    */
-  setCatchUpGate(p: Promise<void> | null): void {
-    this.catchUpGate = p;
+  setCatchUpGate(p: Promise<void> | null, budgetMs?: number): void {
+    const previous = this.catchUpState;
+    if (previous?.timer) clearTimeout(previous.timer);
+    // Wake requests captured on the old generation so they can observe the
+    // replacement (or shutdown) instead of waiting forever on an abandoned gate.
+    previous?.releaseNow();
+    this.catchUpState = null;
+    if (!p) return;
+
+    let releaseNow!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseNow = resolve;
+    });
+    const state: CatchUpState = {
+      status: 'running',
+      startedAt: Date.now(),
+      budgetMs: budgetMs === undefined
+        ? resolveMcpCatchUpBudgetMs(process.env.CODEGRAPH_MCP_CATCHUP_BUDGET_MS)
+        : resolveMcpCatchUpBudgetMs(String(budgetMs)),
+      release,
+      releaseNow,
+      timer: null,
+    };
+    this.catchUpState = state;
+
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      state.releaseNow();
+    }, state.budgetMs);
+    state.timer.unref?.();
+
+    // Attach both handlers immediately so even an already-rejected promise is
+    // observed. The completion branch only clears this exact generation; a
+    // later catch-up registered through retry initialization wins.
+    void p.then(
+      () => {
+        state.status = 'complete';
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = null;
+        state.releaseNow();
+        if (this.catchUpState === state) this.catchUpState = null;
+      },
+      (error: unknown) => {
+        state.status = 'failed';
+        state.error = error instanceof Error ? error.message : String(error);
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = null;
+        state.releaseNow();
+      },
+    );
   }
 
   /**
@@ -1368,6 +1474,7 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
+    this.setCatchUpGate(null);
     for (const cg of this.projectCache.values()) {
       cg.close();
     }
@@ -1480,7 +1587,11 @@ export class ToolHandler {
    * Cost when nothing is pending — the common case — is one boolean check.
    * No I/O, no parsing of markdown beyond a per-pending-file substring scan.
    */
-  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private withStalenessNotice(
+    result: ToolResult,
+    projectPath?: string,
+    startupCatchUpPending = false,
+  ): ToolResult {
     if (result.isError) return result;
 
     let cg: CodeGraph;
@@ -1531,8 +1642,50 @@ export class ToolHandler {
 
     if (inResponse.length === 0) return result;
 
-    const composed = [formatStaleBanner(inResponse), text].join('\n\n');
+    const composed = [
+      formatStaleBanner(inResponse, startupCatchUpPending),
+      text,
+    ].join('\n\n');
     return { ...result, content: [{ type: 'text', text: composed }, ...rest] };
+  }
+
+  /** Wait for the shared catch-up deadline and return the warning snapshot, if any. */
+  private async awaitCatchUpBudget(): Promise<CatchUpAdmission | null> {
+    // A retry initialization can replace the gate while a request is waiting.
+    // Loop so that request also observes the newer generation.
+    while (this.catchUpState) {
+      const state = this.catchUpState;
+      await state.release;
+      if (this.catchUpState !== state) continue;
+      if (state.status === 'complete') {
+        this.catchUpState = null;
+        return null;
+      }
+      return {
+        status: state.status,
+        startedAt: state.startedAt,
+        budgetMs: state.budgetMs,
+        error: state.error,
+      };
+    }
+    return null;
+  }
+
+  /** Prefix a successful result whose request was released before catch-up completed. */
+  private withCatchUpNotice(
+    result: ToolResult,
+    admission: CatchUpAdmission | null,
+  ): ToolResult {
+    if (!admission || result.isError) return result;
+    const [first, ...rest] = result.content;
+    if (!first || first.type !== 'text') return result;
+    return {
+      ...result,
+      content: [{
+        type: 'text',
+        text: `${formatCatchUpNotice(admission)}\n\n${first.text}`,
+      }, ...rest],
+    };
   }
 
   /**
@@ -1554,16 +1707,11 @@ export class ToolHandler {
     args: Record<string, unknown>,
   ): Promise<ToolResult> {
     try {
-      // Block the first tool call on the engine's post-open reconcile so we
-      // never serve rows for files deleted/edited while no MCP server was
-      // running. The gate is cleared after first await — subsequent calls
-      // pay nothing. Catch-up failures are logged by the engine; we
-      // proceed regardless so a transient sync error never breaks tools.
-      if (this.catchUpGate) {
-        const gate = this.catchUpGate;
-        this.catchUpGate = null;
-        try { await gate; } catch { /* engine already logged */ }
-      }
+      // Wait for startup reconciliation only up to its shared interaction
+      // budget. Expiry does not cancel sync; the captured admission is attached
+      // to this response even if catch-up finishes while the query is running,
+      // because the query may already have observed the previous index state.
+      const catchUpAdmission = await this.awaitCatchUpBudget();
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
       if (!this.isToolAllowed(toolName)) {
@@ -1620,14 +1768,19 @@ export class ToolHandler {
           // status embeds the pending-files list as a first-class section
           // (see handleStatus), so we skip the auto-banner wrapper here to
           // avoid duplicating the same info at the top of the response.
-          return await this.handleStatus(args);
+          return await this.handleStatus(args, catchUpAdmission);
         case 'files':
           result = await this.handleFiles(args); break;
         default:
           return this.errorResult(`Unknown tool: ${toolName}`);
       }
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const withFileStaleness = this.withStalenessNotice(
+        withWorktree,
+        args.projectPath as string | undefined,
+        catchUpAdmission !== null,
+      );
+      return this.withCatchUpNotice(withFileStaleness, catchUpAdmission);
     } catch (err) {
       return this.errorResult(`Tool execution failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -5127,7 +5280,10 @@ export class ToolHandler {
   /**
    * Handle codegraph_status
    */
-  private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
+  private async handleStatus(
+    args: Record<string, unknown>,
+    catchUpAdmission: CatchUpAdmission | null = null,
+  ): Promise<ToolResult> {
     let cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
@@ -5153,6 +5309,12 @@ export class ToolHandler {
       '## CodeGraph Status',
       '',
     ];
+    if (catchUpAdmission) {
+      lines.push(
+        `> ${formatCatchUpNotice(catchUpAdmission, true).replace(/\n/g, '\n> ')}`,
+        '',
+      );
+    }
     if (mismatch) {
       lines.push(`> ⚠ ${worktreeMismatchWarning(mismatch).replace(/\n/g, '\n> ')}`, '');
     }
