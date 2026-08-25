@@ -49,6 +49,10 @@ import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock, canonicalFilePath } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
+import {
+  collectPersistedIndexDiagnostics,
+  isDeclarationMacroRecoverySkipped,
+} from './extraction/diagnostics';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
@@ -556,9 +560,12 @@ export class CodeGraph {
           const hasIncompleteGlobalError = result.errors.some(
             (diagnostic) => diagnostic.severity === 'error' && !diagnostic.filePath
           );
+          const hasDeclarationMacroRecoverySkip = result.errors.some(
+            isDeclarationMacroRecoverySkipped
+          );
           result.complete =
             result.success && result.filesErrored === 0 && !hasIncompleteGlobalError &&
-            resolutionDiagnostics.length === 0;
+            !hasDeclarationMacroRecoverySkip && resolutionDiagnostics.length === 0;
           try {
             this.queries.setMetadata(
               'index_completeness',
@@ -568,16 +575,9 @@ export class CodeGraph {
               'index_diagnostics',
               result.complete
                 ? '[]'
-                : JSON.stringify([
-                    ...result.errors.filter((diagnostic) => !diagnostic.filePath),
-                    ...(result.filesErrored > 0
-                      ? [{
-                          severity: 'error',
-                          code: 'files_not_indexed',
-                          message: `${result.filesErrored} files could not be indexed.`,
-                        }]
-                      : []),
-                  ])
+                : JSON.stringify(
+                    collectPersistedIndexDiagnostics(result.errors, result.filesErrored)
+                  )
             );
           } catch { /* the returned diagnostics remain authoritative */ }
 
@@ -982,7 +982,7 @@ export class CodeGraph {
   /** Persisted completeness of the last full index, including visible reasons. */
   getIndexCompleteness(): {
     status: 'complete' | 'incomplete' | 'unknown';
-    diagnostics: Array<{ message: string; severity: string; code?: string }>;
+    diagnostics: Array<{ message: string; severity: string; code?: string; filePath?: string }>;
   } {
     const rawStatus = this.queries.getMetadata('index_completeness');
     const status = rawStatus === 'complete' || rawStatus === 'incomplete'

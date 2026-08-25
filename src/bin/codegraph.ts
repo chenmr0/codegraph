@@ -36,6 +36,10 @@ import { getGlyphs } from '../ui/glyphs';
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR, needsWasmFallback } from './node-version-check';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
+import {
+  DECLARATION_MACRO_RECOVERY_SKIPPED_CODE,
+  isDeclarationMacroRecoverySkipped,
+} from '../extraction/diagnostics';
 import { buildNodeView } from '../cli/node-view';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
@@ -336,9 +340,19 @@ function getIncompleteIndexHints(diagnostics: IndexDiagnostic[]): string[] {
   if (codes.has('framework_detection_failed') || codes.has('framework_post_extract_failed')) {
     hints.push('Fix the reported framework resolver failure before retrying "codegraph index".');
   }
+  if (codes.has(DECLARATION_MACRO_RECOVERY_SKIPPED_CODE)) {
+    hints.push(
+      'Base AST symbols were indexed for the reported files, but declarations generated only ' +
+      'by macros may be missing; re-run "codegraph index" to retry full declaration-macro recovery.'
+    );
+  }
   if (
     codes.has('files_not_indexed') ||
-    diagnostics.some((diagnostic) => diagnostic.filePath !== undefined)
+    diagnostics.some(
+      (diagnostic) =>
+        diagnostic.filePath !== undefined &&
+        !isDeclarationMacroRecoverySkipped(diagnostic)
+    )
   ) {
     hints.push('Fix the reported file errors, then run "codegraph index" to add the missing files.');
   }
@@ -356,6 +370,9 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
   const hasFileErrors = result.filesErrored > 0;
   const globalDiagnostics = result.errors.filter((diagnostic) => !diagnostic.filePath);
   const warningCount = result.errors.filter((diagnostic) => diagnostic.severity === 'warning').length;
+  const declarationMacroRecoverySkips = result.errors.filter(
+    isDeclarationMacroRecoverySkipped
+  );
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -407,6 +424,13 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
   for (const diagnostic of globalDiagnostics) {
     if (diagnostic.severity === 'error') clack.log.error(diagnostic.message);
     else clack.log.warn(diagnostic.message);
+  }
+
+  if (declarationMacroRecoverySkips.length > 0) {
+    clack.log.warn(
+      `${formatNumber(declarationMacroRecoverySkips.length)} file(s) were indexed from their ` +
+      'base AST without declaration-macro recovery; macro-generated declarations may be missing.'
+    );
   }
 
   if (result.success && result.complete === false) {

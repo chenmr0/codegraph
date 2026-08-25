@@ -116,4 +116,33 @@ describe('codegraph status --json — CI fields (#329)', () => {
       expect.objectContaining({ code: 'synthesis_disabled' })
     );
   });
+
+  it('status explains that a base-only file is usable but missing macro-generated declarations', () => {
+    const cg = CodeGraph.initSync(tempDir);
+    const queries = (cg as unknown as {
+      queries: { setMetadata(key: string, value: string): void };
+    }).queries;
+    queries.setMetadata('index_completeness', 'incomplete');
+    queries.setMetadata('index_diagnostics', JSON.stringify([{
+      severity: 'warning',
+      code: 'declaration_macro_recovery_skipped',
+      filePath: 'src/macros.cpp',
+      message:
+        'Base AST symbols were indexed, but declarations generated only by macros may be missing.',
+    }]));
+    cg.close();
+
+    const status = spawnSync(process.execPath, [BIN, 'status'], {
+      cwd: tempDir,
+      encoding: 'utf-8',
+      env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const output = `${status.stdout}\n${status.stderr}`;
+
+    expect(status.status).toBe(0);
+    expect(output).toContain('Base AST symbols were indexed');
+    expect(output).toContain('retry full declaration-macro recovery');
+    expect(output).not.toContain('Fix the reported file errors');
+  });
 });

@@ -41,6 +41,7 @@ import {
   type StoreBundle,
   finalizeStoreBundle,
 } from './store-writer';
+import { replaceWithDeclarationMacroRecoverySkipped } from './diagnostics';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -1642,6 +1643,16 @@ export class ExtractionOrchestrator {
         }
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
+          const degradation = replaceWithDeclarationMacroRecoverySkipped(
+            errors,
+            errEntry,
+            filePath,
+            false,
+          );
+          // Store the same diagnostic on the file record as well as in the
+          // top-level IndexResult, so SDK file inspection and persisted index
+          // completeness agree about this file's reduced coverage.
+          result.errors.push(degradation);
           const language = detectLanguage(filePath, content);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           const bp = walBackpressure?.();
@@ -1654,14 +1665,15 @@ export class ExtractionOrchestrator {
             this.storeExtractionResult(filePath, content, language, stats, result);
           }
 
-          const idx = errors.indexOf(errEntry);
-          if (idx >= 0) errors.splice(idx, 1);
           filesErrored--;
           filesIndexed++;
           totalNodes += result.nodes.length;
           totalEdges += result.edges.length;
           accumulateExtractionTimings(extractionTimingTotals, result.timings);
-          log(`Retry OK: ${filePath} (${result.nodes.length} nodes)`);
+          log(
+            `Retry base-only OK: ${filePath} (${result.nodes.length} nodes; ` +
+            `declaration-macro recovery skipped, coverage incomplete)`
+          );
         }
       }
 
@@ -1702,6 +1714,13 @@ export class ExtractionOrchestrator {
           }
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
+            const degradation = replaceWithDeclarationMacroRecoverySkipped(
+              errors,
+              errEntry,
+              filePath,
+              true,
+            );
+            result.errors.push(degradation);
             const language = detectLanguage(filePath, fullContent);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             const bp = walBackpressure?.();
@@ -1714,14 +1733,16 @@ export class ExtractionOrchestrator {
               this.storeExtractionResult(filePath, fullContent, language, stats, result);
             }
 
-            const idx = errors.indexOf(errEntry);
-            if (idx >= 0) errors.splice(idx, 1);
             filesErrored--;
             filesIndexed++;
             totalNodes += result.nodes.length;
             totalEdges += result.edges.length;
             accumulateExtractionTimings(extractionTimingTotals, result.timings);
-            log(`Retry (stripped) OK: ${filePath} (${result.nodes.length} nodes)`);
+            log(
+              `Retry (comments stripped, base-only) OK: ${filePath} ` +
+              `(${result.nodes.length} nodes; declaration-macro recovery skipped, ` +
+              `coverage incomplete)`
+            );
           }
         }
       }
