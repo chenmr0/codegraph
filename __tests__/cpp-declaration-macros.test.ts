@@ -152,6 +152,39 @@ describe('C/C++ declaration macro expansion', () => {
     expect(checkedLines).toEqual([2]);
   });
 
+  it('rejects lexical executable-body candidates before recursive expansion', () => {
+    const definitions = selectUnambiguousCppMacroDefinitions(scanCppMacroDefinitions([
+      '#define INNER(name) static int name;',
+      '#define OUTER(name) INNER(name)',
+    ].join('\n')));
+    const lexicalChecks: number[] = [];
+    const astChecks: number[] = [];
+    const source = [
+      'void run() { OUTER(local_only) }',
+      'OUTER(global_value)',
+    ].join('\n');
+    const result = expandDeclarationMacros(
+      source,
+      definitions,
+      line => {
+        astChecks.push(line);
+        return true;
+      },
+      line => {
+        lexicalChecks.push(line);
+        return line === 2;
+      },
+    );
+
+    expect(result.source).toBe([
+      'void run() { OUTER(local_only) }',
+      'static int global_value;',
+    ].join('\n'));
+    expect(result.invocationLines).toEqual(new Set([2]));
+    expect(lexicalChecks).toEqual([1, 2]);
+    expect(astChecks).toEqual([2]);
+  });
+
   it('assembles dense declaration-macro expansions without shifting lines or source boundaries', () => {
     const definitions = selectUnambiguousCppMacroDefinitions(
       scanCppMacroDefinitions('#define DECL(index) static int value_##index;'),
@@ -195,6 +228,11 @@ describe('C/C++ declaration macro expansion', () => {
     expect(result.nodes).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'variable', name: 'global_value', startLine: 2 }),
     ]));
+    expect(result.timings).toEqual(expect.objectContaining({
+      primaryParseMs: expect.any(Number),
+      primaryExtractionMs: expect.any(Number),
+      declarationMacroExpansionMs: expect.any(Number),
+    }));
   });
 
   it('keeps declaration scope exact across disjoint functions, methods, and lambdas', () => {

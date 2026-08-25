@@ -563,6 +563,7 @@ export function expandDeclarationMacros(
   source: string,
   projectDefinitions: readonly CppMacroDefinition[],
   isDeclarationScope?: (line: number, column: number) => boolean,
+  isLexicallyDeclarationScope?: (line: number, column: number) => boolean,
 ): DeclarationMacroExpansion {
   const globalIndex = definitionIndex(projectDefinitions);
   const globalDefinitions = globalIndex.definitions;
@@ -674,6 +675,18 @@ export function expandDeclarationMacros(
       if (!invocation) continue;
       args = invocation.args;
       end = invocation.end;
+    }
+
+    // The lexical executable-body check depends only on the original source,
+    // not on the expanded macro text. Run that exact negative predicate before
+    // recursive argument/body expansion so statement macros cannot consume
+    // seconds or overflow the stack merely to be rejected later. The complete
+    // AST-aware declaration-scope predicate remains below after the expansion
+    // has proven declaration-shaped.
+    if (isLexicallyDeclarationScope && !isLexicallyDeclarationScope(line, column)) {
+      advanceLineState(start, end);
+      i = end;
+      continue;
     }
 
     const expandedArgs = args.map(arg => expandText(arg, expansionDefinitions, 1, new Set([name])));

@@ -715,8 +715,10 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('-v, --verbose', 'Show detailed sync phase and worker timing')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; verbose?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
+    const commandStarted = performance.now();
 
     try {
       if (!isInitialized(projectPath)) {
@@ -726,8 +728,12 @@ program
         process.exit(1);
       }
 
+      const moduleLoadStarted = performance.now();
       const { default: CodeGraph } = await loadCodeGraph();
+      const moduleLoadMs = performance.now() - moduleLoadStarted;
+      const databaseOpenStarted = performance.now();
       const cg = await CodeGraph.open(projectPath);
+      const databaseOpenMs = performance.now() - databaseOpenStarted;
 
       if (options.quiet) {
         await cg.sync();
@@ -741,11 +747,23 @@ program
       process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
       const progress = createShimmerProgress();
 
+      const syncPipelineStarted = performance.now();
       const result = await cg.sync({
         onProgress: progress.onProgress,
+        verbose: options.verbose,
       });
+      const syncPipelineMs = performance.now() - syncPipelineStarted;
 
       await progress.stop();
+
+      if (options.verbose) {
+        console.log(
+          `[sync] command phases moduleLoad=${Math.round(moduleLoadMs)}ms ` +
+          `databaseOpen=${Math.round(databaseOpenMs)}ms ` +
+          `syncPipeline=${Math.round(syncPipelineMs)}ms ` +
+          `total=${Math.round(performance.now() - commandStarted)}ms`,
+        );
+      }
 
       const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
 

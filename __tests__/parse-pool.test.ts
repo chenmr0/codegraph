@@ -140,6 +140,7 @@ describe('ParseWorkerPool', () => {
       },
     });
     pool.prewarm();
+    await pool.waitUntilReady();
 
     expect(workers).toHaveLength(3);
     for (const worker of workers) {

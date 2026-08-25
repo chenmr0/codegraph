@@ -88,6 +88,20 @@ export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } 
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
 
+/** A sync made partial progress but left one or more changed files stale. */
+export class SyncIncompleteError extends Error {
+  constructor(public readonly result: SyncResult) {
+    const failed = result.failedFilePaths ?? [];
+    const sample = failed.slice(0, 3).join(', ');
+    const suffix = failed.length > 3 ? ` (+${failed.length - 3} more)` : '';
+    super(
+      `CodeGraph sync incomplete: ${result.filesErrored ?? failed.length} file(s) failed` +
+      (sample ? ` (${sample}${suffix})` : ''),
+    );
+    this.name = 'SyncIncompleteError';
+  }
+}
+
 /**
  * Options for initializing a new CodeGraph project
  */
@@ -648,7 +662,12 @@ export class CodeGraph {
           walValve.start();
         }
 
-        const result = await this.orchestrator.sync(options.onProgress, options.paths);
+        const result = await this.orchestrator.sync(
+          options.onProgress,
+          options.paths,
+          options.verbose,
+        );
+        const hasSuccessfulChangedFiles = (result.changedFilePaths?.length ?? 0) > 0;
 
         // Fold extraction writes before resolution starts reading the changed
         // graph. Besides bounding the WAL, this avoids making the main thread
@@ -659,7 +678,7 @@ export class CodeGraph {
         // every sync that touched files so edits to `app.module.ts` propagate
         // to controllers in unchanged files. The pass is idempotent and cheap
         // (regex over *.module.ts only).
-        if (result.filesAdded > 0 || result.filesModified > 0) {
+        if (hasSuccessfulChangedFiles) {
           this.resolver.runPostExtract();
         } else if (result.filesRemoved > 0) {
           // Pure deletion still resolves resurrected incoming references below.
@@ -670,19 +689,13 @@ export class CodeGraph {
         // Resolve references for changed files first. This restores their
         // import edges (e.g. `a.c --imports--> a.h`), which the co-importer
         // query in the next step relies on.
-        if (result.filesAdded > 0 || result.filesModified > 0) {
-          if (result.changedFilePaths) {
-            this.resolver.resolveAndPersist(
-              this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths),
-              (current, total) => {
-                options.onProgress?.({ phase: 'resolving', current, total });
-              }
-            );
-          } else {
-            await this.resolveReferencesBatched((current, total) => {
+        if (hasSuccessfulChangedFiles) {
+          this.resolver.resolveAndPersist(
+            this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths!),
+            (current, total) => {
               options.onProgress?.({ phase: 'resolving', current, total });
-            });
-          }
+            }
+          );
         }
 
         // Whole-file deletion cascades incoming edges from unchanged callers.
@@ -805,8 +818,7 @@ export class CodeGraph {
         }
 
         if (
-          result.filesAdded > 0 ||
-          result.filesModified > 0 ||
+          hasSuccessfulChangedFiles ||
           resurrectedRefs.length > 0 ||
           orphanCount > 0
         ) {
@@ -817,14 +829,16 @@ export class CodeGraph {
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         if (
-          result.filesAdded > 0 ||
-          result.filesModified > 0 ||
+          hasSuccessfulChangedFiles ||
           result.filesRemoved > 0 ||
           orphanCount > 0
         ) {
           await this.db.runMaintenance();
         }
 
+        if (result.complete === false) {
+          throw new SyncIncompleteError(result);
+        }
         return result;
       } finally {
         // Stop checkpoint activity before restoring SQLite's original policy.

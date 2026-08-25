@@ -14,6 +14,7 @@ import {
   Language,
   FileRecord,
   ExtractionResult,
+  ExtractionTimings,
   ExtractionError,
   SavedCrossFileEdge,
   UnresolvedReference,
@@ -54,6 +55,33 @@ const FILE_IO_BATCH_SIZE = 10;
  * the daemon liveness heartbeat even though the sync itself is healthy.
  */
 const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
+
+const EXTRACTION_TIMING_KEYS: ReadonlyArray<keyof ExtractionTimings> = [
+  'primaryParseMs',
+  'primaryExtractionMs',
+  'declarationMacroExpansionMs',
+  'declarationMacroRecoverySourceMs',
+  'declarationMacroAuxParseMs',
+  'declarationMacroMergeMs',
+];
+
+function accumulateExtractionTimings(
+  totals: ExtractionTimings,
+  timings: ExtractionTimings | undefined,
+): void {
+  if (!timings) return;
+  for (const key of EXTRACTION_TIMING_KEYS) {
+    const value = timings[key];
+    if (value !== undefined) totals[key] = (totals[key] ?? 0) + value;
+  }
+}
+
+function formatExtractionTimings(timings: ExtractionTimings): string {
+  return EXTRACTION_TIMING_KEYS
+    .filter((key) => timings[key] !== undefined)
+    .map((key) => `${key}=${Math.round(timings[key] ?? 0)}ms`)
+    .join(' ');
+}
 
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
@@ -129,12 +157,21 @@ export interface IndexResult {
  * Result of a sync operation
  */
 export interface SyncResult {
+  /** False when one or more changed files could not be read or parsed. */
+  complete?: boolean;
   filesChecked: number;
   filesAdded: number;
   filesModified: number;
   filesRemoved: number;
+  /** Number of changed files that were left on their previous index state. */
+  filesErrored?: number;
   nodesUpdated: number;
   durationMs: number;
+  /** Per-file failures collected while the remaining sync work continued. */
+  errors?: ExtractionError[];
+  /** Files that must remain pending and be retried by watcher/catch-up sync. */
+  failedFilePaths?: string[];
+  /** Added/modified files successfully stored and safe for downstream resolution. */
   changedFilePaths?: string[];
   /** Files whose incoming cross-file edges couldn't be fully rewired —
    *  they need co-importer re-indexing as a fallback.  undefined means
@@ -962,6 +999,10 @@ export class ExtractionOrchestrator {
     let filesErrored = 0;
     let totalNodes = 0;
     let totalEdges = 0;
+    const extractionTimingTotals: ExtractionTimings = {};
+    let fileReadMs = 0;
+    let parseWallMs = 0;
+    let storeAdmissionMs = 0;
 
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
@@ -974,6 +1015,7 @@ export class ExtractionOrchestrator {
       total: 0,
     });
 
+    const scanStarted = performance.now();
     const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
@@ -982,26 +1024,31 @@ export class ExtractionOrchestrator {
         currentFile: file,
       });
     });
+    const scanMs = performance.now() - scanStarted;
 
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
     // (route nodes, middleware, etc.) run after the tree-sitter pass.
     // Framework detection is reset each run so adding e.g. requirements.txt
     // between runs is picked up without restarting the process.
+    const frameworkDetectionStarted = performance.now();
     this.detectedFrameworkNames = null;
     const frameworkNames = this.ensureDetectedFrameworks(files);
     errors.push(...this.frameworkDetectionErrors);
+    const frameworkDetectionMs = performance.now() - frameworkDetectionStarted;
 
     // Pre-scan C/C++/ObjC files for project-wide #define macro names so
     // isMisparsedFunction can filter cross-file macro misparses (macro
     // defined in header A, used in file B → tree-sitter has no
     // preprocessor and would otherwise emit a fake function node in B).
+    const macroScanStarted = performance.now();
     this.globalMacroNames = null;
     this.globalBodylessMacroNames = null;
     this.globalMacroDefinitions = null;
     const globalMacroNames = await this.ensureGlobalMacroNames(files);
     const globalBodylessMacroNames = this.globalBodylessMacroNames!;
     const globalMacroDefinitions = this.globalMacroDefinitions!;
+    const macroScanMs = performance.now() - macroScanStarted;
 
     if (signal?.aborted) {
       return {
@@ -1368,6 +1415,7 @@ export class ExtractionOrchestrator {
       const batch = files.slice(i, i + FILE_IO_BATCH_SIZE);
 
       // Read files in parallel (with path validation before any I/O)
+      const fileReadStarted = performance.now();
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
           try {
@@ -1384,10 +1432,12 @@ export class ExtractionOrchestrator {
           }
         })
       );
+      fileReadMs += performance.now() - fileReadStarted;
 
       // Parse the whole I/O batch concurrently across the pool. Promise.all
       // preserves array order, and the following loop stores in that same
       // order, so graph insertion/disambiguation stays deterministic.
+      const parseBatchStarted = performance.now();
       const parsedBatch = await Promise.all(
         fileContents.map(async (item) => {
           if (item.error || item.content === null || item.stats === null) {
@@ -1406,8 +1456,10 @@ export class ExtractionOrchestrator {
           }
         })
       );
+      parseWallMs += performance.now() - parseBatchStarted;
 
       // Admit and store results strictly in file order.
+      const storeAdmissionStarted = performance.now();
       for (const { filePath, content, stats, error, result, parseError } of parsedBatch) {
         if (signal?.aborted) {
           if (storeWriter) await storeWriter.close();
@@ -1460,6 +1512,7 @@ export class ExtractionOrchestrator {
         }
 
         processed++;
+        accumulateExtractionTimings(extractionTimingTotals, result.timings);
 
         // WAL backpressure: a between-transactions boundary, safe to pause the
         // writer here if the disk is saturated and the WAL needs a full
@@ -1522,6 +1575,7 @@ export class ExtractionOrchestrator {
           }
         }
       }
+      storeAdmissionMs += performance.now() - storeAdmissionStarted;
     }
 
     // The worker applies queued bundles in message order. Close its connection
@@ -1606,6 +1660,7 @@ export class ExtractionOrchestrator {
           filesIndexed++;
           totalNodes += result.nodes.length;
           totalEdges += result.edges.length;
+          accumulateExtractionTimings(extractionTimingTotals, result.timings);
           log(`Retry OK: ${filePath} (${result.nodes.length} nodes)`);
         }
       }
@@ -1665,11 +1720,23 @@ export class ExtractionOrchestrator {
             filesIndexed++;
             totalNodes += result.nodes.length;
             totalEdges += result.edges.length;
+            accumulateExtractionTimings(extractionTimingTotals, result.timings);
             log(`Retry (stripped) OK: ${filePath} (${result.nodes.length} nodes)`);
           }
         }
       }
     }
+
+    log(
+      `Index phases: scan=${Math.round(scanMs)}ms ` +
+      `framework=${Math.round(frameworkDetectionMs)}ms ` +
+      `macroScan=${Math.round(macroScanMs)}ms ` +
+      `read=${Math.round(fileReadMs)}ms ` +
+      `parseWall=${Math.round(parseWallMs)}ms ` +
+      `storeAdmission=${Math.round(storeAdmissionMs)}ms`,
+    );
+    const extractionTimingSummary = formatExtractionTimings(extractionTimingTotals);
+    if (extractionTimingSummary) log(`Extraction totals: ${extractionTimingSummary}`);
 
     return {
       success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
@@ -2051,7 +2118,8 @@ export class ExtractionOrchestrator {
      * Exact watcher paths. Undefined keeps the full filesystem reconcile as
      * the source of truth for manual sync and uncertain watcher events.
      */
-    scopedPaths?: string[]
+    scopedPaths?: string[],
+    verbose?: boolean,
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     // Sync rescans; clear the canonical-path cache so repointed symlinks are seen.
@@ -2061,10 +2129,20 @@ export class ExtractionOrchestrator {
     let filesAdded = 0;
     let filesModified = 0;
     let filesRemoved = 0;
+    let filesErrored = 0;
     let nodesUpdated = 0;
+    const syncErrors: ExtractionError[] = [];
+    const failedFilePaths = new Set<string>();
+    // Only successfully stored files belong here. Detection counts above still
+    // report every observed add/modify, but downstream resolution must never
+    // run against a file whose old index was deliberately retained.
     const changedFilePaths: string[] = [];
     const resurrectedReferenceSourceFiles = new Set<string>();
     this.syncRewireFailures = [];
+    const log = verbose
+      ? (message: string) => console.log(`[sync] ${message}`)
+      : (_message: string) => {};
+    const reconcileStarted = performance.now();
 
     onProgress?.({
       phase: 'scanning',
@@ -2200,50 +2278,254 @@ export class ExtractionOrchestrator {
 
       if (!tracked) {
         filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
         filesAdded++;
       } else if (tracked.contentHash !== contentHash) {
         filesToIndex.push(filePath);
-        changedFilePaths.push(filePath);
         filesModified++;
       }
     }
 
-    // Load only grammars needed for changed files
-    if (filesToIndex.length > 0) {
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f)))];
-      // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
+    const reconcileMs = performance.now() - reconcileStarted;
+    const total = filesToIndex.length;
+    let macroScanMs = 0;
+    let frameworkDetectionMs = 0;
+    let workerSetupMs = 0;
+    let readMs = 0;
+    let parseWallMs = 0;
+    let storeMs = 0;
+    const extractionTimingTotals: ExtractionTimings = {};
+
+    if (total > 0) {
+      const neededLanguages = [...new Set(filesToIndex.map((filePath) => detectLanguage(filePath)))];
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');
       }
-      await loadGrammarsForLanguages(neededLanguages);
+
+      const frameworkStarted = performance.now();
+      const frameworkNames = this.ensureDetectedFrameworks();
+      frameworkDetectionMs = performance.now() - frameworkStarted;
+
+      const needsCppMacroContext = neededLanguages.some(
+        (language) => language === 'c' || language === 'cpp' || language === 'objc',
+      );
+      let globalMacroNames = new Set<string>();
+      let globalBodylessMacroNames = new Set<string>();
+      let globalMacroDefinitions: CppMacroDefinition[] = [];
+      if (needsCppMacroContext) {
+        const macroStarted = performance.now();
+        globalMacroNames = await this.ensureGlobalMacroNames();
+        globalBodylessMacroNames = this.globalBodylessMacroNames ?? new Set<string>();
+        globalMacroDefinitions = this.globalMacroDefinitions ?? [];
+        macroScanMs = performance.now() - macroStarted;
+      }
+
+      const setupStarted = performance.now();
+      const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
+      const useWorker = fs.existsSync(parseWorkerPath);
+      let parsePool: ParseWorkerPool | null = null;
+      if (useWorker) {
+        const cpuCount = typeof os.availableParallelism === 'function'
+          ? os.availableParallelism()
+          : os.cpus().length;
+        const requestedPoolSize = resolveParsePoolSize(
+          process.env.CODEGRAPH_PARSE_WORKERS,
+          cpuCount,
+        );
+        const poolSize = Math.max(1, Math.min(total, requestedPoolSize));
+        let grammarBuffers: Record<string, Uint8Array> | undefined;
+        try {
+          grammarBuffers = await readGrammarWasmBytes(neededLanguages);
+        } catch {
+          grammarBuffers = undefined;
+        }
+        parsePool = new ParseWorkerPool({
+          languages: neededLanguages,
+          size: poolSize,
+          workerScriptPath: parseWorkerPath,
+          recycleInterval: WORKER_RECYCLE_INTERVAL,
+          parseTimeoutMs: PARSE_TIMEOUT_MS,
+          log: (message) => log(`worker ${message}`),
+          grammarBuffers,
+          macroNames: [...globalMacroNames],
+          bodylessMacroNames: [...globalBodylessMacroNames],
+          macroDefinitions: globalMacroDefinitions,
+        });
+        parsePool.prewarm();
+        await parsePool.waitUntilReady();
+        log(`parse worker pool=${poolSize}`);
+      } else {
+        await loadGrammarsForLanguages(neededLanguages);
+        log('parse worker unavailable; using in-process fallback');
+      }
+      workerSetupMs = performance.now() - setupStarted;
+
+      let processed = 0;
+      onProgress?.({ phase: 'parsing', current: 0, total });
+      try {
+        for (let offset = 0; offset < filesToIndex.length; offset += FILE_IO_BATCH_SIZE) {
+          const batch = filesToIndex.slice(offset, offset + FILE_IO_BATCH_SIZE);
+          const readStarted = performance.now();
+          const items = await Promise.all(batch.map(async (filePath) => {
+            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            if (!fullPath) {
+              return { filePath, content: null, stats: null, error: new Error('Path traversal blocked') };
+            }
+            try {
+              const [content, stats] = await Promise.all([
+                fsp.readFile(fullPath, 'utf-8'),
+                fsp.stat(fullPath),
+              ]);
+              return { filePath, content, stats, error: null };
+            } catch (error) {
+              return { filePath, content: null, stats: null, error };
+            }
+          }));
+          readMs += performance.now() - readStarted;
+
+          const parseStarted = performance.now();
+          const parsed = await Promise.all(items.map(async (item) => {
+            if (item.error || item.content === null || item.stats === null) {
+              return {
+                ...item,
+                result: null as ExtractionResult | null,
+                parseError: null as unknown,
+              };
+            }
+            if (item.stats.size > FILE_SIZE_WARN_THRESHOLD) {
+              logWarn(
+                `Large file may take longer to parse: ${item.filePath} ` +
+                `(${(item.stats.size / 1024 / 1024).toFixed(1)}MB)`,
+              );
+            }
+            const language = detectLanguage(item.filePath, item.content);
+            try {
+              const result = parsePool
+                ? await parsePool.requestParse({
+                    filePath: item.filePath,
+                    content: item.content,
+                    language,
+                    frameworkNames,
+                  })
+                : extractFromSource(
+                    item.filePath,
+                    item.content,
+                    language,
+                    frameworkNames,
+                    globalMacroNames,
+                    globalBodylessMacroNames,
+                    globalMacroDefinitions,
+                  );
+              return { ...item, language, result, parseError: null as unknown };
+            } catch (parseError) {
+              return { ...item, language, result: null as ExtractionResult | null, parseError };
+            }
+          }));
+          parseWallMs += performance.now() - parseStarted;
+
+          const storeStarted = performance.now();
+          for (const item of parsed) {
+            processed++;
+            onProgress?.({
+              phase: 'parsing',
+              current: processed,
+              total,
+              currentFile: item.filePath,
+            });
+            if (item.error || item.content === null || item.stats === null) {
+              const error: ExtractionError = {
+                message: `Failed to read file: ${item.error instanceof Error ? item.error.message : String(item.error)}`,
+                filePath: item.filePath,
+                severity: 'error',
+                code: 'read_error',
+              };
+              syncErrors.push(error);
+              failedFilePaths.add(item.filePath);
+              filesErrored++;
+              log(`skipped ${item.filePath}: ${error.message}`);
+              continue;
+            }
+            if (item.parseError || !item.result) {
+              const error: ExtractionError = {
+                message: item.parseError instanceof Error
+                  ? item.parseError.message
+                  : String(item.parseError ?? 'parse failed'),
+                filePath: item.filePath,
+                severity: 'error',
+                code: 'parse_error',
+              };
+              syncErrors.push(error);
+              failedFilePaths.add(item.filePath);
+              filesErrored++;
+              log(`skipped ${item.filePath}: ${error.message}`);
+              continue;
+            }
+            const language = 'language' in item
+              ? item.language
+              : detectLanguage(item.filePath, item.content);
+            if (item.result.nodes.length > 0 || item.result.errors.length === 0) {
+              this.storeExtractionResult(
+                item.filePath,
+                item.content,
+                language,
+                item.stats,
+                item.result,
+              );
+              changedFilePaths.push(item.filePath);
+            } else {
+              const resultErrors = item.result.errors.length > 0
+                ? item.result.errors
+                : [{
+                    message: 'Parse produced no storable result',
+                    filePath: item.filePath,
+                    severity: 'error' as const,
+                    code: 'parse_error',
+                  }];
+              syncErrors.push(...resultErrors.map((error) => ({
+                ...error,
+                filePath: error.filePath ?? item.filePath,
+              })));
+              failedFilePaths.add(item.filePath);
+              filesErrored++;
+              log(`skipped ${item.filePath}: parse produced no storable result`);
+              continue;
+            }
+            nodesUpdated += item.result.nodes.length;
+            accumulateExtractionTimings(extractionTimingTotals, item.result.timings);
+            if (verbose && item.result.timings) {
+              log(`timing ${item.filePath} ${formatExtractionTimings(item.result.timings)}`);
+            }
+          }
+          storeMs += performance.now() - storeStarted;
+        }
+      } finally {
+        if (parsePool) await parsePool.destroy();
+      }
     }
 
-    // Index changed files
-    const total = filesToIndex.length;
-    for (let i = 0; i < filesToIndex.length; i++) {
-      const filePath = filesToIndex[i]!;
-      onProgress?.({
-        phase: 'parsing',
-        current: i + 1,
-        total,
-        currentFile: filePath,
-      });
-
-      const result = await this.indexFile(filePath);
-      nodesUpdated += result.nodes.length;
-    }
+    log(
+      `phases reconcile=${Math.round(reconcileMs)}ms ` +
+      `framework=${Math.round(frameworkDetectionMs)}ms ` +
+      `macroScan=${Math.round(macroScanMs)}ms ` +
+      `workerSetup=${Math.round(workerSetupMs)}ms read=${Math.round(readMs)}ms ` +
+      `parseWall=${Math.round(parseWallMs)}ms store=${Math.round(storeMs)}ms`,
+    );
+    const extractionTimingSummary = formatExtractionTimings(extractionTimingTotals);
+    if (extractionTimingSummary) log(`extraction totals ${extractionTimingSummary}`);
 
     const failedFiles = [...new Set(this.syncRewireFailures)];
     this.syncRewireFailures = [];
 
     return {
+      complete: syncErrors.length === 0,
       filesChecked,
       filesAdded,
       filesModified,
       filesRemoved,
+      filesErrored,
       nodesUpdated,
       durationMs: Date.now() - startTime,
+      errors: syncErrors,
+      failedFilePaths: failedFilePaths.size > 0 ? [...failedFilePaths] : undefined,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
       failedRewireSourceFiles: failedFiles.length > 0 ? failedFiles : undefined,
       resurrectedReferenceSourceFiles:

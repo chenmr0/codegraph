@@ -100,6 +100,10 @@ export class ParseWorkerPool {
   private nextId = 1;
   private crashCount = 0;
   private destroyed = false;
+  private readyWaiters: Array<{
+    resolve: () => void;
+    reject: (error: Error) => void;
+  }> = [];
 
   private readonly languages: Language[];
   private readonly maxSize: number;
@@ -154,6 +158,15 @@ export class ParseWorkerPool {
       this.spawnOne();
       if (this.workers.size === before) break;
     }
+  }
+
+  /** Wait until every worker started so far has loaded its grammars/context. */
+  waitUntilReady(): Promise<void> {
+    if (this.destroyed) return Promise.reject(new Error('Parse pool destroyed'));
+    if (this.pending.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      this.readyWaiters.push({ resolve, reject });
+    });
   }
 
   requestParse(task: ParseTask): Promise<ExtractionResult> {
@@ -219,6 +232,7 @@ export class ParseWorkerPool {
       if (!this.workers.has(worker)) return;
       this.pending.delete(worker);
       this.idle.push(worker);
+      this.settleReadyWaiters();
       this.drain();
       return;
     }
@@ -262,6 +276,7 @@ export class ParseWorkerPool {
     }
     if (job) this.settle(job, undefined, new Error(message));
     if (this.healthy) this.spawnOne();
+    this.settleReadyWaiters();
     this.drain();
   }
 
@@ -401,6 +416,15 @@ export class ParseWorkerPool {
     else job.resolve(result!);
   }
 
+  private settleReadyWaiters(error?: Error): void {
+    if (!error && this.pending.size > 0) return;
+    const waiters = this.readyWaiters.splice(0);
+    for (const waiter of waiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve();
+    }
+  }
+
   /** Give retry attempts fresh WASM heaps. */
   recycleAll(): void {
     for (const worker of [...this.idle]) this.recycle(worker);
@@ -409,6 +433,7 @@ export class ParseWorkerPool {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.settleReadyWaiters(new Error('parse pool destroyed'));
     const workers = [...this.workers];
     this.workers.clear();
     this.pending.clear();

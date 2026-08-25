@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
-import CodeGraph from '../src/index';
+import CodeGraph, { SyncIncompleteError } from '../src/index';
 
 describe('Sync Module', () => {
   describe('Sync Functionality', () => {
@@ -171,6 +171,68 @@ describe('Sync Module', () => {
         const catchUp = await cg.sync();
         expect(catchUp.filesAdded).toBe(1);
         expect(cg.searchNodes('outsideScope').length).toBeGreaterThan(0);
+      });
+
+      it('continues other files and reports an incomplete sync when one file cannot be read', async () => {
+        const failedPath = path.join(testDir, 'src', 'index.ts');
+        const recoveredSource = `export function recoveredAfterRetry() { return 'retry'; }`;
+        fs.writeFileSync(failedPath, recoveredSource);
+        fs.writeFileSync(
+          path.join(testDir, 'src', 'healthy.ts'),
+          `export function healthyDuringPartialSync() { return 42; }`,
+        );
+
+        let failure: unknown;
+        let removedAfterReconcile = false;
+        try {
+          await cg.sync({
+            onProgress: (progress) => {
+              if (
+                !removedAfterReconcile &&
+                progress.phase === 'parsing' &&
+                progress.current === 0
+              ) {
+                removedAfterReconcile = true;
+                fs.unlinkSync(failedPath);
+              }
+            },
+          });
+        } catch (error) {
+          failure = error;
+        } finally {
+          fs.writeFileSync(failedPath, recoveredSource);
+        }
+
+        expect(failure).toBeInstanceOf(SyncIncompleteError);
+        const incomplete = (failure as SyncIncompleteError).result;
+        expect(incomplete).toEqual(expect.objectContaining({
+          complete: false,
+          filesAdded: 1,
+          filesModified: 1,
+          filesErrored: 1,
+          failedFilePaths: ['src/index.ts'],
+          changedFilePaths: ['src/healthy.ts'],
+        }));
+        expect(incomplete.errors).toEqual([
+          expect.objectContaining({
+            filePath: 'src/index.ts',
+            code: 'read_error',
+            message: expect.stringContaining('Failed to read file'),
+          }),
+        ]);
+
+        // The healthy file committed despite its batch peer failing. The failed
+        // file kept its old graph and remains detectable for the next sync.
+        expect(cg.searchNodes('healthyDuringPartialSync').length).toBeGreaterThan(0);
+        expect(cg.searchNodes('hello').length).toBeGreaterThan(0);
+        expect(cg.searchNodes('recoveredAfterRetry')).toHaveLength(0);
+
+        const retry = await cg.sync();
+        expect(retry.complete).toBe(true);
+        expect(retry.filesModified).toBe(1);
+        expect(retry.filesAdded).toBe(0);
+        expect(cg.searchNodes('recoveredAfterRetry').length).toBeGreaterThan(0);
+        expect(cg.searchNodes('hello')).toHaveLength(0);
       });
     });
   });

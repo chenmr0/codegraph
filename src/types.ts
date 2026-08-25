@@ -265,6 +265,28 @@ export interface ExtractionResult {
 
   /** Extraction duration in milliseconds */
   durationMs: number;
+
+  /**
+   * Optional fine-grained extractor timings. These are diagnostic only and do
+   * not participate in graph identity or persistence.
+   */
+  timings?: ExtractionTimings;
+}
+
+/** Fine-grained parsing timings used by verbose index/sync diagnostics. */
+export interface ExtractionTimings {
+  /** Initial parse plus any offset-preserving adaptive parse retries. */
+  primaryParseMs?: number;
+  /** Primary AST traversal and ordinary symbol/reference extraction. */
+  primaryExtractionMs?: number;
+  /** Declaration-macro scan, argument substitution and recursive expansion. */
+  declarationMacroExpansionMs?: number;
+  /** Construction of the sparse, context-preserving recovery source. */
+  declarationMacroRecoverySourceMs?: number;
+  /** Isolated tree-sitter extraction of the recovery source. */
+  declarationMacroAuxParseMs?: number;
+  /** Filtering and merging recovered nodes/contains edges. */
+  declarationMacroMergeMs?: number;
 }
 
 /**

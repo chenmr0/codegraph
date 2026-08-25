@@ -12,6 +12,7 @@ import {
   Edge,
   NodeKind,
   ExtractionResult,
+  ExtractionTimings,
   ExtractionError,
   UnresolvedReference,
 } from '../types';
@@ -717,6 +718,7 @@ export class TreeSitterExtractor {
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   private errors: ExtractionError[] = [];
+  private timings: ExtractionTimings = {};
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
   private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
@@ -781,6 +783,7 @@ export class TreeSitterExtractor {
    */
   extract(): ExtractionResult {
     const startTime = Date.now();
+    this.timings = {};
 
     if (!isLanguageSupported(this.language)) {
       return {
@@ -868,6 +871,7 @@ export class TreeSitterExtractor {
         this.xMacroConstructs = xmacro.constructs;
       }
 
+      const primaryParseStarted = performance.now();
       // Optional offset-preserving source transform for grammar gaps. Most
       // languages use the historical `always` strategy. C/C++ uses `on-error`:
       // parse the original bytes first, leave a healthy tree completely
@@ -987,7 +991,9 @@ export class TreeSitterExtractor {
       if (!this.tree) {
         throw new Error('Parser returned null tree');
       }
+      this.timings.primaryParseMs = performance.now() - primaryParseStarted;
 
+      const primaryExtractionStarted = performance.now();
       // Create file node representing the source file
       const fileNode: Node = {
         id: `file:${this.filePath}`,
@@ -1036,6 +1042,7 @@ export class TreeSitterExtractor {
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
+      this.timings.primaryExtractionMs = performance.now() - primaryExtractionStarted;
 
       this.recoverDeclarationMacroNodes();
     } catch (error) {
@@ -1067,6 +1074,7 @@ export class TreeSitterExtractor {
       unresolvedReferences: this.unresolvedReferences,
       errors: this.errors,
       durationMs: Date.now() - startTime,
+      timings: this.timings,
     };
   }
 
@@ -1493,17 +1501,27 @@ export class TreeSitterExtractor {
       return;
     }
 
+    const expansionStarted = performance.now();
     const expanded = expandDeclarationMacros(
       this.originalSource,
       this.globalMacroDefinitions,
       (line, column) => this.isDeclarationMacroScope(line, column),
+      (line, column) => {
+        const sourceOffset = this.originalLineStart(line) + column;
+        return !this.isInsideLexicalExecutableBody(sourceOffset);
+      },
     );
+    this.timings.declarationMacroExpansionMs =
+      performance.now() - expansionStarted;
     if (expanded.source === this.originalSource || expanded.invocationLines.size === 0) return;
 
+    const recoverySourceStarted = performance.now();
     const recoverySource = this.buildDeclarationMacroRecoverySource(
       expanded.source,
       expanded.invocationLines,
     );
+    this.timings.declarationMacroRecoverySourceMs =
+      performance.now() - recoverySourceStarted;
 
     // All primary-tree work is complete at this point. Release it before any
     // auxiliary parse so no nested extraction shares a live tree with another
@@ -1512,9 +1530,14 @@ export class TreeSitterExtractor {
 
     // Deliberately omit macroDefinitions to prevent recursive auxiliary parses.
     // A one-shot Parser is never shared with the worker's long-lived parser.
+    const auxiliaryParseStarted = performance.now();
     const recovered = this.extractDeclarationRecoverySource(recoverySource);
+    this.timings.declarationMacroAuxParseMs =
+      performance.now() - auxiliaryParseStarted;
     const recoveredNodes = recovered.nodes;
     const recoveredEdges = recovered.edges;
+
+    const mergeStarted = performance.now();
 
     const recoverableKinds = new Set<NodeKind>([
       'class', 'struct', 'enum', 'enum_member', 'interface', 'trait',
@@ -1553,7 +1576,10 @@ export class TreeSitterExtractor {
       existingIds.add(node.id);
       generatedIds.add(node.id);
     }
-    if (generatedIds.size === 0) return;
+    if (generatedIds.size === 0) {
+      this.timings.declarationMacroMergeMs = performance.now() - mergeStarted;
+      return;
+    }
 
     const existingEdgeKeys = new Set(
       this.edges.map(edge => `${edge.kind}\0${edge.source}\0${edge.target}`),
@@ -1566,6 +1592,7 @@ export class TreeSitterExtractor {
       this.edges.push(edge);
       existingEdgeKeys.add(key);
     }
+    this.timings.declarationMacroMergeMs = performance.now() - mergeStarted;
   }
 
   /**
