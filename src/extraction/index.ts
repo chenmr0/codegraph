@@ -41,7 +41,10 @@ import {
   type StoreBundle,
   finalizeStoreBundle,
 } from './store-writer';
-import { replaceWithDeclarationMacroRecoverySkipped } from './diagnostics';
+import {
+  hasDeclarationMacroRecoverySkipped,
+  replaceWithDeclarationMacroRecoverySkipped,
+} from './diagnostics';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -1985,9 +1988,20 @@ export class ExtractionOrchestrator {
     filePath = canonicalFilePath(this.rootDir, filePath);
     const contentHash = hashContent(content);
 
-    // Check if file already exists and hasn't changed
+    // Check if file already exists and hasn't changed. A base-only fallback
+    // deliberately stores the current content hash together with an incomplete
+    // declaration-macro diagnostic. The next full parse must be allowed to
+    // replace that record even though the source bytes are identical.
     const existingFile = this.queries.getFileByPath(filePath);
-    if (!options?.force && existingFile && existingFile.contentHash === contentHash) {
+    const needsDeclarationMacroRecovery = hasDeclarationMacroRecoverySkipped(
+      existingFile?.errors,
+    );
+    if (
+      !options?.force &&
+      existingFile &&
+      existingFile.contentHash === contentHash &&
+      !needsDeclarationMacroRecovery
+    ) {
       return; // No changes
     }
 
@@ -2269,13 +2283,18 @@ export class ExtractionOrchestrator {
       }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
+      const needsDeclarationMacroRecovery = hasDeclarationMacroRecoverySkipped(
+        tracked?.errors,
+      );
 
       // Cheap pre-filter: an already-indexed file whose size AND mtime both match
       // the DB is unchanged — skip it without reading or hashing. (A content
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked) {
+      // A base-only file is intentionally exempt: unchanged source bytes do not
+      // mean its graph coverage is complete, so a later sync must retry it.
+      if (tracked && !needsDeclarationMacroRecovery) {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
@@ -2300,7 +2319,10 @@ export class ExtractionOrchestrator {
       if (!tracked) {
         filesToIndex.push(filePath);
         filesAdded++;
-      } else if (tracked.contentHash !== contentHash) {
+      } else if (
+        needsDeclarationMacroRecovery ||
+        tracked.contentHash !== contentHash
+      ) {
         filesToIndex.push(filePath);
         filesModified++;
       }

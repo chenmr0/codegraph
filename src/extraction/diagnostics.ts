@@ -14,6 +14,13 @@ export function isDeclarationMacroRecoverySkipped(
   return diagnostic.code === DECLARATION_MACRO_RECOVERY_SKIPPED_CODE;
 }
 
+/** True when a persisted file record still needs a full macro-recovery retry. */
+export function hasDeclarationMacroRecoverySkipped(
+  diagnostics: ReadonlyArray<Pick<ExtractionError, 'code'>> | undefined,
+): boolean {
+  return diagnostics?.some(isDeclarationMacroRecoverySkipped) ?? false;
+}
+
 /**
  * Replace a retryable whole-file failure with the narrower coverage diagnostic
  * that is true after a base-only retry succeeds.

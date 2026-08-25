@@ -343,7 +343,8 @@ function getIncompleteIndexHints(diagnostics: IndexDiagnostic[]): string[] {
   if (codes.has(DECLARATION_MACRO_RECOVERY_SKIPPED_CODE)) {
     hints.push(
       'Base AST symbols were indexed for the reported files, but declarations generated only ' +
-      'by macros may be missing; re-run "codegraph index" to retry full declaration-macro recovery.'
+      'by macros may be missing; run "codegraph sync" to retry full declaration-macro recovery ' +
+      'for the affected files without rebuilding the whole index.'
     );
   }
   if (

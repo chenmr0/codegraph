@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import type { ExtractionError } from '../src/types';
+import type { QueryBuilder } from '../src/db/queries';
 import {
   DECLARATION_MACRO_RECOVERY_SKIPPED_CODE,
   collectPersistedIndexDiagnostics,
@@ -142,6 +143,139 @@ describe('base-only index completeness diagnostics', () => {
       });
     } finally {
       orchestrator.indexAll = realIndexAll;
+      cg.close();
+    }
+  });
+
+  it('automatically retries an unchanged base-only file during sync and clears incompleteness', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-base-only-sync-'));
+    tempDirs.push(dir);
+    const sourcePath = path.join(dir, 'recovery.cpp');
+    fs.writeFileSync(sourcePath, [
+      '#define DECLARE_RECORD(Name) struct Name { int generated_field; };',
+      'DECLARE_RECORD(RecoveredRecord)',
+    ].join('\n'));
+    const cg = CodeGraph.initSync(dir, {
+      config: { include: ['**/*.cpp'], exclude: [] },
+    });
+
+    try {
+      await cg.indexAll();
+      const queries = (cg as unknown as { queries: QueryBuilder }).queries;
+      const tracked = queries.getFileByPath('recovery.cpp');
+      expect(tracked).not.toBeNull();
+      expect(cg.searchNodes('RecoveredRecord').length).toBeGreaterThan(0);
+
+      const degradation: ExtractionError = {
+        severity: 'warning',
+        code: DECLARATION_MACRO_RECOVERY_SKIPPED_CODE,
+        filePath: 'recovery.cpp',
+        message: 'Declaration-macro recovery was skipped for this test file.',
+      };
+      // Simulate the reduced graph left by a base-only retry: the current
+      // source hash is retained, while a macro-generated declaration is absent.
+      queries.deleteNodesByFile('recovery.cpp');
+      queries.upsertFile({ ...tracked!, nodeCount: 0, errors: [degradation] });
+      queries.setMetadata('index_completeness', 'incomplete');
+      queries.setMetadata('index_diagnostics', JSON.stringify([degradation]));
+      expect(cg.searchNodes('RecoveredRecord')).toHaveLength(0);
+
+      const result = await cg.sync();
+
+      expect(result.complete).toBe(true);
+      expect(result.filesModified).toBe(1);
+      expect(result.changedFilePaths).toEqual(['recovery.cpp']);
+      expect(cg.searchNodes('RecoveredRecord').length).toBeGreaterThan(0);
+      expect(cg.searchNodes('generated_field').length).toBeGreaterThan(0);
+      expect(queries.getFileByPath('recovery.cpp')?.errors ?? []).not.toContainEqual(
+        expect.objectContaining({ code: DECLARATION_MACRO_RECOVERY_SKIPPED_CODE }),
+      );
+      expect(cg.getIndexCompleteness()).toEqual({
+        status: 'complete',
+        diagnostics: [],
+      });
+
+      const next = await cg.sync();
+      expect(next.filesModified).toBe(0);
+      expect(next.changedFilePaths).toBeUndefined();
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('lets a plain index replace an unchanged base-only file record', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-base-only-index-'));
+    tempDirs.push(dir);
+    fs.writeFileSync(
+      path.join(dir, 'recovery.ts'),
+      'export function recoveredByIndex() { return 7; }',
+    );
+    const cg = CodeGraph.initSync(dir, {
+      config: { include: ['**/*.ts'], exclude: [] },
+    });
+
+    try {
+      await cg.indexAll();
+      const queries = (cg as unknown as { queries: QueryBuilder }).queries;
+      const tracked = queries.getFileByPath('recovery.ts');
+      expect(tracked).not.toBeNull();
+      const degradation: ExtractionError = {
+        severity: 'warning',
+        code: DECLARATION_MACRO_RECOVERY_SKIPPED_CODE,
+        filePath: 'recovery.ts',
+        message: 'Declaration-macro recovery was skipped for this test file.',
+      };
+      queries.upsertFile({ ...tracked!, errors: [degradation] });
+
+      const result = await cg.indexAll();
+
+      expect(result.complete).toBe(true);
+      expect(queries.getFileByPath('recovery.ts')?.errors ?? []).not.toContainEqual(
+        expect.objectContaining({ code: DECLARATION_MACRO_RECOVERY_SKIPPED_CODE }),
+      );
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('preserves unrelated incomplete diagnostics after automatic recovery', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-base-only-preserve-'));
+    tempDirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'recovery.ts'), 'export const recovered = true;');
+    const cg = CodeGraph.initSync(dir, {
+      config: { include: ['**/*.ts'], exclude: [] },
+    });
+
+    try {
+      await cg.indexAll();
+      const queries = (cg as unknown as { queries: QueryBuilder }).queries;
+      const tracked = queries.getFileByPath('recovery.ts');
+      expect(tracked).not.toBeNull();
+      const degradation: ExtractionError = {
+        severity: 'warning',
+        code: DECLARATION_MACRO_RECOVERY_SKIPPED_CODE,
+        filePath: 'recovery.ts',
+        message: 'Declaration-macro recovery was skipped for this test file.',
+      };
+      const unrelated: ExtractionError = {
+        severity: 'error',
+        code: 'synthesis_failed',
+        message: 'Synthetic edge coverage is incomplete.',
+      };
+      queries.upsertFile({ ...tracked!, errors: [degradation] });
+      queries.setMetadata('index_completeness', 'incomplete');
+      queries.setMetadata(
+        'index_diagnostics',
+        JSON.stringify([degradation, unrelated]),
+      );
+
+      await cg.sync();
+
+      expect(cg.getIndexCompleteness()).toEqual({
+        status: 'incomplete',
+        diagnostics: [unrelated],
+      });
+    } finally {
       cg.close();
     }
   });

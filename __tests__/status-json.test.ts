@@ -143,6 +143,7 @@ describe('codegraph status --json — CI fields (#329)', () => {
     expect(status.status).toBe(0);
     expect(output).toContain('Base AST symbols were indexed');
     expect(output).toContain('retry full declaration-macro recovery');
+    expect(output).toContain('codegraph sync');
     expect(output).not.toContain('Fix the reported file errors');
   });
 });

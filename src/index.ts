@@ -836,6 +836,16 @@ export class CodeGraph {
           await this.db.runMaintenance();
         }
 
+        // A successful sync may have replaced (or deleted) files that were
+        // previously stored through the base-only fallback. Reconcile those
+        // file-scoped diagnostics so `codegraph status` stops reporting stale
+        // incompleteness as soon as full declaration-macro recovery succeeds.
+        // Keep metadata unchanged after a partial sync: its pending failures
+        // still need a conservative incomplete signal.
+        if (result.complete !== false) {
+          this.refreshDeclarationMacroRecoveryCompleteness();
+        }
+
         if (result.complete === false) {
           throw new SyncIncompleteError(result);
         }
@@ -979,7 +989,7 @@ export class CodeGraph {
     return { version, extractionVersion: Number.isFinite(parsed) ? parsed : null };
   }
 
-  /** Persisted completeness of the last full index, including visible reasons. */
+  /** Persisted completeness of the current index, including visible reasons. */
   getIndexCompleteness(): {
     status: 'complete' | 'incomplete' | 'unknown';
     diagnostics: Array<{ message: string; severity: string; code?: string; filePath?: string }>;
@@ -1155,6 +1165,41 @@ export class CodeGraph {
    */
   getNodesByName(name: string): Node[] {
     return this.queries.getNodesByName(name);
+  }
+
+  /**
+   * Remove persisted declaration-macro degradation diagnostics whose backing
+   * file record has now been fully restored or deleted. Other full-index
+   * diagnostics are preserved verbatim; a sync must never erase an unrelated
+   * synthesis, framework, or whole-file coverage warning.
+   */
+  private refreshDeclarationMacroRecoveryCompleteness(): void {
+    try {
+      const completeness = this.getIndexCompleteness();
+      if (!completeness.diagnostics.some(isDeclarationMacroRecoverySkipped)) {
+        return;
+      }
+
+      const diagnostics = completeness.diagnostics.flatMap((diagnostic) => {
+        if (!isDeclarationMacroRecoverySkipped(diagnostic)) return [diagnostic];
+        if (!diagnostic.filePath) return [diagnostic];
+
+        const currentFile = this.queries.getFileByPath(diagnostic.filePath);
+        const currentDiagnostic = currentFile?.errors?.find(
+          isDeclarationMacroRecoverySkipped,
+        );
+        return currentDiagnostic ? [currentDiagnostic] : [];
+      });
+
+      this.queries.setMetadata('index_diagnostics', JSON.stringify(diagnostics));
+      this.queries.setMetadata(
+        'index_completeness',
+        diagnostics.length === 0 ? 'complete' : 'incomplete',
+      );
+    } catch {
+      // Completeness metadata is advisory. The recovered graph and file-level
+      // diagnostics remain authoritative if metadata refresh itself fails.
+    }
   }
 
   /**
