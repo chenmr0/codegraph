@@ -22,7 +22,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, EXTENSION_MAP } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath, canonicalFilePath, clearCanonicalCache } from '../utils';
@@ -30,11 +30,23 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { ParseWorkerPool, resolveParsePoolSize } from './parse-pool';
+import type { CppMacroDefinition } from './declaration-macros';
 import {
-  scanCppMacroDefinitions,
-  selectUnambiguousCppMacroDefinitions,
-  type CppMacroDefinition,
-} from './declaration-macros';
+  CPP_MACRO_CONTEXT_PENDING_METADATA_KEY,
+  CPP_MACRO_MANIFEST_METADATA_KEY,
+  CPP_MACRO_MANIFEST_READY_METADATA_KEY,
+  buildCppMacroContext,
+  cppMacroManifestFromMap,
+  cppMacroManifestToMap,
+  diffCppMacroContexts,
+  isCppMacroContributionEmpty,
+  parseCppMacroManifest,
+  scanCppMacroFileContribution,
+  serializeCppMacroManifest,
+  sourceReferencesAnyCppMacro,
+  type CppMacroFileContribution,
+  type CppMacroManifest,
+} from './macro-context';
 import { isRetryableParseWorkerError } from './wasm-errors';
 import {
   StoreWriter,
@@ -59,6 +71,14 @@ const FILE_IO_BATCH_SIZE = 10;
  * the daemon liveness heartbeat even though the sync itself is healthy.
  */
 const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
+
+function isCppMacroLanguage(language: Language): boolean {
+  return language === 'c' || language === 'cpp' || language === 'objc';
+}
+
+function isCppMacroFilePath(filePath: string): boolean {
+  return isCppMacroLanguage(detectLanguage(filePath));
+}
 
 const EXTRACTION_TIMING_KEYS: ReadonlyArray<keyof ExtractionTimings> = [
   'primaryParseMs',
@@ -798,6 +818,12 @@ export class ExtractionOrchestrator {
    */
   private globalMacroDefinitions: CppMacroDefinition[] | null = null;
   /**
+   * Per-file inputs from which the three effective global macro views above
+   * were derived. Persisting this manifest lets sync update only changed macro
+   * contributors while still comparing semantics across process restarts.
+   */
+  private globalMacroManifest: CppMacroManifest | null = null;
+  /**
    * Accumulates source file paths of nodes whose incoming edges couldn't be
    * re-wired during a sync pass. Populated by storeExtractionResult, consumed
    * and cleared by sync().
@@ -903,69 +929,65 @@ export class ExtractionOrchestrator {
    * Cached on the orchestrator for the lifetime of the run. Call with
    * the scanned file list to avoid re-scanning the directory.
    */
-  private async ensureGlobalMacroNames(files?: string[]): Promise<Set<string>> {
-    if (this.globalMacroNames !== null) return this.globalMacroNames;
+  private installGlobalMacroManifest(manifest: CppMacroManifest): void {
+    const context = buildCppMacroContext(manifest);
+    this.globalMacroManifest = manifest;
+    this.globalMacroNames = context.names;
+    this.globalBodylessMacroNames = context.bodylessNames;
+    this.globalMacroDefinitions = context.definitions;
+  }
 
-    const fileList = files ?? scanDirectory(this.rootDir);
-    const macroRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)/gm;
-    const names = new Set<string>();
-    // Bodyless object-like macros: `#define NAME` with an EMPTY body (only
-    // whitespace/comments follow on the line), and NOT function-like
-    // (`NAME(` immediately after — `(?!\s*\()` rejects both `NAME(` and
-    // the object-with-body form `NAME (x)`). These expand to nothing and are
-    // blanked by preParse so prefix-attribute macros like `SAFE`/`BORROW` in
-    // `typedef SAFE VOS_BOOL (*FnPtr)(...)` don't push tree-sitter into the
-    // error-recovery path that buries the real name.
-    const bodylessRegex = /^\s*#\s*define\s+([A-Za-z_]\w*)(?!\s*\()(?:[ \t]*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/[ \t]*)?)?[ \t]*$/gm;
-    const bodyless = new Set<string>();
-    const definitions: CppMacroDefinition[] = [];
+  private clearGlobalMacroContext(): void {
+    this.globalMacroNames = null;
+    this.globalBodylessMacroNames = null;
+    this.globalMacroDefinitions = null;
+    this.globalMacroManifest = null;
+  }
 
-    // Filter to C/C++/ObjC files — only these have the preprocessor and
-    // the macro-misparse-as-function problem.
-    const cLikeFiles = fileList.filter((f) => {
-      const ext = f.slice(f.lastIndexOf('.')).toLowerCase();
-      const lang = EXTENSION_MAP[ext];
-      return lang === 'c' || lang === 'cpp' || lang === 'objc';
-    });
+  /**
+   * Build the per-file macro manifest from source. This is the full-scan path
+   * used by indexAll, by old indexes that predate manifest persistence, and as
+   * the recovery path after an interrupted macro-dependent sync.
+   */
+  private async scanGlobalMacroManifest(files?: string[]): Promise<CppMacroManifest> {
+    const fileList = files ?? await scanDirectoryAsync(this.rootDir);
+    const cLikeFiles = fileList.filter(isCppMacroFilePath);
+    const contributions = new Map<string, CppMacroFileContribution>();
 
     // Batch reads to overlap I/O. 50 files per batch balances throughput
-    // against memory for very large projects.
+    // against memory for very large projects. Only files that actually
+    // contribute a macro are retained in the persisted manifest.
     const BATCH = 50;
     for (let i = 0; i < cLikeFiles.length; i += BATCH) {
       const batch = cLikeFiles.slice(i, i + BATCH);
       const contents = await Promise.all(
         batch.map(async (relPath) => {
           const full = validatePathWithinRoot(this.rootDir, relPath);
-          if (!full) return null;
+          if (!full) return { relPath, content: null as string | null };
           try {
-            return await fsp.readFile(full, 'utf-8');
+            return { relPath, content: await fsp.readFile(full, 'utf-8') };
           } catch {
-            return null;
+            return { relPath, content: null as string | null };
           }
         })
       );
-      for (const content of contents) {
-        if (!content) continue;
-        let m: RegExpExecArray | null;
-        macroRegex.lastIndex = 0;
-        while ((m = macroRegex.exec(content)) !== null) {
-          const name = m[1];
-          if (name) names.add(name);
+      for (const { relPath, content } of contents) {
+        if (content === null) continue;
+        const contribution = scanCppMacroFileContribution(content);
+        if (!isCppMacroContributionEmpty(contribution)) {
+          contributions.set(relPath, contribution);
         }
-        let bm: RegExpExecArray | null;
-        bodylessRegex.lastIndex = 0;
-        while ((bm = bodylessRegex.exec(content)) !== null) {
-          const name = bm[1];
-          if (name) bodyless.add(name);
-        }
-        definitions.push(...scanCppMacroDefinitions(content));
       }
     }
 
-    this.globalMacroNames = names;
-    this.globalBodylessMacroNames = bodyless;
-    this.globalMacroDefinitions = selectUnambiguousCppMacroDefinitions(definitions);
-    return names;
+    return cppMacroManifestFromMap(contributions);
+  }
+
+  private async ensureGlobalMacroNames(files?: string[]): Promise<Set<string>> {
+    if (this.globalMacroNames !== null) return this.globalMacroNames;
+    const manifest = await this.scanGlobalMacroManifest(files);
+    this.installGlobalMacroManifest(manifest);
+    return this.globalMacroNames!;
   }
 
   /**
@@ -1046,9 +1068,7 @@ export class ExtractionOrchestrator {
     // defined in header A, used in file B → tree-sitter has no
     // preprocessor and would otherwise emit a fake function node in B).
     const macroScanStarted = performance.now();
-    this.globalMacroNames = null;
-    this.globalBodylessMacroNames = null;
-    this.globalMacroDefinitions = null;
+    this.clearGlobalMacroContext();
     const globalMacroNames = await this.ensureGlobalMacroNames(files);
     const globalBodylessMacroNames = this.globalBodylessMacroNames!;
     const globalMacroDefinitions = this.globalMacroDefinitions!;
@@ -1762,6 +1782,24 @@ export class ExtractionOrchestrator {
     const extractionTimingSummary = formatExtractionTimings(extractionTimingTotals);
     if (extractionTimingSummary) log(`Extraction totals: ${extractionTimingSummary}`);
 
+    // Publish the macro inputs only after the extraction phase has reached its
+    // normal terminal point. A killed/aborted build must never make a later
+    // sync believe the old graph was produced with a newer macro context.
+    if (this.globalMacroManifest) {
+      try {
+        this.queries.setMetadata(
+          CPP_MACRO_MANIFEST_METADATA_KEY,
+          serializeCppMacroManifest(this.globalMacroManifest),
+        );
+        this.queries.setMetadata(CPP_MACRO_MANIFEST_READY_METADATA_KEY, '1');
+        this.queries.setMetadata(CPP_MACRO_CONTEXT_PENDING_METADATA_KEY, '0');
+      } catch (error) {
+        logDebug('Could not persist C/C++ macro manifest after full index', {
+          error: String(error),
+        });
+      }
+    }
+
     return {
       success: filesIndexed > 0 || errors.filter((e) => e.severity === 'error').length === 0,
       filesIndexed,
@@ -2173,6 +2211,29 @@ export class ExtractionOrchestrator {
     // run against a file whose old index was deliberately retained.
     const changedFilePaths: string[] = [];
     const resurrectedReferenceSourceFiles = new Set<string>();
+    // Actual source-byte changes are kept separately from files that are being
+    // retried for incomplete declaration-macro recovery. Only the former can
+    // change their contribution to the project-wide macro context.
+    const changedSourceContents = new Map<string, string>();
+    const removedCppMacroFiles = new Set<string>();
+    // The ready flag is intentionally separate and tiny. A zero-change sync
+    // can establish that a versioned manifest exists without loading and
+    // JSON-parsing its potentially large payload from SQLite.
+    const macroManifestWasReady = this.queries.getMetadata(
+      CPP_MACRO_MANIFEST_READY_METADATA_KEY,
+    ) === '1';
+    const macroContextWasPending = this.queries.getMetadata(
+      CPP_MACRO_CONTEXT_PENDING_METADATA_KEY,
+    ) === '1';
+    let macroPendingMarked = macroContextWasPending;
+    const markMacroContextPending = (): void => {
+      if (macroPendingMarked) return;
+      // This marker is written before any macro-dependent graph replacement.
+      // If the process dies later, the next process performs a full source scan
+      // instead of trusting a manifest whose graph update may be only partial.
+      this.queries.setMetadata(CPP_MACRO_CONTEXT_PENDING_METADATA_KEY, '1');
+      macroPendingMarked = true;
+    };
     this.syncRewireFailures = [];
     const log = verbose
       ? (message: string) => console.log(`[sync] ${message}`)
@@ -2252,6 +2313,10 @@ export class ExtractionOrchestrator {
     let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
+        if (isCppMacroLanguage(tracked.language)) {
+          markMacroContextPending();
+          removedCppMacroFiles.add(tracked.path);
+        }
         // Deleting the target cascades its incoming edges even though callers
         // in other files are unchanged. Preserve stamped resolution edges as
         // pending refs so this same sync can rebind them or park them for a
@@ -2318,19 +2383,156 @@ export class ExtractionOrchestrator {
 
       if (!tracked) {
         filesToIndex.push(filePath);
+        changedSourceContents.set(filePath, content);
         filesAdded++;
       } else if (
         needsDeclarationMacroRecovery ||
         tracked.contentHash !== contentHash
       ) {
         filesToIndex.push(filePath);
+        if (tracked.contentHash !== contentHash) {
+          changedSourceContents.set(filePath, content);
+        }
         filesModified++;
       }
     }
 
     const reconcileMs = performance.now() - reconcileStarted;
-    const total = filesToIndex.length;
     let macroScanMs = 0;
+    let macroManifestCandidate: CppMacroManifest | null = null;
+    let macroManifestCandidateSerialized: string | null = null;
+    let macroSemanticsChanged = false;
+    let macroInvalidatedFiles = 0;
+    const macroInvalidatedFilePaths = new Set<string>();
+
+    const filesToIndexSet = new Set(filesToIndex);
+    const enqueueMacroInvalidatedFile = (filePath: string): void => {
+      if (filesToIndexSet.has(filePath)) return;
+      filesToIndexSet.add(filePath);
+      filesToIndex.push(filePath);
+      macroInvalidatedFilePaths.add(filePath);
+      macroInvalidatedFiles++;
+    };
+
+    const changedCppMacroSources = [...changedSourceContents.entries()].filter(
+      ([filePath]) => isCppMacroFilePath(filePath),
+    );
+    const projectHasCppFiles =
+      currentFiles.some(isCppMacroFilePath) ||
+      (!macroManifestWasReady && this.queries.getAllFiles().some((file) =>
+        isCppMacroLanguage(file.language)
+      ));
+    const needsPersistedMacroManifest =
+      macroContextWasPending ||
+      changedCppMacroSources.length > 0 ||
+      removedCppMacroFiles.size > 0 ||
+      filesToIndex.some(isCppMacroFilePath) ||
+      (!macroManifestWasReady && projectHasCppFiles);
+    const persistedMacroManifest = needsPersistedMacroManifest
+      ? (this.globalMacroManifest ?? parseCppMacroManifest(
+          this.queries.getMetadata(CPP_MACRO_MANIFEST_METADATA_KEY),
+        ))
+      : null;
+    const hasPersistedMacroManifest = persistedMacroManifest !== null;
+    const needsMacroManifestWork =
+      macroContextWasPending ||
+      changedCppMacroSources.length > 0 ||
+      removedCppMacroFiles.size > 0 ||
+      (!macroManifestWasReady && projectHasCppFiles);
+
+    if (needsMacroManifestWork) {
+      const macroStarted = performance.now();
+      let forceAllCppConsumers = false;
+
+      if (!hasPersistedMacroManifest || macroContextWasPending) {
+        // Missing manifests predate this correctness contract. Pending means a
+        // previous process may have updated some file rows without publishing
+        // the matching context, so reconstruct exclusively from current bytes.
+        this.clearGlobalMacroContext();
+        macroManifestCandidate = await this.scanGlobalMacroManifest();
+        forceAllCppConsumers = !hasPersistedMacroManifest;
+      } else {
+        const contributions = cppMacroManifestToMap(persistedMacroManifest);
+        for (const filePath of removedCppMacroFiles) contributions.delete(filePath);
+        for (const [filePath, content] of changedCppMacroSources) {
+          const contribution = scanCppMacroFileContribution(content);
+          if (isCppMacroContributionEmpty(contribution)) contributions.delete(filePath);
+          else contributions.set(filePath, contribution);
+        }
+        macroManifestCandidate = cppMacroManifestFromMap(contributions);
+      }
+
+      macroManifestCandidateSerialized = serializeCppMacroManifest(
+        macroManifestCandidate,
+      );
+      const macroManifestChanged = !persistedMacroManifest ||
+        macroManifestCandidateSerialized !== serializeCppMacroManifest(
+          persistedMacroManifest,
+        );
+      // Even a semantically neutral contribution change matters to a future
+      // diff (for example, adding an identical duplicate definition and later
+      // removing the original). Protect publication of that structural state
+      // with the same crash marker used for consumer invalidation.
+      if (macroManifestChanged) markMacroContextPending();
+
+      this.installGlobalMacroManifest(macroManifestCandidate);
+      const currentMacroContext = buildCppMacroContext(macroManifestCandidate);
+      let affectedMacroNames = new Set<string>();
+      if (persistedMacroManifest) {
+        affectedMacroNames = diffCppMacroContexts(
+          buildCppMacroContext(persistedMacroManifest),
+          currentMacroContext,
+        ).affectedNames;
+      }
+      macroSemanticsChanged = forceAllCppConsumers || affectedMacroNames.size > 0;
+
+      if (macroSemanticsChanged) {
+        markMacroContextPending();
+        const allCppFiles = (await scanDirectoryAsync(this.rootDir)).filter(
+          isCppMacroFilePath,
+        );
+        for (let index = 0; index < allCppFiles.length; index++) {
+          const filePath = allCppFiles[index]!;
+          if (filesToIndexSet.has(filePath)) continue;
+          if (forceAllCppConsumers) {
+            enqueueMacroInvalidatedFile(filePath);
+          } else {
+            const fullPath = validatePathWithinRoot(this.rootDir, filePath);
+            if (!fullPath) {
+              enqueueMacroInvalidatedFile(filePath);
+              continue;
+            }
+            try {
+              const content = await fsp.readFile(fullPath, 'utf-8');
+              if (sourceReferencesAnyCppMacro(content, affectedMacroNames)) {
+                enqueueMacroInvalidatedFile(filePath);
+              }
+            } catch {
+              // An unreadable candidate cannot be proven unaffected. Queue it
+              // so the normal per-file error path marks the sync incomplete.
+              enqueueMacroInvalidatedFile(filePath);
+            }
+          }
+          if ((index + 1) % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+        }
+        log(
+          `macro context changed; invalidated ${macroInvalidatedFiles} unchanged ` +
+          `C/C++/ObjC consumer(s)`
+        );
+      }
+      macroScanMs = performance.now() - macroStarted;
+    } else if (
+      persistedMacroManifest &&
+      filesToIndex.some(isCppMacroFilePath)
+    ) {
+      // Base-only recovery retries and other forced C-family parses still need
+      // the exact context that produced the last complete graph.
+      this.installGlobalMacroManifest(persistedMacroManifest);
+    }
+
+    const total = filesToIndex.length;
     let frameworkDetectionMs = 0;
     let workerSetupMs = 0;
     let readMs = 0;
@@ -2359,7 +2561,7 @@ export class ExtractionOrchestrator {
         globalMacroNames = await this.ensureGlobalMacroNames();
         globalBodylessMacroNames = this.globalBodylessMacroNames ?? new Set<string>();
         globalMacroDefinitions = this.globalMacroDefinitions ?? [];
-        macroScanMs = performance.now() - macroStarted;
+        macroScanMs += performance.now() - macroStarted;
       }
 
       const setupStarted = performance.now();
@@ -2512,6 +2714,7 @@ export class ExtractionOrchestrator {
                 language,
                 item.stats,
                 item.result,
+                macroInvalidatedFilePaths.has(item.filePath) ? { force: true } : undefined,
               );
               changedFilePaths.push(item.filePath);
             } else {
@@ -2554,6 +2757,29 @@ export class ExtractionOrchestrator {
     );
     const extractionTimingSummary = formatExtractionTimings(extractionTimingTotals);
     if (extractionTimingSummary) log(`extraction totals ${extractionTimingSummary}`);
+
+    if (
+      macroManifestCandidate &&
+      (!macroSemanticsChanged || syncErrors.length === 0)
+    ) {
+      try {
+        this.queries.setMetadata(
+          CPP_MACRO_MANIFEST_METADATA_KEY,
+          macroManifestCandidateSerialized ?? serializeCppMacroManifest(
+            macroManifestCandidate,
+          ),
+        );
+        this.queries.setMetadata(CPP_MACRO_MANIFEST_READY_METADATA_KEY, '1');
+        this.queries.setMetadata(CPP_MACRO_CONTEXT_PENDING_METADATA_KEY, '0');
+      } catch (error) {
+        // The pending marker (when semantics changed) deliberately remains set;
+        // a later process will rebuild from source instead of trusting a graph
+        // whose manifest publication did not finish.
+        logDebug('Could not persist updated C/C++ macro manifest', {
+          error: String(error),
+        });
+      }
+    }
 
     const failedFiles = [...new Set(this.syncRewireFailures)];
     this.syncRewireFailures = [];
