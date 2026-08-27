@@ -1154,6 +1154,139 @@ describe('Installer targets — partial-state idempotency', () => {
     // Both events emptied → the whole `hooks` object is removed.
     expect(after.hooks).toBeUndefined();
   });
+
+  it('codeagent: install writes the reminder extension and registers it in extensions.json', () => {
+    const codeagent = getTarget('codeagent')!;
+    const first = codeagent.install('global', { autoAllow: true });
+    const extension = path.join(tmpHome, '.cac', 'extensions', 'codegraph-reminder.ts');
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+
+    expect(fs.existsSync(extension)).toBe(true);
+    const body = fs.readFileSync(extension, 'utf-8');
+    expect(body).toContain('CODEGRAPH_CODEAGENT_REMINDER_EXTENSION');
+    expect(body).toContain('executeAfter');
+    expect(body).toContain('messagesTransform');
+    expect(body).toContain('mcp__codegraph__');
+    expect(body).toContain('existsSync(join(root, ".codegraph"))');
+    expect(body).toContain('CODEGRAPH_DYNAMIC_SYSTEM_REMINDER');
+    expect(body).not.toContain('output.output +=');
+    expect(body).toContain('优先使用 CodeGraph系列工具，而不是read、grep、Bash源码搜索等。');
+    expect(first.files.find((f) => f.path === extension)?.action).toBe('created');
+
+    expect(fs.existsSync(config)).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(config, 'utf-8'));
+    expect(cfg.extensions).toContain('./extensions/codegraph-reminder.ts');
+    expect(first.files.find((f) => f.path === config)?.action).toBe('created');
+
+    const second = codeagent.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === extension)?.action).toBe('unchanged');
+    expect(second.files.find((f) => f.path === config)?.action).toBe('unchanged');
+  });
+
+  it('codeagent: local install writes ./.cac/extensions/ with a project-relative entry', () => {
+    const codeagent = getTarget('codeagent')!;
+    const result = codeagent.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.cac/extensions/codegraph-reminder.ts'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/.cac/extensions.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpCwd, '.cac', 'extensions', 'codegraph-reminder.ts'))).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.cac', 'extensions.json'), 'utf-8'));
+    // Project-level entries resolve against the project root, so the
+    // specifier must carry the .cac/ prefix.
+    expect(cfg.extensions).toContain('./.cac/extensions/codegraph-reminder.ts');
+  });
+
+  it('codeagent: uninstall removes the extension file and its registration', () => {
+    const codeagent = getTarget('codeagent')!;
+    const extension = path.join(tmpHome, '.cac', 'extensions', 'codegraph-reminder.ts');
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+
+    codeagent.install('global', { autoAllow: true });
+    codeagent.uninstall('global');
+    expect(fs.existsSync(extension)).toBe(false);
+    // The file only carried our entry — it is removed entirely.
+    expect(fs.existsSync(config)).toBe(false);
+  });
+
+  it('codeagent: uninstall keeps a user replacement without our marker', () => {
+    const codeagent = getTarget('codeagent')!;
+    const extension = path.join(tmpHome, '.cac', 'extensions', 'codegraph-reminder.ts');
+
+    codeagent.install('global', { autoAllow: true });
+    codeagent.uninstall('global');
+    expect(fs.existsSync(extension)).toBe(false);
+
+    fs.mkdirSync(path.dirname(extension), { recursive: true });
+    fs.writeFileSync(extension, 'export default async () => ({})\n');
+    const result = codeagent.uninstall('global');
+    expect(fs.existsSync(extension)).toBe(true);
+    expect(result.files.find((f) => f.path === extension)?.action).toBe('kept');
+  });
+
+  it('codeagent: install preserves user extension entries in all three forms', () => {
+    const codeagent = getTarget('codeagent')!;
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, JSON.stringify({
+      extensions: [
+        '@scope/some-package',
+        ['another-package', { key: 'value' }],
+        { path: './extensions/user-ext.ts', options: { flag: true } },
+      ],
+    }, null, 2) + '\n');
+
+    codeagent.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(config, 'utf-8'));
+    expect(cfg.extensions).toHaveLength(4);
+    expect(cfg.extensions[0]).toBe('@scope/some-package');
+    expect(cfg.extensions[1]).toEqual(['another-package', { key: 'value' }]);
+    expect(cfg.extensions[2]).toEqual({ path: './extensions/user-ext.ts', options: { flag: true } });
+    expect(cfg.extensions[3]).toBe('./extensions/codegraph-reminder.ts');
+  });
+
+  it('codeagent: uninstall removes only our entry, keeping user entries', () => {
+    const codeagent = getTarget('codeagent')!;
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, JSON.stringify({
+      extensions: ['@scope/some-package', './extensions/codegraph-reminder.ts'],
+    }, null, 2) + '\n');
+
+    codeagent.uninstall('global');
+
+    const cfg = JSON.parse(fs.readFileSync(config, 'utf-8'));
+    expect(cfg.extensions).toEqual(['@scope/some-package']);
+  });
+
+  it('codeagent: install treats an object-form registration of our extension as already present', () => {
+    const codeagent = getTarget('codeagent')!;
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, JSON.stringify({
+      extensions: [{ path: './extensions/codegraph-reminder.ts' }],
+    }, null, 2) + '\n');
+
+    const result = codeagent.install('global', { autoAllow: true });
+
+    const cfg = JSON.parse(fs.readFileSync(config, 'utf-8'));
+    expect(cfg.extensions).toEqual([{ path: './extensions/codegraph-reminder.ts' }]);
+    expect(result.files.find((f) => f.path === config)?.action).toBe('unchanged');
+  });
+
+  it('codeagent: install recovers a corrupted extensions.json with a backup', () => {
+    const codeagent = getTarget('codeagent')!;
+    const config = path.join(tmpHome, '.cac', 'extensions.json');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, '{ not valid json');
+
+    codeagent.install('global', { autoAllow: true });
+
+    expect(fs.existsSync(config + '.backup')).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(config, 'utf-8'));
+    expect(cfg.extensions).toContain('./extensions/codegraph-reminder.ts');
+  });
 });
 
 describe('Installer targets — registry', () => {
