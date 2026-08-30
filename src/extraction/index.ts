@@ -22,7 +22,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, EXTENSION_MAP } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isGrammarLoaded, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, EXTENSION_MAP } from './grammars';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath, canonicalFilePath, clearCanonicalCache } from '../utils';
@@ -157,6 +157,12 @@ export interface IndexResult {
   durationMs: number;
 }
 
+/** Result of a main-process single-file index attempt. */
+export interface SingleFileIndexResult extends ExtractionResult {
+  /** True only when this attempt actually replaced the file's stored graph. */
+  stored: boolean;
+}
+
 /**
  * Result of a sync operation
  */
@@ -173,7 +179,7 @@ export interface SyncResult {
   durationMs: number;
   /** Per-file failures collected while the remaining sync work continued. */
   errors?: ExtractionError[];
-  /** Files that must remain pending and be retried by watcher/catch-up sync. */
+  /** Files left stale by this attempt. Callers may surface or explicitly retry them. */
   failedFilePaths?: string[];
   /** Added/modified files successfully stored and safe for downstream resolution. */
   changedFilePaths?: string[];
@@ -1836,7 +1842,7 @@ export class ExtractionOrchestrator {
   /**
    * Index a single file
    */
-  async indexFile(relativePath: string, options?: { force?: boolean }): Promise<ExtractionResult> {
+  async indexFile(relativePath: string, options?: { force?: boolean }): Promise<SingleFileIndexResult> {
     // Canonicalize at the public entry: CLI/watcher/sync callers may pass a
     // logical symlink path. The file is stored under its canonical
     // (realpath-relative) path so the same physical file is indexed once.
@@ -1850,6 +1856,7 @@ export class ExtractionOrchestrator {
         unresolvedReferences: [],
         errors: [{ message: `Path traversal blocked: ${relativePath}`, filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
+        stored: false,
       };
     }
 
@@ -1873,6 +1880,7 @@ export class ExtractionOrchestrator {
           },
         ],
         durationMs: 0,
+        stored: false,
       };
     }
 
@@ -1888,7 +1896,7 @@ export class ExtractionOrchestrator {
     content: string,
     stats: fs.Stats,
     options?: { force?: boolean }
-  ): Promise<ExtractionResult> {
+  ): Promise<SingleFileIndexResult> {
     // Prevent path traversal
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
     if (!fullPath) {
@@ -1899,6 +1907,7 @@ export class ExtractionOrchestrator {
         unresolvedReferences: [],
         errors: [{ message: 'Path traversal blocked', filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
+        stored: false,
       };
     }
 
@@ -1915,7 +1924,15 @@ export class ExtractionOrchestrator {
         unresolvedReferences: [],
         errors: [],
         durationMs: 0,
+        stored: false,
       };
+    }
+
+    // Worker-backed bulk indexing loads grammars inside the workers. Single-file
+    // indexing and sync's co-importer recovery run extraction in this process,
+    // so they must establish the grammar invariant at their shared entry point.
+    if (!isGrammarLoaded(language)) {
+      await loadGrammarsForLanguages([language]);
     }
 
     // Extract from source. Use cached framework names if indexAll has run,
@@ -1934,11 +1951,12 @@ export class ExtractionOrchestrator {
     );
 
     // Store in database
-    if (result.nodes.length > 0 || result.errors.length === 0) {
+    const stored = result.nodes.length > 0 || result.errors.length === 0;
+    if (stored) {
       this.storeExtractionResult(relativePath, content, language, stats, result, options);
     }
 
-    return result;
+    return { ...result, stored };
   }
 
   /**

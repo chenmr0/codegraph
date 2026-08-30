@@ -741,11 +741,38 @@ export class CodeGraph {
         // or ambiguous overload) need the old co-importer re-index fallback.
         const failedFiles = result.failedRewireSourceFiles?.length
           ? result.failedRewireSourceFiles.filter(
-              fp => !result.changedFilePaths!.includes(fp)
+              fp => !(result.changedFilePaths ?? []).includes(fp)
             )
           : [];
 
         if (failedFiles.length > 0) {
+          const successfullyReindexedFiles: string[] = [];
+          const recordReindexFailure = (
+            filePath: string,
+            errors: ExtractionResult['errors'],
+          ): void => {
+            const reportedErrors = errors.length > 0
+              ? errors
+              : [{
+                  message: 'Fallback re-index produced no storable result',
+                  filePath,
+                  severity: 'error' as const,
+                  code: 'parse_error',
+                }];
+            result.complete = false;
+            result.filesErrored = (result.filesErrored ?? 0) + 1;
+            result.failedFilePaths = [
+              ...new Set([...(result.failedFilePaths ?? []), filePath]),
+            ];
+            result.errors = [
+              ...(result.errors ?? []),
+              ...reportedErrors.map((error) => ({
+                ...error,
+                filePath: error.filePath ?? filePath,
+              })),
+            ];
+          };
+
           options.onProgress?.({
             phase: 'parsing',
             current: 0,
@@ -756,10 +783,20 @@ export class CodeGraph {
           for (let i = 0; i < failedFiles.length; i++) {
             const fp = failedFiles[i]!;
             try {
-              await this.orchestrator.indexFile(fp, { force: true });
-              result.filesModified++;
-            } catch {
-              continue;
+              const reindexResult = await this.orchestrator.indexFile(fp, { force: true });
+              if (reindexResult.stored) {
+                successfullyReindexedFiles.push(fp);
+                result.filesModified++;
+              } else {
+                recordReindexFailure(fp, reindexResult.errors);
+              }
+            } catch (error) {
+              recordReindexFailure(fp, [{
+                message: error instanceof Error ? error.message : String(error),
+                filePath: fp,
+                severity: 'error',
+                code: 'parse_error',
+              }]);
             }
             options.onProgress?.({
               phase: 'parsing',
@@ -769,17 +806,21 @@ export class CodeGraph {
           }
 
           const coImportRefs =
-            this.queries.getUnresolvedReferencesByFiles(failedFiles);
+            this.queries.getUnresolvedReferencesByFiles(successfullyReindexedFiles);
           if (coImportRefs.length > 0) {
             this.resolver.resolveAndPersist(coImportRefs, (current, total) => {
               options.onProgress?.({ phase: 'resolving', current, total });
             });
           }
 
-          // Merge into changedFilePaths for the result report
-          result.changedFilePaths = result.changedFilePaths!.concat(
-            failedFiles.filter(fp => !result.changedFilePaths!.includes(fp))
-          );
+          // Only files whose replacement graph was actually stored are safe
+          // for downstream resolution and incremental synthesis.
+          if (successfullyReindexedFiles.length > 0) {
+            const changedFilePaths = result.changedFilePaths ?? [];
+            result.changedFilePaths = changedFilePaths.concat(
+              successfullyReindexedFiles.filter(fp => !changedFilePaths.includes(fp))
+            );
+          }
         }
 
         // A process killed during reference resolution can leave untouched

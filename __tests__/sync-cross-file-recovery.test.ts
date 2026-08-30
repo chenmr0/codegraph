@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import CodeGraph from '../src/index';
+import CodeGraph, { SyncIncompleteError } from '../src/index';
 
 function rawDb(cg: CodeGraph): any {
   const handle = (cg as any).db?.db;
@@ -150,5 +150,77 @@ describe('C/C++ sync cross-file reference recovery', () => {
 
     expect(result.filesChecked).toBe(1);
     expect(hasCall(cg, 'caller', 'late_cpp')).toBe(true);
+  });
+
+  it('does not report an unstored co-importer fallback as successfully modified', async () => {
+    fs.writeFileSync(
+      path.join(directory, 'defs.h'),
+      'namespace cg_ns { inline int cg_target_v1() { return 1; } }\n'
+    );
+    fs.writeFileSync(
+      path.join(directory, 'caller.cpp'),
+      '#include "defs.h"\nint cg_caller() { return cg_ns::cg_target_v1(); }\n'
+    );
+
+    cg = CodeGraph.initSync(directory);
+    await cg.indexAll();
+    expect(hasCall(cg, 'cg_caller', 'cg_target_v1')).toBe(true);
+    const callerIndexedAt = cg.getFile('caller.cpp')!.indexedAt;
+
+    const orchestrator = (cg as any).orchestrator;
+    const originalIndexFile = orchestrator.indexFile.bind(orchestrator);
+    const fallbackAttempts: string[] = [];
+    orchestrator.indexFile = async (
+      filePath: string,
+      options?: { force?: boolean },
+    ) => {
+      if (filePath !== 'caller.cpp') return originalIndexFile(filePath, options);
+      fallbackAttempts.push(filePath);
+      return {
+        nodes: [],
+        edges: [],
+        unresolvedReferences: [],
+        errors: [{
+          message: 'synthetic main-process parser failure',
+          filePath,
+          severity: 'error' as const,
+          code: 'parser_error',
+        }],
+        durationMs: 0,
+        stored: false,
+      };
+    };
+
+    fs.writeFileSync(
+      path.join(directory, 'defs.h'),
+      'namespace cg_ns { inline int cg_target_v2() { return 2; } }\n'
+    );
+
+    let failure: unknown;
+    try {
+      await cg.sync({ paths: ['defs.h'] });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(fallbackAttempts).toEqual(['caller.cpp']);
+    expect(failure).toBeInstanceOf(SyncIncompleteError);
+    const incomplete = (failure as SyncIncompleteError).result;
+    expect(incomplete).toEqual(expect.objectContaining({
+      complete: false,
+      filesModified: 1,
+      filesErrored: 1,
+      failedFilePaths: ['caller.cpp'],
+      changedFilePaths: ['defs.h'],
+    }));
+    expect(incomplete.errors).toContainEqual(expect.objectContaining({
+      filePath: 'caller.cpp',
+      code: 'parser_error',
+      message: 'synthetic main-process parser failure',
+    }));
+    expect(cg.getFile('caller.cpp')!.indexedAt).toBe(callerIndexedAt);
+    expect(cg.getNodesByName('cg_caller')).toHaveLength(1);
+    expect(hasCall(cg, 'cg_caller', 'cg_target_v1')).toBe(false);
+    expect(hasCall(cg, 'cg_caller', 'cg_target_v2')).toBe(false);
   });
 });
