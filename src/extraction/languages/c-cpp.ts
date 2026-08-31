@@ -33,7 +33,7 @@ function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  const parts = getNodeText(qid, source).trim().split('::').map(part => part.trim()).filter(Boolean);
   return parts[parts.length - 1];
 }
 
@@ -42,7 +42,7 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
+  const parts = getNodeText(qid, source).trim().split('::').map(part => part.trim()).filter(Boolean);
   return parts.length > 1 ? parts.slice(0, -1).join('::') : undefined;
 }
 
@@ -1602,6 +1602,58 @@ function cCppIsMacroInvocationMisparse(
   return false;
 }
 
+function hasDirectTypeQualifier(node: SyntaxNode, qualifier: string): boolean {
+  for (let index = 0; index < node.namedChildCount; index++) {
+    const child = node.namedChild(index);
+    if (child?.type === 'type_qualifier' && child.text === qualifier) return true;
+  }
+  return false;
+}
+
+/**
+ * Classify the declared object rather than the declaration's base type.
+ *
+ * Tree-sitter nests declarator modifiers from the base type towards the
+ * identifier. The modifier closest to the identifier is the top-level object:
+ * `const T *items[]` is pointer -> array -> identifier, so it is an array whose
+ * element type is a mutable pointer, not an array of constants.
+ */
+function isCppDeclaratorConst(declaration: SyntaxNode, declarator: SyntaxNode): boolean {
+  if (hasDirectTypeQualifier(declaration, 'constexpr')) return true;
+  const baseTypeIsConst = hasDirectTypeQualifier(declaration, 'const');
+  const modifiers: SyntaxNode[] = [];
+  let current: SyntaxNode | null = declarator;
+
+  while (current) {
+    if (current.type === 'init_declarator' || current.type === 'parenthesized_declarator') {
+      current = getChildByField(current, 'declarator') ?? current.namedChild(0);
+      continue;
+    }
+    if (
+      current.type === 'pointer_declarator' ||
+      current.type === 'array_declarator' ||
+      current.type === 'reference_declarator'
+    ) {
+      modifiers.push(current);
+      current = getChildByField(current, 'declarator') ?? current.namedChild(0);
+      continue;
+    }
+    break;
+  }
+
+  // Arrays inherit their element type's constness. Strip each array layer,
+  // then classify the element's outermost pointer/reference or the base type.
+  let modifierIndex = modifiers.length - 1;
+  while (modifierIndex >= 0 && modifiers[modifierIndex]!.type === 'array_declarator') {
+    modifierIndex--;
+  }
+  if (modifierIndex < 0) return baseTypeIsConst;
+
+  const modifier = modifiers[modifierIndex]!;
+  if (modifier.type === 'reference_declarator') return false;
+  return modifier.type === 'pointer_declarator' && hasDirectTypeQualifier(modifier, 'const');
+}
+
 export const cExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
   classTypes: [],
@@ -1633,6 +1685,7 @@ export const cExtractor: LanguageExtractor = {
     }
     return false;
   },
+  isDeclaratorConst: isCppDeclaratorConst,
   isStatic: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);
@@ -1771,6 +1824,7 @@ export const cppExtractor: LanguageExtractor = {
     }
     return false;
   },
+  isDeclaratorConst: isCppDeclaratorConst,
   isStatic: (node) => {
     for (let i = 0; i < node.namedChildCount; i++) {
       const c = node.namedChild(i);

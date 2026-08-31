@@ -171,6 +171,12 @@ export interface LanguageExtractor {
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
   /**
+   * Check one declarator in a multi-declarator declaration for top-level
+   * constness. C/C++ needs this because `const T value, *ptr` declares one
+   * const object and one mutable pointer in the same AST node.
+   */
+  isDeclaratorConst?: (declaration: SyntaxNode, declarator: SyntaxNode) => boolean;
+  /**
    * Extract extra symbol-level modifier keywords to persist on the node's
    * `decorators` list (e.g. Kotlin `expect`/`actual` multiplatform markers).
    * Called generically for every created node; return undefined/[] when none.

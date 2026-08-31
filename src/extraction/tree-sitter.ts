@@ -530,17 +530,181 @@ function expandRangeByLines(source: string, start: number, end: number, lineCoun
 }
 
 /** Match clang tooling's symbol spelling for callable template-ids/operators. */
+function normalizeCppConversionType(type: string): string {
+  return type
+    .trim()
+    .replace(/\s*::\s*/g, '::')
+    .replace(/\s*([*&]+)\s*/g, '$1')
+    .replace(/\s+/g, ' ');
+}
+
 function normalizeCppCallableName(name: string, receiverType?: string): string {
-  const templateId = name.trim().match(/^(~?[A-Za-z_]\w*)\s*<[\s\S]+>$/);
+  const trimmedName = name.trim();
+  const templateId = trimmedName.match(/^(~?[A-Za-z_]\w*)\s*<[\s\S]+>$/);
   if (templateId && receiverType) {
     const receiverTail = receiverType.split('::').pop()?.trim() ?? '';
     const receiverBase = receiverTail.replace(/<[^<>]*>\s*$/, '');
     if (receiverBase === templateId[1]!.replace(/^~/, '')) return templateId[1]!;
   }
+  const conversionOperator = trimmedName.match(/^operator\s+([A-Za-z_:][\s\S]*)$/);
+  if (conversionOperator) {
+    return `operator ${normalizeCppConversionType(conversionOperator[1]!)}`;
+  }
   // Only symbolic operators are compacted. Conversion operators (`operator
   // const char *`) retain their meaningful type whitespace.
-  const symbolicOperator = name.trim().match(/^operator\s*([^\w\s][\s\S]*)$/);
-  return symbolicOperator ? `operator${symbolicOperator[1]!.replace(/\s+/g, '')}` : name;
+  const symbolicOperator = trimmedName.match(/^operator\s*([^\w\s][\s\S]*)$/);
+  return symbolicOperator ? `operator${symbolicOperator[1]!.replace(/\s+/g, '')}` : trimmedName;
+}
+
+interface SourceSpelledCppCallable {
+  prefix: string;
+  receiverType: string;
+  name: string;
+  qualifiedName: string;
+}
+
+function cppTopLevelScopeSeparators(value: string): number[] {
+  const separators: number[] = [];
+  let angleDepth = 0;
+  for (let i = 0; i + 1 < value.length; i++) {
+    const char = value[i]!;
+    if (char === '<') {
+      angleDepth++;
+    } else if (char === '>' && angleDepth > 0) {
+      angleDepth--;
+    } else if (angleDepth === 0 && char === ':' && value[i + 1] === ':') {
+      separators.push(i);
+      i++;
+    }
+  }
+  return separators;
+}
+
+function cppScopeSegmentStart(value: string, endInclusive: number): number {
+  let cursor = endInclusive;
+  while (cursor >= 0 && /\s/.test(value[cursor]!)) cursor--;
+  if (cursor < 0) return -1;
+
+  if (value[cursor] === '>') {
+    let depth = 1;
+    cursor--;
+    while (cursor >= 0 && depth > 0) {
+      if (value[cursor] === '>') depth++;
+      else if (value[cursor] === '<') depth--;
+      cursor--;
+    }
+    if (depth !== 0) return -1;
+    while (cursor >= 0 && /\s/.test(value[cursor]!)) cursor--;
+  }
+
+  const identifierEnd = cursor;
+  while (cursor >= 0 && /[A-Za-z0-9_]/.test(value[cursor]!)) cursor--;
+  return cursor === identifierEnd ? -1 : cursor + 1;
+}
+
+function cppReceiverStart(value: string, receiverEnd: number): number {
+  let cursor = receiverEnd - 1;
+  let start = cppScopeSegmentStart(value, cursor);
+  if (start < 0) return -1;
+
+  while (start > 0) {
+    cursor = start - 1;
+    while (cursor >= 0 && /\s/.test(value[cursor]!)) cursor--;
+    if (cursor < 1 || value[cursor] !== ':' || value[cursor - 1] !== ':') break;
+    cursor -= 2;
+    const previous = cppScopeSegmentStart(value, cursor);
+    if (previous < 0) break;
+    start = previous;
+  }
+  return start;
+}
+
+function cppReceiverBase(receiverType: string): string {
+  const separators = cppTopLevelScopeSeparators(receiverType);
+  const tail = receiverType.slice((separators.at(-1) ?? -2) + 2).trim();
+  const templateStart = tail.indexOf('<');
+  return (templateStart >= 0 ? tail.slice(0, templateStart) : tail).trim();
+}
+
+function isBalancedCppTemplateText(value: string): boolean {
+  let depth = 0;
+  for (const char of value) {
+    if (char === '<') depth++;
+    else if (char === '>') {
+      if (depth === 0) return false;
+      depth--;
+    }
+  }
+  return depth === 0;
+}
+
+function isValidRecoveredCppCallable(receiverType: string, name: string): boolean {
+  if (!receiverType || !name || !isBalancedCppTemplateText(receiverType)) return false;
+  let templateDepth = 0;
+  let receiverSkeleton = '';
+  for (const char of receiverType) {
+    if (char === '<') {
+      templateDepth++;
+      continue;
+    }
+    if (char === '>') {
+      templateDepth--;
+      continue;
+    }
+    if (templateDepth === 0) receiverSkeleton += char;
+  }
+  if (/\s/.test(receiverSkeleton)) return false;
+  if (!/^(?:::)?[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$/.test(receiverSkeleton)) return false;
+  if (/::(?:class|struct|enum|typename)(?:::|$)/.test(receiverSkeleton)) return false;
+
+  const trimmedName = name.trim();
+  if (/^operator\s+/.test(trimmedName)) return trimmedName.length > 'operator '.length;
+  if (/^operator[^A-Za-z0-9_]/.test(trimmedName)) return trimmedName.length > 'operator'.length;
+  if (!/^~?[A-Za-z_]\w*(?:\s*<[\s\S]+>)?$/.test(trimmedName)) return false;
+  return isBalancedCppTemplateText(trimmedName);
+}
+
+/**
+ * Parse the right-most qualified callable in a source-spelled definition
+ * header. Candidate discovery remains intentionally broad; this parser owns
+ * identity extraction so a qualified return type can never become part of the
+ * method's qualified name.
+ */
+function parseSourceSpelledCppCallable(header: string): SourceSpelledCppCallable | null {
+  const trimmedEnd = header.trimEnd();
+  const separators = cppTopLevelScopeSeparators(trimmedEnd);
+  if (separators.length === 0) return null;
+
+  const operatorSeparator = [...separators].reverse().find(separator =>
+    /^\s*operator\b/.test(trimmedEnd.slice(separator + 2))
+  );
+  const callableSeparator = operatorSeparator ?? separators[separators.length - 1]!;
+  const rawName = trimmedEnd.slice(callableSeparator + 2).trim();
+  const receiverStart = cppReceiverStart(trimmedEnd, callableSeparator);
+  if (receiverStart < 0) return null;
+
+  const receiverType = trimmedEnd
+    .slice(receiverStart, callableSeparator)
+    .trim()
+    .replace(/\s*::\s*/g, '::')
+    .replace(/^::/, '');
+  const name = normalizeCppCallableName(rawName, receiverType).trim();
+  if (!isValidRecoveredCppCallable(receiverType, name)) return null;
+
+  const prefix = trimmedEnd.slice(0, receiverStart).trim();
+  const receiverBase = cppReceiverBase(receiverType);
+  const callableBase = name.replace(/^~/, '').replace(/\s*<[\s\S]+>$/, '');
+  const isCtorOrDtor = receiverBase === callableBase;
+  const isConversionOperator = /^operator\s+[A-Za-z_:]/.test(name);
+  if (!prefix && !isCtorOrDtor && !isConversionOperator) return null;
+  if (/^(?:return|if|for|while|switch|case|throw)\b/.test(prefix)) return null;
+
+  return {
+    prefix,
+    receiverType,
+    name,
+    qualifiedName: `${receiverType}::${name}`,
+  };
 }
 
 function anonymousCppTypeName(node: SyntaxNode): string | null {
@@ -553,6 +717,22 @@ function anonymousCppTypeName(node: SyntaxNode): string | null {
 
 /** Read the callable declarator without wandering into template/parameter types. */
 function cppCallableDeclaratorName(node: SyntaxNode, source: string): string | null {
+  const operatorCast = node.type === 'operator_cast'
+    ? node
+    : node.descendantsOfType('operator_cast')[0];
+  if (operatorCast) {
+    const conversionDeclarator = getChildByField(operatorCast, 'declarator');
+    const parameters = conversionDeclarator?.descendantsOfType('parameter_list')[0];
+    if (parameters) {
+      const operatorText = getNodeText(operatorCast, source);
+      const conversionEnd = parameters.startIndex - operatorCast.startIndex;
+      const conversionType = operatorText.slice('operator'.length, conversionEnd);
+      if (conversionType.trim()) {
+        return `operator ${normalizeCppConversionType(conversionType)}`;
+      }
+    }
+  }
+
   const fn = node.type === 'function_declarator'
     ? node
     : node.descendantsOfType('function_declarator')[0];
@@ -564,19 +744,19 @@ function cppCallableDeclaratorName(node: SyntaxNode, source: string): string | n
     declarator = getChildByField(declarator, 'declarator') ?? declarator.namedChild(0);
   }
   if (!declarator) return null;
-  const raw = getNodeText(declarator, source).trim();
+  const raw = getNodeText(declarator, source).trim().replace(/\s*::\s*/g, '::');
   if (!raw) return null;
   const operatorScope = raw.lastIndexOf('::operator');
-  if (operatorScope >= 0) return raw.slice(operatorScope + 2);
+  if (operatorScope >= 0) return raw.slice(operatorScope + 2).trim();
   let angleDepth = 0;
   for (let i = raw.length - 1; i > 0; i--) {
     if (raw[i] === '>') angleDepth++;
     else if (raw[i] === '<' && angleDepth > 0) angleDepth--;
     else if (angleDepth === 0 && raw[i] === ':' && raw[i - 1] === ':') {
-      return raw.slice(i + 1);
+      return raw.slice(i + 1).trim();
     }
   }
-  return raw;
+  return raw.trim();
 }
 
 /** Expand a declaration recovery range to the complete source lines it touches. */
@@ -1446,37 +1626,30 @@ export class TreeSitterExtractor {
       return null;
     };
 
-    const candidate = /^[ \t]*([^#\/\n;{}]*?)((?:[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?\s*::)+(?:~?[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?|operator\s*(?:\[\]|\(\)|[^\s(]+)))\s*\(/gm;
+    const candidate = /^[ \t]*([^#\/\n;{}]*?)((?:[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?\s*::)+(?:~?[A-Za-z_]\w*(?:\s*<[^;\n{}]+>)?|operator\s*(?:\[\]|\(\)|[^;\n{}(]+?)))\s*\(/gm;
     let match: RegExpExecArray | null;
     while ((match = candidate.exec(source)) !== null) {
-      const prefix = match[1]!.trim();
-      const rawQualifiedName = match[2]!.trim().replace(/\s*::\s*/g, '::');
       const open = candidate.lastIndex - 1;
       const close = closeParameterList(open);
       if (close < 0) continue;
       const delimiter = bodyDelimiter(close + 1);
       if (!delimiter || delimiter.char !== '{') continue;
 
-      const parts = rawQualifiedName.replace(/^::/, '').split('::');
-      if (parts.length < 2) continue;
-      const rawName = parts[parts.length - 1]!;
-      const receiver = parts[parts.length - 2]!.replace(/<[^<>]*>\s*$/, '');
-      const callableBase = rawName.replace(/^~/, '').replace(/<[^<>]*>\s*$/, '');
-      if (!prefix && receiver !== callableBase) continue;
-      if (/^(?:return|if|for|while|switch|case|throw)\b/.test(prefix)) continue;
-
-      const name = normalizeCppCallableName(rawName, parts.slice(0, -1).join('::'));
-      parts[parts.length - 1] = name;
-      const qualifiedName = parts.join('::');
+      const parsed = parseSourceSpelledCppCallable(source.slice(match.index, open));
+      if (!parsed) continue;
+      const { name, qualifiedName } = parsed;
       const line = lineForOffset(match.index);
+      const lineStart = lineStarts[line - 1]!;
+      const column = match.index - lineStart;
       if (this.nodes.some(node =>
-        node.name === name && node.qualifiedName === qualifiedName
-        && Math.abs(node.startLine - line) <= 2)) {
+        node.name === name && (
+          (node.qualifiedName === qualifiedName && Math.abs(node.startLine - line) <= 2) ||
+          (node.kind === 'method' && node.startLine === line && node.startColumn === column)
+        ))) {
         continue;
       }
-      const lineStart = lineStarts[line - 1]!;
       const signature = source.slice(match.index, delimiter.offset).trim();
-      this.createSyntheticNode('method', name, line, match.index - lineStart, name.length, {
+      this.createSyntheticNode('method', name, line, column, name.length, {
         qualifiedName,
         signature,
         isDeclaration: false,
@@ -1562,12 +1735,40 @@ export class TreeSitterExtractor {
       }
       return false;
     };
+    const isRedundantSourceSpelledDefinition = (node: Node): boolean => {
+      if (
+        this.language !== 'cpp' ||
+        (node.kind !== 'method' && node.kind !== 'function') ||
+        node.isDeclaration ||
+        !node.qualifiedName
+      ) {
+        return false;
+      }
+      const normalizedQualifiedName = node.qualifiedName
+        .trim()
+        .replace(/\s*::\s*/g, '::');
+      const lineStart = this.originalLineStart(node.startLine);
+      const lineEnd = this.originalSource.indexOf('\n', lineStart);
+      const sourceLine = this.originalSource
+        .slice(lineStart, lineEnd === -1 ? this.originalSource.length : lineEnd)
+        .replace(/\s+/g, '');
+      if (!sourceLine.includes(normalizedQualifiedName.replace(/\s+/g, ''))) return false;
+      return this.nodes.some(existing =>
+        existing.kind === node.kind &&
+        existing.name.trim() === node.name.trim() &&
+        existing.qualifiedName.trim().replace(/\s*::\s*/g, '::') === normalizedQualifiedName &&
+        existing.startLine === node.startLine &&
+        existing.startColumn === node.startColumn &&
+        !existing.isDeclaration
+      );
+    };
     for (const node of recoveredNodes) {
       if (
         !recoverableKinds.has(node.kind) ||
         !expanded.invocationLines.has(node.startLine) ||
         existingIds.has(node.id) ||
         expanded.expandedMacroNames.has(node.name) ||
+        isRedundantSourceSpelledDefinition(node) ||
         isTemplateParameterArtifact(node)
       ) {
         continue;
@@ -4271,6 +4472,9 @@ export class TreeSitterExtractor {
 
       outer: for (const child of node.namedChildren) {
         if (!DECLARATOR_TYPES.has(child.type)) continue;
+        const declaratorKind: NodeKind = (
+          this.extractor.isDeclaratorConst?.(node, child) ?? isConst
+        ) ? 'constant' : 'variable';
 
         // Handle function declarations (forward declarations, prototypes).
         // Tree-sitter parses `int foo();` as `declaration` containing a
@@ -4375,7 +4579,7 @@ export class TreeSitterExtractor {
                       ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
                     const initSignature = initValue
                       ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
-                    this.createNode(kind, errName, ec, {
+                    this.createNode(declaratorKind, errName, ec, {
                       docstring,
                       signature: initSignature,
                       isExported,
@@ -4414,7 +4618,7 @@ export class TreeSitterExtractor {
         const initSignature = initValue
           ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-        this.createNode(kind, name, resolved, {
+        this.createNode(declaratorKind, name, resolved, {
           docstring,
           signature: initSignature,
           isExported,

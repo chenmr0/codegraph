@@ -88,6 +88,53 @@ describe('generic C/C++ declaration recovery', () => {
     ]));
   });
 
+  it('does not let qualified return types leak into recovered method identities', () => {
+    const result = cpp([
+      'template <class T> struct Box {',
+      '  using iterator = int;',
+      '  iterator begin();',
+      '};',
+      'template <class T>',
+      'typename Box<T>::iterator Box<T>::begin() { return 0; }',
+      '@', // Keep the translation unit damaged so source-spelled recovery runs.
+    ].join('\n'));
+    const definitions = result.nodes.filter(node =>
+      node.kind === 'method' && node.name === 'begin' && node.startLine === 6
+    );
+
+    expect(definitions).toHaveLength(1);
+    expect(definitions[0]).toMatchObject({
+      qualifiedName: 'Box<T>::begin',
+    });
+    expect(definitions[0]?.isDeclaration).not.toBe(true);
+  });
+
+  it('normalizes nested-template, spaced-scope, destructor, and operator recovery names', () => {
+    const result = cpp([
+      'template <class T> struct Box;',
+      'typename Box<A<B<C<int>>>>::iterator Box<A<B<C<int>>>> :: begin() { return 0; }',
+      'Box<A<B<C<int>>>> :: ~Box() {}',
+      'Box<A<B<C<int>>>>::operator bool() const { return true; }',
+      'Box<A<B<C<int>>>>::operator const char *() const { return nullptr; }',
+      'Box<A<B<C<int>>>> &Box<A<B<C<int>>>>::operator = (const Box &) { return *this; }',
+      '@',
+    ].join('\n'));
+    const definitions = result.nodes.filter(node =>
+      node.kind === 'method' && !node.isDeclaration
+    );
+
+    expect(definitions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'begin', qualifiedName: 'Box<A<B<C<int>>>>::begin' }),
+      expect.objectContaining({ name: '~Box', qualifiedName: 'Box<A<B<C<int>>>>::~Box' }),
+      expect.objectContaining({ name: 'operator bool', qualifiedName: 'Box<A<B<C<int>>>>::operator bool' }),
+      expect.objectContaining({ name: 'operator const char*', qualifiedName: 'Box<A<B<C<int>>>>::operator const char*' }),
+      expect.objectContaining({ name: 'operator=', qualifiedName: 'Box<A<B<C<int>>>>::operator=' }),
+    ]));
+    for (const name of ['begin', '~Box', 'operator bool', 'operator const char*', 'operator=']) {
+      expect(definitions.filter(node => node.name === name)).toHaveLength(1);
+    }
+  });
+
   it('uses an inline type declaration as the range of its trailing field', () => {
     const result = cpp([
       'class Owner {',
