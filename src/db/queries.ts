@@ -121,6 +121,19 @@ interface UnresolvedRefRow {
   name_tail: string;
 }
 
+/** Stable snapshot of one failed-reference name selected for retry. */
+export interface FailedReferenceRetryGroup {
+  nameTail: string;
+  total: number;
+  maxRowId: number;
+}
+
+/** Failed references matching symbols contributed by changed files. */
+export interface FailedReferenceRetryPlan {
+  groups: FailedReferenceRetryGroup[];
+  total: number;
+}
+
 /** Last qualified segment that can match a newly-added plain node name. */
 function referenceNameTail(referenceName: string): string {
   const separator = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
@@ -324,6 +337,7 @@ export class QueryBuilder {
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
     getUnresolvedBatchAfter?: SqliteStatement;
+    getFailedRetryBatch?: SqliteStatement;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
@@ -2553,44 +2567,74 @@ WHERE e.kind = 'imports'
   }
 
   /**
-   * Failed references whose final name segment matches symbols introduced by
-   * changed files. Popular names are skipped wholesale to bound sync work.
+   * Plan a stable retry snapshot for failed references whose final name
+   * segment matches symbols introduced by changed files.
+   *
+   * The old implementation skipped an entire name once it had more than 500
+   * rows. That bounded memory by sacrificing correctness. The plan keeps only
+   * per-name counts and high-water marks in memory; callers stream the rows in
+   * bounded primary-key batches via getFailedReferenceRetryBatch().
    */
-  getRetryableFailedReferences(
-    names: string[],
-    perNameCeiling: number = 500
-  ): UnresolvedReference[] {
-    if (names.length === 0) return [];
+  getFailedReferenceRetryPlan(names: string[]): FailedReferenceRetryPlan {
+    const uniqueNames = [...new Set(names.filter((name) => name.length > 0))];
+    if (uniqueNames.length === 0) return { groups: [], total: 0 };
 
-    const retryNames = new Set<string>();
-    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = [...new Set(names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE))];
+    const groups: FailedReferenceRetryGroup[] = [];
+    let total = 0;
+    for (let i = 0; i < uniqueNames.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = uniqueNames.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
         .prepare(
-          `SELECT name_tail, COUNT(*) AS count FROM unresolved_refs ` +
-            `WHERE status = 'failed' AND name_tail IN (${placeholders}) GROUP BY name_tail`
+          `SELECT name_tail, COUNT(*) AS count, MAX(id) AS max_id ` +
+            `FROM unresolved_refs WHERE status = 'failed' ` +
+            `AND name_tail IN (${placeholders}) GROUP BY name_tail`
         )
-        .all(...chunk) as Array<{ name_tail: string; count: number }>;
+        .all(...chunk) as Array<{
+          name_tail: string;
+          count: number;
+          max_id: number;
+        }>;
       for (const row of rows) {
-        if (row.count <= perNameCeiling) retryNames.add(row.name_tail);
+        const count = Number(row.count);
+        groups.push({
+          nameTail: row.name_tail,
+          total: count,
+          maxRowId: Number(row.max_id),
+        });
+        total += count;
       }
     }
 
-    const rows: UnresolvedRefRow[] = [];
-    const retryNameList = [...retryNames];
-    for (let i = 0; i < retryNameList.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = retryNameList.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      rows.push(
-        ...(this.db
-          .prepare(
-            `SELECT * FROM unresolved_refs WHERE status = 'failed' ` +
-              `AND name_tail IN (${placeholders}) ORDER BY id`
-          )
-          .all(...chunk) as UnresolvedRefRow[])
+    groups.sort((left, right) => left.nameTail.localeCompare(right.nameTail));
+    return { groups, total };
+  }
+
+  /**
+   * Read one bounded failed-reference retry batch using primary-key seek.
+   * maxRowId fixes the plan's high-water mark, so rows written during a retry
+   * cannot extend the current pass or cause an infinite loop.
+   */
+  getFailedReferenceRetryBatch(
+    nameTail: string,
+    afterRowId: number,
+    maxRowId: number,
+    limit: number = 500
+  ): UnresolvedReference[] {
+    if (!nameTail || afterRowId >= maxRowId) return [];
+    const safeLimit = Math.max(1, Math.floor(limit));
+    if (!this.stmts.getFailedRetryBatch) {
+      this.stmts.getFailedRetryBatch = this.db.prepare(
+        `SELECT * FROM unresolved_refs WHERE status = 'failed' ` +
+          `AND name_tail = ? AND id > ? AND id <= ? ORDER BY id LIMIT ?`
       );
     }
+    const rows = this.stmts.getFailedRetryBatch.all(
+      nameTail,
+      afterRowId,
+      maxRowId,
+      safeLimit
+    ) as UnresolvedRefRow[];
 
     return rows.map((row) => ({
       rowId: row.id,

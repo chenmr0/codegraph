@@ -714,23 +714,59 @@ export class CodeGraph {
 
         // A changed file may introduce a symbol needed by references in files
         // that did not change. Retry only failed rows whose final qualified
-        // name segment matches a node contributed by the changed files.
+        // name segment matches a node contributed by the changed files. Stream
+        // every matching name in bounded primary-key batches: popular names
+        // must not be skipped wholesale merely because they exceed one batch.
         if (result.changedFilePaths?.length) {
-          const retryable = this.queries.getRetryableFailedReferences(
+          const retryPlan = this.queries.getFailedReferenceRetryPlan(
             this.queries.getNodeNamesByFiles(result.changedFilePaths)
           );
-          if (retryable.length > 0) {
+          if (retryPlan.total > 0) {
+            let attempted = 0;
             options.onProgress?.({
               phase: 'resolving',
               current: 0,
-              total: retryable.length,
+              total: retryPlan.total,
             });
-            await this.resolver.resolveAndPersistListYielding(retryable);
-            options.onProgress?.({
-              phase: 'resolving',
-              current: retryable.length,
-              total: retryable.length,
-            });
+
+            for (const group of retryPlan.groups) {
+              let afterRowId = 0;
+              while (afterRowId < group.maxRowId) {
+                const batch = this.queries.getFailedReferenceRetryBatch(
+                  group.nameTail,
+                  afterRowId,
+                  group.maxRowId,
+                );
+                if (batch.length === 0) break;
+
+                const lastRowId = batch[batch.length - 1]!.rowId;
+                if (lastRowId === undefined || lastRowId <= afterRowId) {
+                  throw new Error(
+                    `Failed-reference retry made no primary-key progress for ${group.nameTail}`
+                  );
+                }
+
+                this.resolver.resolveAndPersist(batch);
+                attempted += batch.length;
+                afterRowId = lastRowId;
+                options.onProgress?.({
+                  phase: 'resolving',
+                  current: attempted,
+                  total: retryPlan.total,
+                });
+                await new Promise<void>((resolve) => setImmediate(resolve));
+              }
+            }
+
+            // With the index mutex held, every row in the snapshot must be
+            // visited exactly once. Never turn an unexpected query/cleanup
+            // mismatch into another silently incomplete successful sync.
+            if (attempted !== retryPlan.total) {
+              throw new Error(
+                `Failed-reference retry incomplete: attempted ${attempted} ` +
+                  `of ${retryPlan.total} planned row(s)`
+              );
+            }
           }
         }
 

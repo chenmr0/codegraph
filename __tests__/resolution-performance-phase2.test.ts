@@ -81,7 +81,7 @@ describe('phase 2 exact unresolved-reference cleanup', () => {
     expect(afterFirst.map((ref) => ref.line)).toEqual([20, 30]);
   });
 
-  it('parks only the attempted row and retries qualified C++ names by tail', () => {
+  it('parks only the attempted row and snapshots qualified C++ retries by tail', () => {
     queries.insertUnresolvedRefsBatch([
       { ...makeRef(10), referenceName: 'ns::late_target', language: 'cpp' },
       { ...makeRef(20), referenceName: 'ns::late_target', language: 'cpp' },
@@ -98,10 +98,39 @@ describe('phase 2 exact unresolved-reference cleanup', () => {
     expect(queries.getUnresolvedReferencesBatchAfter(0, 10).map((ref) => ref.line)).toEqual([
       20,
     ]);
-    expect(queries.getRetryableFailedReferences(['late_target']).map((ref) => ref.line)).toEqual([
-      10,
-    ]);
-    expect(queries.getRetryableFailedReferences(['late_target'], 0)).toEqual([]);
+    const plan = queries.getFailedReferenceRetryPlan(['late_target']);
+    expect(plan).toEqual({
+      groups: [{ nameTail: 'late_target', total: 1, maxRowId: first.rowId }],
+      total: 1,
+    });
+    expect(
+      queries
+        .getFailedReferenceRetryBatch(
+          plan.groups[0]!.nameTail,
+          0,
+          plan.groups[0]!.maxRowId,
+        )
+        .map((ref) => ref.line)
+    ).toEqual([10]);
+
+    // A row parked after the plan was created belongs to the next pass, not
+    // the current high-water-mark snapshot.
+    const second = queries.getUnresolvedReferencesBatchAfter(0, 1)[0]!;
+    expect(
+      queries.markReferencesFailedByRowIds([
+        { rowId: second.rowId!, referenceName: second.referenceName },
+      ])
+    ).toBe(1);
+    expect(
+      queries
+        .getFailedReferenceRetryBatch(
+          plan.groups[0]!.nameTail,
+          0,
+          plan.groups[0]!.maxRowId,
+        )
+        .map((ref) => ref.line)
+    ).toEqual([10]);
+    expect(queries.getFailedReferenceRetryPlan(['late_target']).total).toBe(2);
   });
 
   it('keeps edge identity deduplication while secondary indexes are deferred', async () => {

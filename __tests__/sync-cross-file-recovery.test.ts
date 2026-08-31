@@ -23,6 +23,21 @@ function hasCall(cg: CodeGraph, callerName: string, targetName: string): boolean
     .some((edge) => edge.kind === 'calls' && edge.target === target.id);
 }
 
+function incomingEdgeCount(
+  cg: CodeGraph,
+  targetName: string,
+  kind: 'calls' | 'references',
+): number {
+  const targets = cg
+    .getNodesByName(targetName)
+    .filter((node) => node.kind === 'function');
+  return targets.reduce(
+    (total, target) =>
+      total + cg.getIncomingEdges(target.id).filter((edge) => edge.kind === kind).length,
+    0,
+  );
+}
+
 describe('C/C++ sync cross-file reference recovery', () => {
   let directory: string;
   let cg: CodeGraph | null;
@@ -151,6 +166,86 @@ describe('C/C++ sync cross-file reference recovery', () => {
     expect(result.filesChecked).toBe(1);
     expect(hasCall(cg, 'caller', 'late_cpp')).toBe(true);
   });
+
+  it('streams more than 500 same-name failed refs and heals every unchanged C++ caller', async () => {
+    const callerCount = 251;
+    fs.writeFileSync(
+      path.join(directory, 'defs.h'),
+      'namespace cg_retry { inline int cg_popular_target_v1() { return 1; } }\n'
+    );
+    for (let i = 0; i < callerCount; i++) {
+      fs.writeFileSync(
+        path.join(directory, `caller_${String(i).padStart(3, '0')}.cpp`),
+        '#include "defs.h"\n' +
+          `int cg_popular_caller_${i}() { return cg_retry::cg_popular_target_v1(); }\n`
+      );
+    }
+
+    cg = CodeGraph.initSync(directory);
+    await cg.indexAll();
+    expect(incomingEdgeCount(cg, 'cg_popular_target_v1', 'calls')).toBe(callerCount);
+    expect(incomingEdgeCount(cg, 'cg_popular_target_v1', 'references')).toBe(callerCount);
+
+    fs.writeFileSync(
+      path.join(directory, 'defs.h'),
+      'namespace cg_retry { inline int cg_popular_target_v2() { return 2; } }\n'
+    );
+    await cg.sync({ paths: ['defs.h'] });
+
+    const failedCount = (): number =>
+      rawDb(cg!)
+        .prepare(
+          "SELECT COUNT(*) AS count FROM unresolved_refs " +
+            "WHERE status = 'failed' AND name_tail = 'cg_popular_target_v1'"
+        )
+        .get().count as number;
+    expect(failedCount()).toBe(callerCount * 2);
+
+    // A same-named symbol in an incompatible language makes every row get a
+    // real retry attempt but must not bind cross-language or loop forever.
+    fs.writeFileSync(
+      path.join(directory, 'wrong_language.py'),
+      'def cg_popular_target_v1():\n    return 3\n'
+    );
+    let yieldedBetweenRetryBatches = false;
+    let sawSecondRetryBatch = false;
+    const incompatible = await cg.sync({
+      paths: ['wrong_language.py'],
+      onProgress: (progress) => {
+        if (
+          progress.phase === 'resolving' &&
+          progress.total === callerCount * 2 &&
+          progress.current === 500
+        ) {
+          setImmediate(() => {
+            yieldedBetweenRetryBatches = true;
+          });
+        }
+        if (
+          progress.phase === 'resolving' &&
+          progress.total === callerCount * 2 &&
+          progress.current === callerCount * 2
+        ) {
+          sawSecondRetryBatch = true;
+          expect(yieldedBetweenRetryBatches).toBe(true);
+        }
+      },
+    });
+    expect(incompatible.complete).toBe(true);
+    expect(sawSecondRetryBatch).toBe(true);
+    expect(failedCount()).toBe(callerCount * 2);
+
+    fs.writeFileSync(
+      path.join(directory, 'defs.h'),
+      'namespace cg_retry { inline int cg_popular_target_v1() { return 4; } }\n'
+    );
+    const healed = await cg.sync({ paths: ['defs.h'] });
+
+    expect(healed.complete).toBe(true);
+    expect(failedCount()).toBe(0);
+    expect(incomingEdgeCount(cg, 'cg_popular_target_v1', 'calls')).toBe(callerCount);
+    expect(incomingEdgeCount(cg, 'cg_popular_target_v1', 'references')).toBe(callerCount);
+  }, 30_000);
 
   it('does not report an unstored co-importer fallback as successfully modified', async () => {
     fs.writeFileSync(
