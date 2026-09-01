@@ -60,6 +60,13 @@ release/
 # Local-only: browser-based tmux session launcher (see tmux-web/README.md)
 tmux-web/
 
+# Benchmark artifacts: repo snapshot copies, rebench runs, experiment reports.
+# Large and machine-local; the dated .md reports stay here, not in git.
+bench-logs/
+
+# Packaged fork build artifacts
+sdd-codegraph-wx-*.tgz
+
 assets/__pycache__/
 
 assets/generate-waitlist.py
