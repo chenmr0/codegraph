@@ -41,6 +41,7 @@ import {
   isDeclarationMacroRecoverySkipped,
 } from '../extraction/diagnostics';
 import { buildNodeView } from '../cli/node-view';
+import { formatQueryLocation } from '../cli/query-output';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -1050,7 +1051,7 @@ program
 
           for (const result of results) {
             const node = result.node;
-            const location = `${node.filePath}:${node.startLine}`;
+            const location = formatQueryLocation(node.filePath, node.startLine, node.endLine);
             const score = chalk.dim(`(${(result.score * 100).toFixed(0)}%)`);
 
             console.log(
