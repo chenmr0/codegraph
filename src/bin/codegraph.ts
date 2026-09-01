@@ -42,6 +42,14 @@ import {
 } from '../extraction/diagnostics';
 import { buildNodeView } from '../cli/node-view';
 import { formatQueryLocation } from '../cli/query-output';
+import {
+  formatDefinitionLocation,
+  formatRelationshipSites,
+  mergeDirectRelationshipGroups,
+  relationshipGroupToJson,
+  sortRelatedSymbolRelationships,
+  type RelatedSymbolRelationships,
+} from '../relationship-output';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -302,6 +310,29 @@ function info(message: string): void {
  */
 function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
+}
+
+const CLI_RELATIONSHIP_SITE_LIMIT = 8;
+
+function printRelationshipEntry(
+  entry: RelatedSymbolRelationships,
+  definitionLabel: 'caller' | 'definition',
+  sitesFirst: boolean,
+): void {
+  const { lines: siteLines, omitted } = formatRelationshipSites(
+    entry.sites,
+    CLI_RELATIONSHIP_SITE_LIMIT,
+  );
+  const definition = `${definitionLabel}: ${formatDefinitionLocation(entry.node)}`;
+  const details = sitesFirst ? [...siteLines, definition] : [definition, ...siteLines];
+
+  console.log(
+    chalk.cyan(entry.node.kind.padEnd(12)) +
+    chalk.white(entry.node.name)
+  );
+  for (const line of details) console.log(chalk.dim(`  ${line}`));
+  if (omitted > 0) console.log(chalk.dim(`  ... +${omitted} more relationship sites`));
+  console.log();
 }
 
 type IndexResult = {
@@ -1405,47 +1436,38 @@ program
         return;
       }
 
-      const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const callerGroups = new Map<string, RelatedSymbolRelationships>();
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallers(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
+        mergeDirectRelationshipGroups(
+          callerGroups,
+          match.node,
+          'incoming',
+          cg.getDirectRelationshipGroups(match.node.id, 'incoming'),
+        );
       }
 
       // Fallback: if exact filter removed everything, use the top match
-      if (allCallers.length === 0 && matches[0]) {
-        for (const c of cg.getCallers(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
+      if (callerGroups.size === 0 && matches[0]) {
+        mergeDirectRelationshipGroups(
+          callerGroups,
+          matches[0].node,
+          'incoming',
+          cg.getDirectRelationshipGroups(matches[0].node.id, 'incoming'),
+        );
       }
 
-      const limited = allCallers.slice(0, limit);
+      const limited = sortRelatedSymbolRelationships(callerGroups.values()).slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
+        console.log(JSON.stringify({ symbol, callers: limited.map(relationshipGroupToJson) }, null, 2));
       } else if (limited.length === 0) {
         info(`No callers found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
+        for (const entry of limited) printRelationshipEntry(entry, 'caller', true);
       }
 
       cg.destroy();
@@ -1484,46 +1506,37 @@ program
         return;
       }
 
-      const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      const calleeGroups = new Map<string, RelatedSymbolRelationships>();
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
         if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallees(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
+        mergeDirectRelationshipGroups(
+          calleeGroups,
+          match.node,
+          'outgoing',
+          cg.getDirectRelationshipGroups(match.node.id, 'outgoing'),
+        );
       }
 
-      if (allCallees.length === 0 && matches[0]) {
-        for (const c of cg.getCallees(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
+      if (calleeGroups.size === 0 && matches[0]) {
+        mergeDirectRelationshipGroups(
+          calleeGroups,
+          matches[0].node,
+          'outgoing',
+          cg.getDirectRelationshipGroups(matches[0].node.id, 'outgoing'),
+        );
       }
 
-      const limited = allCallees.slice(0, limit);
+      const limited = sortRelatedSymbolRelationships(calleeGroups.values()).slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
+        console.log(JSON.stringify({ symbol, callees: limited.map(relationshipGroupToJson) }, null, 2));
       } else if (limited.length === 0) {
         info(`No callees found for "${symbol}"`);
       } else {
         console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
+        for (const entry of limited) printRelationshipEntry(entry, 'definition', false);
       }
 
       cg.destroy();

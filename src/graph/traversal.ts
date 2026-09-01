@@ -4,7 +4,15 @@
  * BFS and DFS traversal for the code knowledge graph.
  */
 
-import { Node, Edge, Subgraph, TraversalOptions, EdgeKind } from '../types';
+import {
+  Node,
+  Edge,
+  Subgraph,
+  TraversalOptions,
+  EdgeKind,
+  DirectRelationshipGroup,
+  RelationshipDirection,
+} from '../types';
 import { QueryBuilder } from '../db/queries';
 
 /**
@@ -36,6 +44,54 @@ export class GraphTraverser {
 
   constructor(queries: QueryBuilder) {
     this.queries = queries;
+  }
+
+  /**
+   * Return one traversal layer grouped by the opposite endpoint while keeping
+   * every parallel edge. This is intentionally separate from getCallers() and
+   * getCallees(): their visited set models recursive graph traversal and should
+   * continue to deduplicate nodes at depth > 1, whereas relationship output
+   * needs every distinct source location between two directly-related symbols.
+   */
+  getDirectRelationshipGroups(
+    nodeId: string,
+    direction: RelationshipDirection,
+    kinds: EdgeKind[] = ['calls', 'references', 'imports'],
+  ): DirectRelationshipGroup[] {
+    const edges = direction === 'incoming'
+      ? this.queries.getIncomingEdges(nodeId, kinds)
+      : this.queries.getOutgoingEdges(nodeId, kinds);
+    if (edges.length === 0) return [];
+
+    const oppositeId = (edge: Edge): string =>
+      direction === 'incoming' ? edge.source : edge.target;
+    const endpointIds = [...new Set(edges.map(oppositeId).filter((id) => id !== nodeId))];
+    const nodes = this.queries.getNodesByIds(endpointIds);
+    const grouped = new Map<string, DirectRelationshipGroup>();
+
+    for (const edge of edges) {
+      const id = oppositeId(edge);
+      if (id === nodeId) continue;
+      const node = nodes.get(id);
+      if (!node) continue;
+      const group = grouped.get(id);
+      if (group) group.edges.push(edge);
+      else grouped.set(id, { node, edges: [edge] });
+    }
+
+    const edgeOrder = (left: Edge, right: Edge): number =>
+      (left.line ?? Number.MAX_SAFE_INTEGER) - (right.line ?? Number.MAX_SAFE_INTEGER) ||
+      (left.column ?? Number.MAX_SAFE_INTEGER) - (right.column ?? Number.MAX_SAFE_INTEGER) ||
+      left.kind.localeCompare(right.kind) ||
+      left.source.localeCompare(right.source) ||
+      left.target.localeCompare(right.target);
+    for (const group of grouped.values()) group.edges.sort(edgeOrder);
+
+    return [...grouped.values()].sort((left, right) =>
+      left.node.filePath.localeCompare(right.node.filePath) ||
+      left.node.startLine - right.node.startLine ||
+      left.node.name.localeCompare(right.node.name) ||
+      left.node.id.localeCompare(right.node.id));
   }
 
   /**

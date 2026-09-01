@@ -214,6 +214,19 @@ export interface Edge {
   provenance?: 'tree-sitter' | 'scip' | 'heuristic';
 }
 
+/** Direction of a direct relationship lookup from one indexed symbol. */
+export type RelationshipDirection = 'incoming' | 'outgoing';
+
+/**
+ * One directly-related symbol and every parallel edge connecting it to the
+ * lookup root. Unlike recursive caller/callee traversal, this preserves
+ * multiple call/reference/import sites between the same two symbols.
+ */
+export interface DirectRelationshipGroup {
+  node: Node;
+  edges: Edge[];
+}
+
 /**
  * Metadata about a tracked file
  */

@@ -54,6 +54,13 @@ import {
   scanRawSourceEvidence,
   type RawEvidenceSpec,
 } from './raw-source-evidence';
+import {
+  formatDefinitionLocation,
+  formatRelationshipSites,
+  mergeDirectRelationshipGroups,
+  sortRelatedSymbolRelationships,
+  type RelatedSymbolRelationships,
+} from '../relationship-output';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -117,6 +124,7 @@ const MCP_SEARCH_MAX_QUERIES = 8;
 /** Keep synchronous overload grouping bounded for ubiquitous names such as process. */
 const MCP_RELATIONSHIP_MAX_GROUPING_CANDIDATES = 64;
 const MCP_RELATIONSHIP_MAX_FALLBACK_COMPARISONS = 50_000;
+const MCP_RELATIONSHIP_SITE_LIMIT_PER_NODE = 5;
 
 /** Literal text search is intentionally narrow and source-only. */
 const MCP_TEXT_SEARCH_MAX_QUERIES = 8;
@@ -3030,18 +3038,18 @@ export class ToolHandler {
     // walk only explicit synthesized-dispatch links for the same overload.
     const dispatchNodes = this.relationshipDispatchFamily(cg, target.nodes);
     const dispatchIds = new Set(dispatchNodes.map((node) => node.id));
-    const seen = new Set<string>();
-    const allCallers: Node[] = [];
+    const callerGroups = new Map<string, RelatedSymbolRelationships>();
     for (const node of dispatchNodes) {
-      for (const c of cg.getCallers(node.id)) {
-        if (!dispatchIds.has(c.node.id) && !seen.has(c.node.id)) {
-          seen.add(c.node.id);
-          allCallers.push(c.node);
-        }
-      }
+      mergeDirectRelationshipGroups(
+        callerGroups,
+        node,
+        'incoming',
+        cg.getDirectRelationshipGroups(node.id, 'incoming'),
+        dispatchIds,
+      );
     }
 
-    if (allCallers.length === 0) {
+    if (callerGroups.size === 0) {
       const needle = this.rawEvidenceNeedle(target.symbol);
       const evidence = needle
         ? await this.renderRawEvidence(cg, [{ label: `zero callers: ${target.signature ?? target.symbol}`, needle }])
@@ -3056,9 +3064,11 @@ export class ToolHandler {
     const dispatchNote = dispatchNodes.length > target.nodes.length
       ? `\n\n> Virtual dispatch family expanded ${target.nodes.length} selected declaration/definition endpoint(s) to ${dispatchNodes.length} exact base/override endpoint(s); callers were deduplicated across that family.`
       : '';
-    const formatted = this.formatNodeList(
-      allCallers.slice(0, limit),
+    const formatted = this.formatRelationshipList(
+      sortRelatedSymbolRelationships(callerGroups.values()).slice(0, limit),
       `Callers of ${this.formatRelationshipTarget(target)}`,
+      'caller',
+      true,
     ) + dispatchNote + target.lookupNote;
     return this.textResult(this.truncateOutput(formatted));
   }
@@ -3073,18 +3083,17 @@ export class ToolHandler {
     if ('result' in resolved) return resolved.result;
     const { target } = resolved;
 
-    const seen = new Set<string>();
-    const allCallees: Node[] = [];
+    const calleeGroups = new Map<string, RelatedSymbolRelationships>();
     for (const node of target.nodes) {
-      for (const c of cg.getCallees(node.id)) {
-        if (!seen.has(c.node.id)) {
-          seen.add(c.node.id);
-          allCallees.push(c.node);
-        }
-      }
+      mergeDirectRelationshipGroups(
+        calleeGroups,
+        node,
+        'outgoing',
+        cg.getDirectRelationshipGroups(node.id, 'outgoing'),
+      );
     }
 
-    if (allCallees.length === 0) {
+    if (calleeGroups.size === 0) {
       const needle = this.rawEvidenceNeedle(target.symbol);
       const evidence = needle
         ? await this.renderRawEvidence(cg, [{ label: `zero callees: ${target.signature ?? target.symbol}`, needle }])
@@ -3096,9 +3105,11 @@ export class ToolHandler {
       ].filter(Boolean).join('\n\n'));
     }
 
-    const formatted = this.formatNodeList(
-      allCallees.slice(0, limit),
+    const formatted = this.formatRelationshipList(
+      sortRelatedSymbolRelationships(calleeGroups.values()).slice(0, limit),
       `Callees of ${this.formatRelationshipTarget(target)}`,
+      'definition',
+      false,
     ) + target.lookupNote;
     return this.textResult(this.truncateOutput(formatted));
   }
@@ -6708,13 +6719,28 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeList(nodes: Node[], title: string): string {
-    const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
+  private formatRelationshipList(
+    entries: RelatedSymbolRelationships[],
+    title: string,
+    definitionLabel: 'caller' | 'definition',
+    sitesFirst: boolean,
+  ): string {
+    const lines: string[] = [`## ${title} (${entries.length} found)`, ''];
 
-    for (const node of nodes) {
-      const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location
-      lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}`);
+    for (const entry of entries) {
+      const formattedSites = formatRelationshipSites(
+        entry.sites,
+        MCP_RELATIONSHIP_SITE_LIMIT_PER_NODE,
+      );
+      const definition = `${definitionLabel}: ${formatDefinitionLocation(entry.node)}`;
+      const details = sitesFirst
+        ? [...formattedSites.lines, definition]
+        : [definition, ...formattedSites.lines];
+      lines.push(`- ${entry.node.name} (${entry.node.kind})`);
+      for (const detail of details) lines.push(`  - ${detail}`);
+      if (formattedSites.omitted > 0) {
+        lines.push(`  - … +${formattedSites.omitted} more relationship sites`);
+      }
     }
 
     return lines.join('\n');

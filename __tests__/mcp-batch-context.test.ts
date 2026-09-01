@@ -26,6 +26,18 @@ describe('MCP bounded batch context and literal search', () => {
       ].join('\n'),
     );
     fs.writeFileSync(
+      path.join(dir, 'src', 'relations.ts'),
+      [
+        'export function relationTarget() { return 1; }',
+        'export function relationCaller() {',
+        '  relationTarget();',
+        '  relationTarget();',
+        '  return relationTarget();',
+        '}',
+        '',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
       path.join(dir, 'src', 'widget.generated.ts'),
       'export const GENERATED_MARKER = "__all_virtual_demo";\n',
     );
@@ -729,6 +741,18 @@ describe('MCP bounded batch context and literal search', () => {
     const out = await output('callers', { symbol: 'FIRST' });
     expect(out).toMatch(/Case-insensitive exact-name correction/i);
     expect(out).toContain('second (function)');
+  });
+
+  it('shows every direct call site together with caller and callee definition ranges', async () => {
+    const callers = await output('callers', { symbol: 'relationTarget' });
+    expect(callers).toContain('relationCaller (function)');
+    expect(callers).toContain('call sites: src/relations.ts:3, src/relations.ts:4, src/relations.ts:5');
+    expect(callers).toContain('caller: src/relations.ts:2-6');
+
+    const callees = await output('callees', { symbol: 'relationCaller' });
+    expect(callees).toContain('relationTarget (function)');
+    expect(callees).toContain('definition: src/relations.ts:1-1');
+    expect(callees).toContain('call sites: src/relations.ts:3, src/relations.ts:4, src/relations.ts:5');
   });
 
   it('batches selected container members without returning the whole container', async () => {

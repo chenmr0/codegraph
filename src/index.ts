@@ -21,6 +21,9 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  RelationshipDirection,
+  EdgeKind,
+  DirectRelationshipGroup,
 } from './types';
 import { DatabaseConnection, getDatabasePath } from './db';
 import { WalCheckpointValve } from './db/wal-valve';
@@ -1349,6 +1352,19 @@ export class CodeGraph {
    */
   getIncomingEdges(nodeId: string): Edge[] {
     return this.queries.getIncomingEdges(nodeId);
+  }
+
+  /**
+   * Get one relationship layer without collapsing parallel source locations.
+   * Use this for callers/callees presentation; recursive traversal APIs retain
+   * their existing node-oriented deduplication semantics.
+   */
+  getDirectRelationshipGroups(
+    nodeId: string,
+    direction: RelationshipDirection,
+    kinds?: EdgeKind[],
+  ): DirectRelationshipGroup[] {
+    return this.traverser.getDirectRelationshipGroups(nodeId, direction, kinds);
   }
 
   // ===========================================================================
