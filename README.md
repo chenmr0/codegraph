@@ -315,6 +315,7 @@ flowchart LR
 codegraph init -i                  # 初始化 + 构建索引
 codegraph status                   # 查看索引统计
 codegraph query g_counter --kind variable   # 按名称/种类搜索符号
+codegraph query TEST_F --path-hint radio/rcm # 同名符号按近似路径优先排序
 codegraph callers g_counter        # 谁引用了它
 codegraph callees init_device      # 它调用了谁
 codegraph impact init_device --depth 3      # 影响面分析

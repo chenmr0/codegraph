@@ -133,6 +133,25 @@ export function getUserProfile(id: number): string { return 'p' + id; }
     expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
   });
 
+  it('applies a soft path hint before LIMIT without filtering other exact candidates', () => {
+    const hit = cg.searchNodes('SharedThing', {
+      exact: true,
+      kinds: ['class'],
+      pathHint: '/usr1/checkout/src/zzz-target.ts',
+      limit: 1,
+    });
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.node.filePath).toContain('zzz-target.ts');
+
+    const fallback = cg.searchNodes('SharedThing', {
+      exact: true,
+      kinds: ['class'],
+      pathHint: 'completely/unrelated/path',
+      limit: 50,
+    });
+    expect(fallback).toHaveLength(13);
+  });
+
   it('honors SearchOptions includePatterns before exact-result LIMIT', () => {
     const hit = cg.searchNodes('SharedThing', {
       exact: true,

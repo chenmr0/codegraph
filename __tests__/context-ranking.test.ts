@@ -16,7 +16,61 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
-import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
+import {
+  comparePathSimilarity,
+  deriveProjectNameTokens,
+  isDistinctiveIdentifier,
+  normalizePathForComparison,
+  pathContainsHint,
+  scorePathRelevance,
+  scorePathSimilarity,
+} from '../src/search/query-utils';
+
+describe('path similarity ranking', () => {
+  it('normalizes absolute/relative separators and trims path hints', () => {
+    expect(normalizePathForComparison(' C:\\Repo\\.\\Source\\rcm\\ ')).toBe('repo/source/rcm');
+    expect(pathContainsHint('Source/rusoft/rcm/file.cpp', ' ./RUSOFT\\RCM ')).toBe(true);
+  });
+
+  it('ranks exact suffixes, module siblings, related trees, then basename-only matches', () => {
+    const hint = '/usr1/repo/Source/rusoft/BRD_RU/radiosw/centre/rcm/rcm_cfg.cpp';
+    const paths = [
+      'third_party/demo/rcm_cfg.cpp',
+      'Inner/rusoft/dt_new/radio_dt/ct/rcm/rcm_cfg.cpp',
+      'Source/rusoft/BRD_RU/radiosw/centre/rcm/other.cpp',
+      'Source/rusoft/BRD_RU/radiosw/centre/rcm/rcm_cfg.cpp',
+    ].sort((left, right) => comparePathSimilarity(left, right, hint));
+
+    expect(paths).toEqual([
+      'Source/rusoft/BRD_RU/radiosw/centre/rcm/rcm_cfg.cpp',
+      'Source/rusoft/BRD_RU/radiosw/centre/rcm/other.cpp',
+      'Inner/rusoft/dt_new/radio_dt/ct/rcm/rcm_cfg.cpp',
+      'third_party/demo/rcm_cfg.cpp',
+    ]);
+  });
+
+  it('treats a directory hint as a strong suffix of the candidate directory', () => {
+    const score = scorePathSimilarity(
+      'Source/rusoft/BRD_RU/radiosw/centre/rcm/rcm_cfg.cpp',
+      '/checkout/Source/rusoft/BRD_RU/radiosw/centre/rcm',
+    );
+    expect(score.completeSuffixMatch).toBe(1);
+    expect(score.commonSuffixSegments).toBe(6);
+  });
+
+  it('prefers the complete project-relative suffix over deeper duplicate copies', () => {
+    const hint = 'D:/python_code/codegraph/src/index.ts';
+    expect(comparePathSimilarity(
+      'src/index.ts',
+      'bench/builds/old/src/index.ts',
+      hint,
+    )).toBeLessThan(0);
+  });
+
+  it('returns an exact tie for unrelated paths so callers preserve their baseline order', () => {
+    expect(comparePathSimilarity('src/a/file.ts', 'lib/b/other.ts', 'missing/module')).toBe(0);
+  });
+});
 
 describe('isDistinctiveIdentifier', () => {
   it('treats plain dictionary words as non-distinctive', () => {

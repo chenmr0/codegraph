@@ -20,7 +20,14 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import {
+  comparePathSimilarity,
+  comparePathSimilarityScores,
+  kindBonus,
+  nameMatchBonus,
+  scorePathRelevance,
+  scorePathSimilarity,
+} from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import {
   canonicalQualifiedName,
@@ -1051,6 +1058,7 @@ export class QueryBuilder {
    */
   searchNodes(query: string, options: SearchOptions = {}): SearchResult[] {
     const { limit = 100, offset = 0 } = options;
+    const pathHint = options.pathHint?.trim() || undefined;
     const pathPatternMatcher = createSearchPathMatcher(
       options.includePatterns,
       options.excludePatterns
@@ -1115,6 +1123,7 @@ export class QueryBuilder {
         nameFilters,
         pathPatternMatcher,
         line,
+        pathHint,
       });
     }
 
@@ -1222,7 +1231,13 @@ export class QueryBuilder {
           + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens)
           + nameMatchBonus(r.node.name, scoringQuery),
       }));
-      results.sort(compareSearchResultsDeterministically);
+      results.sort((left, right) => {
+        if (left.score !== right.score) return right.score - left.score;
+        const pathOrder = pathHint
+          ? comparePathSimilarity(left.node.filePath, right.node.filePath, pathHint)
+          : 0;
+        return pathOrder || compareSearchResultsDeterministically(left, right);
+      });
     }
 
     // Apply path: + name: filters AFTER scoring. Scoring already uses
@@ -1277,6 +1292,7 @@ export class QueryBuilder {
       nameFilters: string[];
       pathPatternMatcher?: (filePath: string) => boolean;
       line?: number;
+      pathHint?: string;
     }
   ): SearchResult[] {
     const {
@@ -1288,6 +1304,7 @@ export class QueryBuilder {
       nameFilters,
       pathPatternMatcher,
       line,
+      pathHint,
     } = options;
 
     const filterNodes = (input: Node[]): Node[] => {
@@ -1314,7 +1331,32 @@ export class QueryBuilder {
         nodes = nodes.filter((node) => pathPatternMatcher(node.filePath));
       }
       if (line !== undefined) nodes = nodes.filter((node) => nodeContainsLine(node, line));
-      return nodes.sort(compareNodesDeterministically);
+      if (!pathHint) return nodes.sort(compareNodesDeterministically);
+      const pathScores = new Map<string, ReturnType<typeof scorePathSimilarity>>();
+      const scoreFor = (filePath: string): ReturnType<typeof scorePathSimilarity> => {
+        let score = pathScores.get(filePath);
+        if (!score) {
+          score = scorePathSimilarity(filePath, pathHint);
+          pathScores.set(filePath, score);
+        }
+        return score;
+      };
+      return nodes.sort((left, right) => {
+        const leftPathScore = scoreFor(left.filePath);
+        const rightPathScore = scoreFor(right.filePath);
+        const pathOrder = comparePathSimilarityScores(leftPathScore, rightPathScore);
+        if (pathOrder !== 0) return pathOrder;
+        const hasPathSignal = [leftPathScore, rightPathScore].some((score) =>
+          score.completeSuffixMatch > 0 ||
+          score.commonSuffixSegments > 0 ||
+          score.sharedDirectorySegments > 0
+        );
+        if (!hasPathSignal) return compareNodesDeterministically(left, right);
+        const declarationOrder = Number(left.isDeclaration === true) - Number(right.isDeclaration === true);
+        if (declarationOrder !== 0) return declarationOrder;
+        const generatedOrder = Number(isGeneratedFile(left.filePath)) - Number(isGeneratedFile(right.filePath));
+        return generatedOrder || compareNodesDeterministically(left, right);
+      });
     };
 
     // No text (e.g. `kind:function` alone) — reuse the filter-only path.

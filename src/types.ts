@@ -463,6 +463,12 @@ export interface SearchOptions {
   /** Only return symbols whose source span contains this 1-based line */
   line?: number;
 
+  /**
+   * Optional soft file-path hint used only for ranking. Candidates are never
+   * excluded when this path is absent or only approximately matches.
+   */
+  pathHint?: string;
+
   /** Maximum results to return */
   limit?: number;
 

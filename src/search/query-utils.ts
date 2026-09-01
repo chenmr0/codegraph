@@ -8,6 +8,109 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Node } from '../types';
 
+/** Path-comparison key ordered lexicographically from strongest to weakest. */
+export interface PathSimilarityScore {
+  /** One normalized path/directory is a complete suffix of the other. */
+  completeSuffixMatch: number;
+  /** Longest matching tail across file/file, directory/path, and sibling-file views. */
+  commonSuffixSegments: number;
+  /** Number of distinct candidate-directory segments also present in the hint. */
+  sharedDirectorySegments: number;
+}
+
+/** Normalize user and indexed paths without requiring either one to exist. */
+export function normalizePathForComparison(raw: string): string {
+  const normalized = raw.trim().replace(/\\/g, '/').toLowerCase().replace(/^[a-z]:/, '');
+  const parts: string[] = [];
+  for (const part of normalized.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length > 0) parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join('/');
+}
+
+/** Existing hard-substring semantics, with shared normalization. */
+export function pathContainsHint(filePath: string, pathHint: string): boolean {
+  const candidate = normalizePathForComparison(filePath);
+  const hint = normalizePathForComparison(pathHint);
+  return hint.length > 0 && candidate.includes(hint);
+}
+
+function commonSuffixLength(left: string[], right: string[]): number {
+  let count = 0;
+  while (
+    count < left.length &&
+    count < right.length &&
+    left[left.length - 1 - count] === right[right.length - 1 - count]
+  ) {
+    count++;
+  }
+  return count;
+}
+
+function sharedDistinctSegments(left: string[], right: string[]): number {
+  const rightSet = new Set(right);
+  return new Set(left.filter((segment) => rightSet.has(segment))).size;
+}
+
+/**
+ * Compare two paths by structure rather than whole-string edit distance.
+ *
+ * Both full paths and their parent directories participate so a directory hint
+ * (`module/rcm`) can rank a file below it, and sibling `.h` / `.cpp` files still
+ * receive useful proximity. Absolute-vs-project-relative paths naturally align
+ * on their common suffix after normalization.
+ */
+export function scorePathSimilarity(filePath: string, pathHint: string): PathSimilarityScore {
+  const candidate = normalizePathForComparison(filePath).split('/').filter(Boolean);
+  const hint = normalizePathForComparison(pathHint).split('/').filter(Boolean);
+  if (candidate.length === 0 || hint.length === 0) {
+    return { completeSuffixMatch: 0, commonSuffixSegments: 0, sharedDirectorySegments: 0 };
+  }
+
+  const candidateDirectory = candidate.slice(0, -1);
+  const hintDirectory = hint.slice(0, -1);
+  const pairs: Array<[string[], string[]]> = [
+    [candidate, hint],
+    [candidateDirectory, hint],
+    [candidate, hintDirectory],
+    [candidateDirectory, hintDirectory],
+  ];
+  const suffixLengths = pairs.map(([left, right]) => commonSuffixLength(left, right));
+  const commonSuffixSegments = Math.max(...suffixLengths);
+  const completeSuffixMatch = Number(pairs.some(([left, right], index) => {
+    const smallerLength = Math.min(left.length, right.length);
+    return smallerLength > 0 && suffixLengths[index] === smallerLength;
+  }));
+  const sharedDirectorySegments = Math.max(
+    sharedDistinctSegments(candidateDirectory, hint),
+    sharedDistinctSegments(candidateDirectory, hintDirectory),
+  );
+  return { completeSuffixMatch, commonSuffixSegments, sharedDirectorySegments };
+}
+
+/** Negative means `left` is more similar, matching Array.sort comparators. */
+export function comparePathSimilarityScores(
+  leftScore: PathSimilarityScore,
+  rightScore: PathSimilarityScore,
+): number {
+  return rightScore.completeSuffixMatch - leftScore.completeSuffixMatch ||
+    rightScore.commonSuffixSegments - leftScore.commonSuffixSegments ||
+    rightScore.sharedDirectorySegments - leftScore.sharedDirectorySegments;
+}
+
+/** Negative means `left` is more similar, matching Array.sort comparators. */
+export function comparePathSimilarity(left: string, right: string, pathHint: string): number {
+  return comparePathSimilarityScores(
+    scorePathSimilarity(left, pathHint),
+    scorePathSimilarity(right, pathHint),
+  );
+}
+
 /** Normalize a name to a comparable token: lowercase, alphanumerics only. */
 export function normalizeNameToken(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9]/g, '');

@@ -24,10 +24,15 @@ import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { NODE_KINDS } from '../types';
 import {
+  comparePathSimilarity,
+  comparePathSimilarityScores,
   isDistinctiveIdentifier,
   isNaturalLanguageQuery,
   isTestFile,
   normalizeNameToken,
+  normalizePathForComparison,
+  pathContainsHint,
+  scorePathSimilarity,
 } from '../search/query-utils';
 import {
   existsSync,
@@ -617,7 +622,7 @@ export const tools: ToolDefinition[] = [
   {
     name: 'search',
     description:
-      'Search 1–8 exact symbol names, qualified names, or callable signatures. Batch with `queries`; true misses share one raw scan. Use path/line/signature to disambiguate. `includeCode="if_unique"` returns one implementation body plus compact declaration pointers; oversized source is safely truncated. Natural-language questions and literal values are rejected.',
+      'Search 1–8 exact symbol names, qualified names, or callable signatures. Batch with `queries`; true misses share one raw scan. `path` is a soft disambiguation hint: matching candidates are narrowed and ranked, while a miss keeps all exact candidates with a warning. Use line/signature for stronger assertions. `includeCode="if_unique"` returns one implementation body plus compact declaration pointers; oversized source is safely truncated. Natural-language questions and literal values are rejected.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -639,7 +644,7 @@ export const tools: ToolDefinition[] = [
               query: { type: 'string', description: '符号名、限定名或可调用签名。' },
               kind: { type: 'string', description: '可选节点类型过滤。', enum: SEARCHABLE_KINDS },
               limit: { type: 'number', description: '该查询最大结果数。', minimum: 1, maximum: 100 },
-              path: { type: 'string', description: '可选文件路径子串。' },
+              path: { type: 'string', description: '可选软路径提示：命中时收窄并排序；未命中时保留全部精确候选并提示。' },
               line: { type: 'number', description: '可选 1-based 行号。', minimum: 1 },
               signature: { type: 'string', description: '可选精确/显著签名。' },
               includeCode: { type: 'string', description: '唯一逻辑重载时内联实现源码并紧凑引用声明；超预算源码会安全截断。', enum: ['never', 'if_unique'] },
@@ -659,7 +664,7 @@ export const tools: ToolDefinition[] = [
         },
         path: {
           type: 'string',
-          description: 'Optional case-insensitive file-path substring used to disambiguate same-named symbols',
+          description: 'Optional soft file-path hint. Matching exact candidates are narrowed and ranked by path similarity; if none match, all exact candidates remain visible with a warning.',
         },
         line: {
           type: 'number',
@@ -1904,7 +1909,9 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const validatedPath = this.validateOptionalPath(args.path, 'path');
     if (validatedPath !== undefined && typeof validatedPath !== 'string') return validatedPath;
-    const pathHint = validatedPath?.replace(/\\/g, '/').toLowerCase();
+    const pathHint = validatedPath
+      ? normalizePathForComparison(validatedPath) || undefined
+      : undefined;
     const lineHint = typeof args.line === 'number' && Number.isInteger(args.line) && args.line > 0
       ? args.line
       : undefined;
@@ -1936,19 +1943,36 @@ export class ToolHandler {
       exactAll = this.findCaseInsensitiveSymbolMatches(cg, query);
       caseCorrected = exactAll.length > 0;
     }
-    let exact = exactAll.filter((node) =>
-      (!kinds || kinds.includes(node.kind)) &&
-      (!pathHint || node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint)) &&
-      (lineHint === undefined ||
-        (node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint))
-    );
+    const kindExact = exactAll.filter((node) => !kinds || kinds.includes(node.kind));
+    const pathMatches = pathHint
+      ? kindExact.filter((node) => pathContainsHint(node.filePath, pathHint))
+      : kindExact;
+    const pathMatched = !pathHint || pathMatches.length > 0;
+    const pathFallback = Boolean(pathHint && kindExact.length > 0 && !pathMatched);
+    let exact = pathHint && pathMatches.length > 0 ? pathMatches : kindExact;
+    const lineSkippedForPathFallback = pathFallback && lineHint !== undefined;
+    if (lineHint !== undefined && !lineSkippedForPathFallback) {
+      exact = exact.filter((node) =>
+        node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint
+      );
+    }
+    const pathStatusNotice = pathHint && kindExact.length > 0
+      ? pathMatched
+        ? `> Path hint ${JSON.stringify(validatedPath)} matched ${pathMatches.length} of ${kindExact.length} exact candidate(s); that subset was ranked by path similarity.`
+        : `> Path hint ${JSON.stringify(validatedPath)} matched no exact candidate; showing all ${kindExact.length} exact candidate(s) ranked by path similarity.`
+      : '';
+    const lineStatusNotice = lineSkippedForPathFallback
+      ? `> Line hint ${lineHint} was not applied because the path hint matched no exact candidate.`
+      : '';
     if (signature && exact.length > 0) {
       const signatureMatches = this.matchingNodesBySignature(exact, signature);
       if (signatureMatches.length === 0) {
-        const candidates = this.rankExactSymbolNodes(exact).slice(0, limit);
+        const candidates = this.rankSearchCandidatesByPath(exact, pathHint).slice(0, limit);
         const formatted = this.formatSearchResults(cg, candidates.map((node) => ({ node, score: 1.0 })));
         return this.textResult(this.truncateOutput([
           includeCodeCorrection,
+          pathStatusNotice,
+          lineStatusNotice,
           `> Signature hint did not match \`${signature}\`. No source was inlined and no overload was guessed.`,
           '',
           formatted,
@@ -1961,7 +1985,10 @@ export class ToolHandler {
       exact = signatureMatches;
     }
     if (exact.length > 0) {
-      const ranked = this.rankExactSymbolNodes(this.preferContainerMatches(exact, lineHint, signature));
+      const ranked = this.rankSearchCandidatesByPath(
+        this.preferContainerMatches(exact, lineHint, signature),
+        pathHint,
+      );
       const groups = this.relationshipOverloadGroups(cg, ranked, exactAll);
       const declarationOnly = ranked.some((node) =>
         node.isDeclaration === true && cppParameterKey(node) !== null &&
@@ -1972,7 +1999,6 @@ export class ToolHandler {
         ? await this.renderSearchRawEvidence(cg, [{
           label: signature ?? queryText,
           needle: declarationEvidenceNeedle,
-          path: validatedPath,
           purpose: 'declaration_only',
         }], deferredRawEvidence)
         : '';
@@ -1994,6 +2020,8 @@ export class ToolHandler {
         return this.textResult(this.truncateOutput([
           includeCodeCorrection,
           correctionNotice,
+          pathStatusNotice,
+          lineStatusNotice,
           deliveryNotice,
           '',
           section.text,
@@ -2004,20 +2032,21 @@ export class ToolHandler {
       const total = ranked.length;
       const capped = ranked.slice(0, limit);
       const qualifier = isQualified ? 'qualified ' : '';
-      const pathNote = pathHint ? ` in paths containing "${validatedPath}"` : '';
-      const lineNote = lineHint !== undefined ? ` at line ${lineHint}` : '';
+      const lineNote = lineHint !== undefined && !lineSkippedForPathFallback ? ` at line ${lineHint}` : '';
       const caseNote = caseCorrected
         ? `\n\n> Case-insensitive exact-name correction applied for "${queryText}".`
         : '';
       const sourceNote = includeCode === 'if_unique' && groups.length > 1
-        ? `\n\n> Source was not inlined because ${groups.length} distinct logical symbols/overloads remain; pass path/line/signature to make the target unique.`
+        ? `\n\n> Source was not inlined because ${groups.length} distinct logical symbols/overloads remain; use a matching path hint, line, or signature to make the target unique. A path miss keeps all exact candidates visible.`
         : '';
       const note = total > limit
-        ? `\n\n> Showing ${capped.length} of ${total} exact ${qualifier}matches${pathNote}${lineNote}. Raise \`limit\` or narrow \`path\`/\`line\` to see the intended symbol.`
+        ? `\n\n> Showing ${capped.length} of ${total} exact ${qualifier}matches${lineNote}. Raise \`limit\`, provide a closer path hint, or use line/signature to see the intended symbol.`
         : '';
       const formatted = this.formatSearchResults(cg, capped.map((node) => ({ node, score: 1.0 })));
       return this.textResult(this.truncateOutput([
         includeCodeCorrection,
+        pathStatusNotice,
+        lineStatusNotice,
         formatted + caseNote + sourceNote + note,
         declarationEvidence,
       ].filter(Boolean).join('\n\n')));
@@ -2043,28 +2072,33 @@ export class ToolHandler {
       }
       const needle = this.rawEvidenceNeedle(query);
       const evidence = needle
-        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle }], deferredRawEvidence)
         : '';
-      return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
+      return this.textResult([includeCodeCorrection, `No results found in the indexed graph for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
 
     // No exact bare-name match — fuzzy fallback, visibly labelled.
-    const fuzzyQuery = pathHint
-      ? `${query} path:"${validatedPath!.replace(/"/g, '')}"`
-      : query;
-    const fuzzy = cg.searchNodes(fuzzyQuery, { limit, kinds, line: lineHint });
+    const fuzzy = cg.searchNodes(query, {
+      limit,
+      kinds,
+      line: pathHint ? undefined : lineHint,
+      pathHint,
+    });
     if (fuzzy.length === 0) {
       const needle = this.rawEvidenceNeedle(query);
       const evidence = needle
-        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle, path: validatedPath }], deferredRawEvidence)
+        ? await this.renderSearchRawEvidence(cg, [{ label: queryText, needle }], deferredRawEvidence)
         : '';
-      return this.textResult([includeCodeCorrection, `No results found for "${query}"`, evidence].filter(Boolean).join('\n\n'));
+      return this.textResult([includeCodeCorrection, `No results found in the indexed graph for "${query}"`, evidence].filter(Boolean).join('\n\n'));
     }
-    const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:`;
-    const formatted = this.formatSearchResults(cg, this.rankSearchResults(fuzzy));
+    const pathRankingNote = pathHint
+      ? `\n> Path hint ${JSON.stringify(validatedPath)} was used as a secondary ranking signal; it did not filter fuzzy candidates.`
+      : '';
+    const note = `\n\n> ⚠️ No exact match for "${query}". Showing closest matches:${pathRankingNote}`;
+    const formatted = this.formatSearchResults(cg, this.rankSearchResults(fuzzy, pathHint));
     const needle = exactAll.length === 0 ? this.rawEvidenceNeedle(query) : undefined;
     const evidence = needle
-      ? await this.renderSearchRawEvidence(cg, [{ label: `exact identifier behind fuzzy results: ${queryText}`, needle, path: validatedPath }], deferredRawEvidence)
+      ? await this.renderSearchRawEvidence(cg, [{ label: `exact identifier behind fuzzy results: ${queryText}`, needle }], deferredRawEvidence)
       : '';
     return this.textResult(this.truncateOutput([
       includeCodeCorrection,
@@ -5075,19 +5109,31 @@ export class ToolHandler {
       while (i < left.length && i < right.length && left[i] === right[i]) i++;
       return i;
     };
+    const pathScores = new Map<string, ReturnType<typeof scorePathSimilarity>>();
+    const pathScoreFor = (filePath: string): ReturnType<typeof scorePathSimilarity> => {
+      let score = pathScores.get(filePath);
+      if (!score) {
+        score = scorePathSimilarity(filePath, pathHint ?? '');
+        pathScores.set(filePath, score);
+      }
+      return score;
+    };
     candidates = [...candidates].sort((left, right) => {
+      const pathOrder = pathHint
+        ? comparePathSimilarityScores(pathScoreFor(left.filePath), pathScoreFor(right.filePath))
+        : 0;
+      if (pathOrder !== 0) return pathOrder;
       const owner = (node: Node) => node.qualifiedName.replace(/\./g, '::').split('::').slice(0, -1).join('::').toLowerCase();
       const score = (node: Node) => {
         const candidateOwner = owner(node);
-        const pathScore = pathHint && node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint) ? 10_000 : 0;
         const lineScore = lineHint !== undefined && node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint ? 5_000 : 0;
-        return pathScore + lineScore + commonPrefix(requestedOwner, candidateOwner) * 10 - Math.abs(requestedOwner.length - candidateOwner.length);
+        return lineScore + commonPrefix(requestedOwner, candidateOwner) * 10 - Math.abs(requestedOwner.length - candidateOwner.length);
       };
       return score(right) - score(left) || left.filePath.localeCompare(right.filePath) || left.startLine - right.startLine;
     });
 
     const assertedPath = pathHint
-      ? candidates.filter((node) => node.filePath.replace(/\\/g, '/').toLowerCase().includes(pathHint))
+      ? candidates.filter((node) => pathContainsHint(node.filePath, pathHint))
       : candidates;
     const assertedLine = lineHint !== undefined
       ? assertedPath.filter((node) => node.startLine <= lineHint && (node.endLine ?? node.startLine) >= lineHint)
@@ -5112,7 +5158,7 @@ export class ToolHandler {
     const out: string[] = [
       `> Qualified owner mismatch: no exact symbol named \`${query}\`, but the exact leaf \`${leaf}\` has structured candidates. Raw-source fallback was skipped.`,
     ];
-    if (pathHint && assertedPath.length === 0) out.push(`> Path assertion \`${pathValue}\` matched none of those candidates.`);
+    if (pathHint && assertedPath.length === 0) out.push(`> Path hint \`${pathValue}\` matched none of those candidates; all structured candidates remain visible and are ranked by path similarity.`);
     if (lineHint !== undefined && assertedLine.length === 0) out.push(`> Line assertion ${lineHint} matched none of those candidates.`);
     if (signatureAssertionMiss) {
       out.push(`> Signature assertion \`${signature}\` was not used to guess a different overload.`);
@@ -6635,15 +6681,42 @@ export class ToolHandler {
    * declarations (prototypes) so the agent sees the implementation body
    * before the header signature. Preserves FTS/BM25 order within a group.
    */
-  private rankSearchResults(results: SearchResult[]): SearchResult[] {
+  private rankSearchResults(results: SearchResult[], pathHint?: string): SearchResult[] {
+    const originalOrder = new Map(results.map((result, index) => [result.node.id, index]));
     return [...results].sort((a, b) => {
+      if (pathHint) {
+        const relevanceOrder = b.score - a.score;
+        if (relevanceOrder !== 0) return relevanceOrder;
+        const pathOrder = comparePathSimilarity(a.node.filePath, b.node.filePath, pathHint);
+        if (pathOrder !== 0) return pathOrder;
+      }
       const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
       const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
       if (aGen !== bGen) return aGen - bGen;
       const aDecl = a.node.isDeclaration === true ? 1 : 0;
       const bDecl = b.node.isDeclaration === true ? 1 : 0;
-      return aDecl - bDecl;
+      return aDecl - bDecl ||
+        (originalOrder.get(a.node.id) ?? 0) - (originalOrder.get(b.node.id) ?? 0);
     });
+  }
+
+  /** Search-only path ranking; never changes declaration/definition primary selection. */
+  private rankSearchCandidatesByPath(nodes: Node[], pathHint?: string): Node[] {
+    const baseline = this.rankExactSymbolNodes(nodes);
+    if (!pathHint) return baseline;
+    const baselineOrder = new Map(baseline.map((node, index) => [node.id, index]));
+    const pathScores = new Map<string, ReturnType<typeof scorePathSimilarity>>();
+    const scoreFor = (filePath: string): ReturnType<typeof scorePathSimilarity> => {
+      let score = pathScores.get(filePath);
+      if (!score) {
+        score = scorePathSimilarity(filePath, pathHint);
+        pathScores.set(filePath, score);
+      }
+      return score;
+    };
+    return [...baseline].sort((left, right) =>
+      comparePathSimilarityScores(scoreFor(left.filePath), scoreFor(right.filePath)) ||
+      (baselineOrder.get(left.id) ?? 0) - (baselineOrder.get(right.id) ?? 0));
   }
 
   /** Stable exact-symbol ranking shared by search/node/callers helpers. */

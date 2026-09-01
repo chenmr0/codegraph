@@ -37,6 +37,25 @@ describe('MCP bounded batch context and literal search', () => {
         '',
       ].join('\n'),
     );
+    fs.mkdirSync(path.join(dir, 'src', 'path-near', 'module'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'src', 'path-far'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'src', 'path-near', 'module', 'ranked.ts'),
+      [
+        'export function rankedTarget() { return "near"; }',
+        'export function batchRankedTarget() { return "near"; }',
+        '',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'path-far', 'ranked.ts'),
+      [
+        'export function rankedTarget() { return "far"; }',
+        'export function batchRankedTarget() { return "far"; }',
+        '// PathSoftRawOnlySymbol intentionally has no indexed declaration.',
+        '',
+      ].join('\n'),
+    );
     fs.writeFileSync(
       path.join(dir, 'src', 'widget.generated.ts'),
       'export const GENERATED_MARKER = "__all_virtual_demo";\n',
@@ -741,6 +760,93 @@ describe('MCP bounded batch context and literal search', () => {
     const out = await output('callers', { symbol: 'FIRST' });
     expect(out).toMatch(/Case-insensitive exact-name correction/i);
     expect(out).toContain('second (function)');
+  });
+
+  it('uses search path as a soft exact-candidate hint and skips line after a path miss', async () => {
+    const matched = await output('search', {
+      query: 'rankedTarget',
+      path: 'path-near/module',
+    });
+    expect(matched).toContain('matched 1 of 2 exact candidate');
+    expect(matched).toContain('src/path-near/module/ranked.ts');
+    expect(matched).not.toContain('src/path-far/ranked.ts');
+
+    const fallback = await output('search', {
+      query: 'rankedTarget',
+      path: '/usr1/checkout/src/path-near/module',
+      line: 999,
+    });
+    expect(fallback).toMatch(/matched no exact candidate/i);
+    expect(fallback).toMatch(/Line hint 999 was not applied/i);
+    expect(fallback).toContain('src/path-near/module/ranked.ts');
+    expect(fallback).toContain('src/path-far/ranked.ts');
+    expect(fallback.indexOf('src/path-near/module/ranked.ts'))
+      .toBeLessThan(fallback.indexOf('src/path-far/ranked.ts'));
+    expect(fallback).not.toMatch(/No exact match|closest matches/i);
+  });
+
+  it('keeps blank search paths backward-compatible with an omitted optional hint', async () => {
+    const omitted = await output('search', { query: 'first' });
+    const blank = await output('search', { query: 'first', path: '' });
+    const whitespace = await output('search', { query: 'first', path: '   ' });
+    expect(blank).toBe(omitted);
+    expect(whitespace).toBe(omitted);
+
+    const batch = await output('search', {
+      queries: [{ query: 'first', path: '' }],
+    });
+    expect(batch).toContain('first (function)');
+    expect(batch).not.toMatch(/path must not be blank/i);
+  });
+
+  it('applies independent soft path semantics to each native batch query', async () => {
+    const out = await output('search', {
+      queries: [
+        { query: 'rankedTarget', path: 'path-far' },
+        { query: 'batchRankedTarget', path: '/checkout/src/path-near/module' },
+      ],
+    });
+    const first = out.slice(out.indexOf('## rankedTarget'), out.indexOf('\n\n---\n\n'));
+    const second = out.slice(out.indexOf('## batchRankedTarget'));
+    expect(first).toContain('src/path-far/ranked.ts');
+    expect(first).not.toContain('src/path-near/module/ranked.ts');
+    expect(second).toMatch(/matched no exact candidate/i);
+    expect(second.indexOf('src/path-near/module/ranked.ts'))
+      .toBeLessThan(second.indexOf('src/path-far/ranked.ts'));
+  });
+
+  it('uses path only as secondary ranking for fuzzy fallback', async () => {
+    const out = await output('search', {
+      query: 'rankedTarge',
+      path: 'path-far',
+      limit: 10,
+    });
+    expect(out).toMatch(/No exact match/i);
+    expect(out).toMatch(/secondary ranking signal/i);
+    expect(out).toContain('src/path-far/ranked.ts');
+    expect(out).toContain('src/path-near/module/ranked.ts');
+    expect(out.indexOf('src/path-far/ranked.ts'))
+      .toBeLessThan(out.indexOf('src/path-near/module/ranked.ts'));
+  });
+
+  it('does not hard-scope raw evidence to a missed soft path hint', async () => {
+    const out = await output('search', {
+      query: 'PathSoftRawOnlySymbol',
+      path: 'path-near/module',
+    });
+    expect(out).toContain('RAW_MATCHES');
+    expect(out).toContain('src/path-far/ranked.ts');
+  });
+
+  it('keeps definition-first implementation delivery when a path hint selects a header declaration', async () => {
+    const out = await output('search', {
+      query: 'push_back_send_list',
+      path: 'overloads.h',
+      signature: 'push_back_send_list()',
+      includeCode: 'if_unique',
+    });
+    expect(out).toContain('src/overloads.cpp');
+    expect(out).toContain('int ObDtlBasicChannel::push_back_send_list() { return 0; }');
   });
 
   it('shows every direct call site together with caller and callee definition ranges', async () => {

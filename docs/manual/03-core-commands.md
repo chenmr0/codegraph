@@ -122,6 +122,7 @@ codegraph status --json     # 机器可读
 codegraph query g_counter                       # 按名称搜
 codegraph query g_counter --kind variable       # 只搜变量
 codegraph query init_device --limit 20          # 多返回一些
+codegraph query TEST_F --path-hint radio/rcm    # 同名很多时按近似路径优先排序（不硬过滤）
 codegraph query foo --fuzzy                     # 模糊匹配（前缀+子串+编辑距离回退）
 codegraph query foo --json                      # 机器可读
 ```
@@ -129,6 +130,7 @@ codegraph query foo --json                      # 机器可读
 - `-k/--kind <kind>`：按节点种类过滤，如 `function`/`variable`/`macro`/`struct`/`field` 等。
 - `-l/--limit <number>`：最多返回几个，默认 10。
 - `--fuzzy`：严格匹配搜不到时用，放宽匹配。
+- `--path-hint <path>`：软路径提示；在分页前按路径相似度排序，提示不匹配时仍保留其他同名候选。
 - `-p/--path <path>`：查别的项目。
 
 ### `codegraph callers` —— 谁调用了它

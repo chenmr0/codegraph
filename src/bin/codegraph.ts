@@ -1037,8 +1037,9 @@ program
   .option('-l, --limit <number>', 'Maximum results', '10')
   .option('-k, --kind <kind>', 'Filter by node kind (function, class, etc.)')
   .option('-j, --json', 'Output as JSON')
+  .option('--path-hint <path>', 'Soft file-path hint used to rank same-named symbols without filtering other candidates')
   .option('--fuzzy', 'Use fuzzy matching (FTS prefix + substring + edit-distance fallback) instead of strict exact match')
-  .action(async (search: string, options: { path?: string; limit?: string; kind?: string; json?: boolean; fuzzy?: boolean }) => {
+  .action(async (search: string, options: { path?: string; pathHint?: string; limit?: string; kind?: string; json?: boolean; fuzzy?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1051,6 +1052,7 @@ program
       const cg = await CodeGraph.open(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
+      const pathHint = options.pathHint?.trim() || undefined;
       // Default is a strict case-sensitive exact match: `query getUser`
       // returns only nodes named exactly `getUser` — no prefix / case-folded
       // / fuzzy fallback. Pass `--fuzzy` to opt back into the FTS → substring
@@ -1060,17 +1062,20 @@ program
         limit,
         kinds: options.kind ? [options.kind as any] : undefined,
         exact: !options.fuzzy,
+        pathHint,
       });
 
       // Mirror the MCP search down-rank so the CLI also surfaces the
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
       const { isGeneratedFile } = await import('../extraction/generated-detection');
-      const results = [...rawResults].sort((a, b) => {
-        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
-        return aGen - bGen;
-      });
+      const results = pathHint
+        ? rawResults
+        : [...rawResults].sort((a, b) => {
+            const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
+            const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+            return aGen - bGen;
+          });
 
       if (options.json) {
         console.log(JSON.stringify(results, null, 2));
