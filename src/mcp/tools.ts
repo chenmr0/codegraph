@@ -66,6 +66,7 @@ import {
   sortRelatedSymbolRelationships,
   type RelatedSymbolRelationships,
 } from '../relationship-output';
+import { formatSourceRange } from '../source-location';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -4622,7 +4623,7 @@ export class ToolHandler {
     }
 
     // Disambiguate a heavily-overloaded name to a specific definition the caller
-    // pinned by file/line (the `file:line` a trail or another tool showed it) —
+    // pinned by file/line (the `file:start-end` a trail or another tool showed it) —
     // so it can fetch e.g. `Harness::poll` at harness.rs:153 out of 50+ `poll`s
     // instead of Reading. A supplied line is an assertion, not a nearest-line
     // guess: when it falls outside every same-file match, preserve the candidates
@@ -4655,13 +4656,13 @@ export class ToolHandler {
     // codegraph_node read cause on Swift/Go. So return them ALL: pack as many
     // FULL bodies as fit a char budget (the agent gets the one it needs in this
     // one call, no follow-up parameter to learn), and list any remainder by
-    // file:line so a large overload set can't overflow the per-tool cap.
+    // file:start-end so a large overload set can't overflow the per-tool cap.
     const header = [
       autoCorrectionNotice,
       `**${matches.length} definitions named "${symbol}"**`,
     ].filter(Boolean).join('\n\n');
     if (!includeCode) {
-      const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
+      const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${formatDefinitionLocation(n)}`);
       return this.textResult(this.truncateOutput(
         [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
       ));
@@ -4701,7 +4702,7 @@ export class ToolHandler {
       out.push(
         '',
         '### Other definitions',
-        ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
+        ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${formatDefinitionLocation(n)}`),
       );
       if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
       out.push(
@@ -4792,7 +4793,7 @@ export class ToolHandler {
       const lines: string[] = [heading];
       for (const n of mapNodes.slice(0, limit)) {
         const sig = n.signature ? ` ${n.signature.replace(/\s+/g, ' ').trim()}` : '';
-        lines.push(`- \`${displaySymbol(n)}\` (${n.kind})${sig} — :${n.startLine}`);
+        lines.push(`- \`${displaySymbol(n)}\` (${n.kind})${sig} — :${formatSourceRange(n.startLine, n.endLine)}`);
       }
       if (mapNodes.length > limit) lines.push(`- … +${mapNodes.length - limit} more`);
       return lines;
@@ -5005,7 +5006,7 @@ export class ToolHandler {
     }
     const missingDeclarationPointers = unique
       .filter((node) => node.isDeclaration === true)
-      .filter((node) => !rendered.some((section) => section.text.includes(`(${node.filePath}:${node.startLine})`)));
+      .filter((node) => !rendered.some((section) => section.text.includes(`(${formatDefinitionLocation(node)})`)));
     const modes = new Set(rendered.map((section) => section.contentMode));
     const sourceOnly = [...modes].every((mode) => mode === 'source' || mode === 'source_truncated');
     const contentMode: RenderedContentMode = sourceOnly
@@ -5084,7 +5085,7 @@ export class ToolHandler {
     });
     if (ownerNodes.length > 0) {
       const ownerLocations = ownerNodes.slice(0, 3)
-        .map((node) => `${node.filePath}:${node.startLine}`)
+        .map((node) => formatDefinitionLocation(node))
         .join(', ');
       const otherOwners = this.rankExactSymbolNodes(candidates)
         .filter((node) => normalizeQualified(node.qualifiedName)
@@ -5098,7 +5099,7 @@ export class ToolHandler {
         out.push('', '### Same leaf on other owners (summary only)');
         for (const node of otherOwners) {
           const signatureText = node.signature?.replace(/\s+/g, ' ').trim() || displaySymbol(node);
-          out.push(`- \`${signatureText}\` — ${node.filePath}:${node.startLine}`);
+          out.push(`- \`${signatureText}\` — ${formatDefinitionLocation(node)}`);
         }
       }
       out.push('', `Inspect \`${requestedOwnerText}\` with a filtered owner outline or search one listed qualified candidate explicitly.`);
@@ -5192,7 +5193,7 @@ export class ToolHandler {
 
   /**
    * Build the "trail" for a symbol: its direct callees (what it calls) and
-   * callers (what calls it), each with file:line — so codegraph_node doubles as
+   * callers (what calls it), each with file:start-end — so codegraph_node doubles as
    * the structural Grep→Read→expand primitive: a spot PLUS where to go next.
    * Capped to stay cheap. Walk the graph by calling codegraph_node on a trail
    * entry; no Read needed for covered hops. Empty edges on a non-leaf often mean
@@ -5202,7 +5203,7 @@ export class ToolHandler {
   private formatTrail(cg: CodeGraph, node: Node): string {
     const TRAIL_CAP = 12;
     const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const base = `${e.node.name} (${formatDefinitionLocation(e.node)})`;
       const synth = synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };
@@ -5247,7 +5248,7 @@ export class ToolHandler {
         } catch { /* retain the indexed signature */ }
       }
     }
-    return `\`${label}\` (${node.filePath}:${node.startLine})`;
+    return `\`${label}\` (${formatDefinitionLocation(node)})`;
   }
 
   /**
@@ -5290,7 +5291,7 @@ export class ToolHandler {
       return n ? this.formatCompactEndpointRef(cg, n) : id;
     };
     const trailFmt = (e: { node: Node; edge: Edge }): string => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const base = `${e.node.name} (${formatDefinitionLocation(e.node)})`;
       const synth = synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };
@@ -6359,8 +6360,7 @@ export class ToolHandler {
       : 'the line hint is outside every matching symbol body';
     const candidates = result.hintedCandidates.slice(0, 8).map((node) => {
       const signature = node.signature?.replace(/\s+/g, ' ').trim() || displaySymbol(node);
-      const end = node.endLine && node.endLine !== node.startLine ? `-${node.endLine}` : '';
-      return `- \`${signature}\` — ${node.filePath}:${node.startLine}${end}`;
+      return `- \`${signature}\` — ${formatDefinitionLocation(node)}`;
     });
     const more = result.hintedCandidates.length > 8
       ? [`- … +${result.hintedCandidates.length - 8} more candidates`]
@@ -6402,7 +6402,7 @@ export class ToolHandler {
     const shown = relevant.slice(0, 6).map((node) => {
       const signature = node.signature?.replace(/\s+/g, ' ').trim() || displaySymbol(node);
       const role = this.indexedDefinitionRole(cg, node);
-      return `- \`${signature}\` — ${role}, ${node.filePath}:${node.startLine}`;
+      return `- \`${signature}\` — ${role}, ${formatDefinitionLocation(node)}`;
     });
     if (relevant.length > 6) shown.push(`- … +${relevant.length - 6} more overloads`);
     return ['### Other overloads (summary only)', ...shown].join('\n');
@@ -6553,7 +6553,7 @@ export class ToolHandler {
     for (const node of candidates) {
       const signature = node.signature?.replace(/\s+/g, ' ').trim() || displaySymbol(node);
       const role = this.indexedDefinitionRole(cg, node);
-      out.push(`- \`${signature}\` — ${role}, ${node.filePath}:${node.startLine}`);
+      out.push(`- \`${signature}\` — ${role}, ${formatDefinitionLocation(node)}`);
     }
     out.push('', '### Source');
 
@@ -6574,7 +6574,7 @@ export class ToolHandler {
     if (omitted.length > 0) {
       out.push('', '### Bodies omitted by the per-target budget');
       for (const node of omitted) {
-        out.push(`- \`${node.signature ?? displaySymbol(node)}\` — ${node.filePath}:${node.startLine}`);
+        out.push(`- \`${node.signature ?? displaySymbol(node)}\` — ${formatDefinitionLocation(node)}`);
       }
       out.push('Use the listed signature as the target `signature` hint only if that body is required.');
     }
@@ -6861,7 +6861,7 @@ export class ToolHandler {
     const visible = children.slice(0, MCP_NODE_CONTAINER_OUTLINE_SYMBOLS);
     const lines = [`**Members (${children.length}; showing ${visible.length}):**`, ''];
     for (const c of visible) {
-      const loc = c.startLine ? `:${c.startLine}` : '';
+      const loc = `:${formatSourceRange(c.startLine, c.endLine)}`;
       const sig = c.signature ? ` — \`${c.signature}\`` : '';
       lines.push(`- ${c.name} (${c.kind})${loc}${sig}`);
     }
@@ -6881,11 +6881,10 @@ export class ToolHandler {
     outline?: string | null,
     sourceCharBudget: number = SYMBOL_SOURCE_MAX_CHARS,
   ): FormattedNodeDetails {
-    const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `## ${node.name} (${node.kind})`,
       '',
-      `**Location:** ${node.filePath}${location}`,
+      `**Location:** ${formatDefinitionLocation(node)}`,
     ];
 
     if (node.signature) {

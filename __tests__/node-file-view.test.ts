@@ -149,9 +149,11 @@ describe('codegraph_node guarded MCP file mode', () => {
 
   it('symbolsOnly returns the structural map, not the source', async () => {
     const out = await text({ file: 'a.ts', symbolsOnly: true });
+    const helper = cg.getNodesByName('helper')[0]!;
     expect(out).toContain('### Symbols');
     expect(out).toContain('helper');
     expect(out).toContain('Widget');
+    expect(out).toContain(`:${helper.startLine}-${helper.endLine}`);
     expect(out).not.toContain('return x + 1'); // bodies are NOT included in the map
     expect(out).toMatch(/batch 1[–-]8 precise.*codegraph_node\(targets/i);
     expect(out).not.toMatch(/drop `symbolsOnly`/i);

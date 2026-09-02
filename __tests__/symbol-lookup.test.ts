@@ -247,5 +247,15 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect(text).toMatch(/\(method\)/);
     expect(text).toMatch(/\(function\)/);
     expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(3);
+    for (const node of cg.getNodesByName('request')) {
+      expect(text).toContain(`${node.filePath}:${node.startLine}-${node.endLine}`);
+    }
+
+    // Metadata-only candidate lists use the same complete inclusive ranges.
+    const listed = await handler.execute('node', { symbol: 'request' });
+    const listedText = listed.content?.[0]?.text ?? '';
+    for (const node of cg.getNodesByName('request')) {
+      expect(listedText).toContain(`${node.filePath}:${node.startLine}-${node.endLine}`);
+    }
   });
 });

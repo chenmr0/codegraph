@@ -26,6 +26,11 @@ import { validatePathWithinRoot, CONFIG_LEAF_LANGUAGES, canonicalFilePath } from
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { readFileSync } from 'fs';
 import {
+  formatNodeLocation,
+  formatSourceLocation,
+  formatSourceRange,
+} from '../source-location';
+import {
   boundNumberedSource,
   displaySymbol,
   SYMBOL_SOURCE_MAX_CHARS,
@@ -72,7 +77,8 @@ interface TrailEntry {
   name: string;
   kind: string;
   filePath: string;
-  startLine?: number;
+  startLine: number;
+  endLine: number;
   synth?: string;
 }
 
@@ -282,7 +288,7 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
   // Multiple definitions share this name — return them ALL.
   const header = `**${matches.length} definitions named "${symbol}"**`;
   if (!opts.includeCode) {
-    const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
+    const list = matches.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${formatNodeLocation(n)}`);
     return result(
       { mode: 'symbol-multi', symbol, count: matches.length, listed: matches.map(nodeJson), rendered: [] },
       [header, '', 'Re-query with --code to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
@@ -311,7 +317,7 @@ async function buildSymbolView(cg: CodeGraph, symbol: string, opts: SymbolViewOp
   ];
   if (listed.length) {
     const shownList = listed.slice(0, MULTI_LIST_CAP);
-    out.push('', '### Other definitions', ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${n.filePath}:${n.startLine}`));
+    out.push('', '### Other definitions', ...shownList.map((n) => `- \`${displaySymbol(n)}\` (${n.kind}) — ${formatNodeLocation(n)}`));
     if (listed.length > MULTI_LIST_CAP) out.push(`- … +${listed.length - MULTI_LIST_CAP} more`);
   }
 
@@ -399,11 +405,10 @@ async function resolveSymbolContent(
 }
 
 function formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
-  const location = node.startLine ? `:${node.startLine}` : '';
   const lines: string[] = [
     `## ${node.name} (${node.kind})`,
     '',
-    `**Location:** ${node.filePath}${location}`,
+    `**Location:** ${formatNodeLocation(node)}`,
   ];
   if (node.signature) lines.push(`**Signature:** \`${node.signature}\``);
   if (node.docstring && node.docstring.length < 200) lines.push('', node.docstring);
@@ -423,7 +428,7 @@ function formatNodeDetails(node: Node, code: string | null, outline?: string | n
   return lines.join('\n');
 }
 
-/** The call trail: direct callees + callers, each with file:line (+ synth note). */
+/** The call trail: direct callees + callers, each with file:start-end (+ synth note). */
 function formatTrail(cg: CodeGraph, node: Node): string {
   const declDef = formatDeclDef(cg, node);
   const callees = dedupeTrail(cg.getCallees(node.id), node.id);
@@ -441,8 +446,8 @@ function formatTrail(cg: CodeGraph, node: Node): string {
 }
 
 function fmtTrailEntry(e: TrailEntry): string {
-  const loc = e.startLine ? `:${e.startLine}` : '';
-  const base = `${e.name} (${e.filePath}${loc})`;
+  const location = formatSourceLocation(e.filePath, e.startLine, e.endLine);
+  const base = `${e.name} (${location})`;
   return e.synth ? `${base} [${e.synth}]` : base;
 }
 
@@ -458,6 +463,7 @@ function dedupeTrail(edges: Array<{ node: Node; edge: Edge }>, selfId: string): 
       kind: e.node.kind,
       filePath: e.node.filePath,
       startLine: e.node.startLine,
+      endLine: e.node.endLine,
       synth: synth?.compact,
     });
   }
@@ -472,7 +478,7 @@ function formatDeclDef(cg: CodeGraph, node: Node, includeDefinitionTrail: boolea
 
   const ref = (id: string): string => {
     const n = cg.getNode(id);
-    return n ? `\`${n.name}\` (${n.filePath}:${n.startLine})` : id;
+    return n ? `\`${n.name}\` (${formatNodeLocation(n)})` : id;
   };
   const lines: string[] = ['', '### Declaration / Definition'];
 
@@ -555,14 +561,16 @@ function declDefJson(cg: CodeGraph, node: Node) {
 
 function edgeRefJson(cg: CodeGraph, id: string) {
   const n = cg.getNode(id);
-  return n ? { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine } : { id };
+  return n
+    ? { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine, endLine: n.endLine }
+    : { id };
 }
 
 function symbolMapLines(nodes: Node[], heading = '### Symbols'): string[] {
   const lines = [heading];
   for (const n of nodes.slice(0, OUTLINE_CAP)) {
     const sig = n.signature ? ` ${n.signature.replace(/\s+/g, ' ').trim()}` : '';
-    lines.push(`- \`${n.name}\` (${n.kind})${sig} — :${n.startLine}`);
+    lines.push(`- \`${n.name}\` (${n.kind})${sig} — :${formatSourceRange(n.startLine, n.endLine)}`);
   }
   if (nodes.length > OUTLINE_CAP) lines.push(`- … +${nodes.length - OUTLINE_CAP} more`);
   return lines;

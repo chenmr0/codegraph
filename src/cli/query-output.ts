@@ -1,3 +1,5 @@
+import { formatSourceLocation } from '../source-location';
+
 /**
  * Format an indexed symbol's inclusive source range for `codegraph query`.
  *
@@ -9,6 +11,5 @@ export function formatQueryLocation(
   startLine: number,
   endLine: number,
 ): string {
-  const safeEndLine = Math.max(startLine, endLine);
-  return `${filePath}:${startLine}-${safeEndLine}`;
+  return formatSourceLocation(filePath, startLine, endLine);
 }

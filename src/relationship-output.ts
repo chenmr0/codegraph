@@ -5,6 +5,7 @@ import type {
   Node,
   RelationshipDirection,
 } from './types';
+import { formatNodeLocation } from './source-location';
 
 export interface RelationshipSite {
   kind: EdgeKind;
@@ -88,8 +89,7 @@ export function sortRelatedSymbolRelationships(
 }
 
 export function formatDefinitionLocation(node: Node): string {
-  const endLine = Math.max(node.startLine, node.endLine);
-  return `${node.filePath}:${node.startLine}-${endLine}`;
+  return formatNodeLocation(node);
 }
 
 function siteOrder(left: RelationshipSite, right: RelationshipSite): number {

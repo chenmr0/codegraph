@@ -6,6 +6,7 @@ import { CodeGraph } from '../src';
 import { QueryBuilder } from '../src/db/queries';
 import * as memoryBudget from '../src/resolution/memory-budget';
 import { registerFrameworkResolver } from '../src/resolution/frameworks';
+import { buildNodeView } from '../src/cli/node-view';
 
 /**
  * End-to-end test for the C declaration-definition pairing synthesizer
@@ -69,6 +70,8 @@ int add(int a, int b) {
     expect(cg.getIndexCompleteness()).toEqual({ status: 'complete', diagnostics: [] });
     const db = (cg as any).db.db;
     const edges = definesEdges(db);
+    const definitionView = await buildNodeView(cg, { symbol: 'add', file: 'foo.c' });
+    const declarationView = await buildNodeView(cg, { symbol: 'add', file: 'foo.h' });
     cg.close?.();
 
     expect(edges.length).toBe(1);
@@ -83,6 +86,19 @@ int add(int a, int b) {
     expect(edge.synthBy).toBe('c-decl-def');
     expect(edge.provenance).toBe('heuristic');
     expect(edge.registeredAt).toMatch(/foo\.h:\d+/);
+
+    // CLI JSON declaration/definition pointers expose both range bounds, just
+    // like the primary node payload.
+    expect((definitionView.json as any).match.declDef.declarations[0]).toMatchObject({
+      filePath: 'foo.h',
+      startLine: 2,
+      endLine: 2,
+    });
+    expect((declarationView.json as any).match.declDef.definitions[0]).toMatchObject({
+      filePath: 'foo.c',
+      startLine: 2,
+      endLine: 4,
+    });
   });
 
   it('skips language-specific whole-graph passes on a pure C project', async () => {

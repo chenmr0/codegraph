@@ -103,8 +103,10 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
 
   it('symbolsOnly returns the structural outline, not the source', async () => {
     const out = await view({ file: 'a.ts', symbolsOnly: true });
+    const helper = cg.getNodesByName('helper')[0]!;
     expect(out.text).toContain('helper');
     expect(out.text).toContain('Widget');
+    expect(out.text).toContain(`:${helper.startLine}-${helper.endLine}`);
     expect(out.text).not.toContain('return x + 1');
     expect(out.json).toMatchObject({ mode: 'file-symbols' });
     expect((out.json as any).symbols.length).toBeGreaterThan(0);
@@ -132,12 +134,17 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
 
   it('symbol mode omits relations by default and supports an explicit trail', async () => {
     const defaultOut = await view({ symbol: 'useHelper' });
+    const useHelper = cg.getNodesByName('useHelper')[0]!;
     expect(defaultOut.text).toContain('## useHelper');
-    expect(defaultOut.text).toMatch(/Location:.*src\/b\.ts:\d+/);
+    expect(defaultOut.text).toContain(
+      `**Location:** ${useHelper.filePath}:${useHelper.startLine}-${useHelper.endLine}`,
+    );
     expect(defaultOut.text).not.toContain('### Trail');
 
     const withRelations = await view({ symbol: 'useHelper', includeRelations: true });
+    const helper = cg.getNodesByName('helper')[0]!;
     expect(withRelations.text).toMatch(/Calls →.*helper.*src\/a\.ts/);
+    expect(withRelations.text).toContain(`${helper.filePath}:${helper.startLine}-${helper.endLine}`);
   });
 
   it('--code includes the symbol body (numbered like Read)', async () => {
@@ -183,9 +190,12 @@ describe('codegraph node (CLI twin of codegraph_node)', () => {
     );
     await cg.sync();
     const out = await view({ symbol: 'helper' });
-    // Multiple definitions → lists every file:line and hints at --code.
+    // Multiple definitions → lists every complete file:start-end range and hints at --code.
     expect(out.text).toMatch(/definitions named "helper"/);
     expect(out.text).toMatch(/--code/);
+    for (const helper of cg.getNodesByName('helper')) {
+      expect(out.text).toContain(`${helper.filePath}:${helper.startLine}-${helper.endLine}`);
+    }
     expect(out.json).toMatchObject({ mode: 'symbol-multi' });
   });
 
