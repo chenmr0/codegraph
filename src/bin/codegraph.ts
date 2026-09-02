@@ -1434,7 +1434,11 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // exact: the argument IS a precise symbol name. The non-exact path goes
+      // FTS-first (prefix matches like TO_STRING_KV crowd out real overloads)
+      // and can fall through to LIKE/fuzzy full-table scans on a miss —
+      // seconds of IO on a multi-GB database.
+      const matches = cg.searchNodes(symbol, { limit: 50, exact: true });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1504,7 +1508,8 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // exact: see callers — the argument IS a precise symbol name.
+      const matches = cg.searchNodes(symbol, { limit: 50, exact: true });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1573,7 +1578,8 @@ program
       const cg = await CodeGraph.open(projectPath);
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      // exact: see callers — the argument IS a precise symbol name.
+      const matches = cg.searchNodes(symbol, { limit: 50, exact: true });
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
