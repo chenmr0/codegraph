@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, buildDefaultIgnore, expandAnchoredNegations } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { cppExtractor } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -6822,6 +6822,99 @@ describe('Nested non-submodule git repos', () => {
     expect(() => ig.ignores('src/app.ts')).not.toThrow();
     expect(ig.ignores('generated/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
+  });
+
+  // ── Whitelist dialect: a ROOT-ANCHORED negation in .codegraphignore may
+  // re-include a path below an excluded parent. Git's spec forbids this (an
+  // excluded parent short-circuits everything below), and `/*` +
+  // `!/hert_bbu/bbu/api/` used to exclude the whole project. CodeGraph
+  // auto-expands such negations into the spec-compliant per-level form, so
+  // the natural whitelist spelling now works — identical to hand-writing
+  // the expansion. ──
+
+  it('whitelist dialect: anchored negation re-includes a nested subtree under /*', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/hert_bbu/bbu/api/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('hert_bbu/bbu/api/api.cpp')).toBe(false); // re-included subtree
+    expect(ig.ignores('hert_bbu/bbu/bbu_other.cpp')).toBe(true); // sibling of api/ excluded
+    expect(ig.ignores('hert_bbu/hert_top.cpp')).toBe(true); // parent-level content excluded
+    expect(ig.ignores('src/main.cpp')).toBe(true);           // everything else excluded
+    expect(ig.ignores('main.cpp')).toBe(true);              // root-level file excluded
+  });
+
+  it('whitelist dialect is equivalent to the hand-written per-level form', () => {
+    // A user who already hand-wrote the spec-compliant expansion keeps the
+    // exact same result — the dialect adds rules, never contradicts them.
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/hert_bbu/\n/hert_bbu/*\n!/hert_bbu/bbu/\n/hert_bbu/bbu/*\n!/hert_bbu/bbu/api/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('hert_bbu/bbu/api/api.cpp')).toBe(false);
+    expect(ig.ignores('hert_bbu/bbu/bbu_other.cpp')).toBe(true);
+    expect(ig.ignores('src/main.cpp')).toBe(true);
+  });
+
+  it('whitelist dialect works through the real filesystem walk', () => {
+    for (const [dir, file] of [
+      ['hert_bbu/bbu/api', 'api.cpp'],
+      ['hert_bbu/bbu', 'other.cpp'],
+      ['src', 'main.cpp'],
+    ] as const) {
+      fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, dir, file), 'int f() { return 0; }\n');
+    }
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/hert_bbu/bbu/api/\n');
+
+    const files = scanDirectory(tempDir);
+
+    expect(files).toContain('hert_bbu/bbu/api/api.cpp');
+    expect(files.every((f) => f !== 'src/main.cpp' && f !== 'hert_bbu/bbu/other.cpp')).toBe(true);
+  });
+
+  it('whitelist dialect: sibling negations share one /*-level exclusion without clobbering each other', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/a/b/\n!/a/c/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('a/b/keep.cpp')).toBe(false);
+    expect(ig.ignores('a/c/keep.cpp')).toBe(false);
+    expect(ig.ignores('a/other.cpp')).toBe(true); // a/ content outside b/ and c/ excluded
+  });
+
+  it('whitelist dialect: a bare-FILE anchored negation re-includes the file itself', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/a/b/c.cpp\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('a/b/c.cpp')).toBe(false); // the named file re-included
+    expect(ig.ignores('a/b/d.cpp')).toBe(true); // its sibling stays excluded
+  });
+
+  it('non-anchored negations keep plain git semantics (dialect does not expand them)', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'generated/\n');
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '!dist/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('dist/')).toBe(false);     // negation still overrides a lower layer
+    expect(ig.ignores('generated/')).toBe(true); // .gitignore rule still applies
+  });
+
+  it('glob negations keep plain git semantics (no expansion, parent still short-circuits)', () => {
+    fs.writeFileSync(path.join(tempDir, '.codegraphignore'), '/*\n!/a/*/keep/\n');
+    const ig = buildDefaultIgnore(tempDir);
+    // `a/` is excluded by /* and a glob negation names no concrete level to
+    // re-include, so stock git semantics leave the whole tree excluded.
+    expect(ig.ignores('a/x/keep/k.cpp')).toBe(true);
+  });
+
+  it('expandAnchoredNegations emits per-level rules and merges shared prefixes', () => {
+    expect(expandAnchoredNegations('/*\n!/hert_bbu/bbu/api/\n')).toEqual([
+      '!/hert_bbu/', '/hert_bbu/*',
+      '!/hert_bbu/bbu/', '/hert_bbu/bbu/*',
+      '!/hert_bbu/bbu/api/',
+    ]);
+    expect(expandAnchoredNegations('!/a/b/\n!/a/c/\n')).toEqual([
+      '!/a/', '/a/*', '!/a/b/', '!/a/c/',
+    ]);
+    expect(expandAnchoredNegations('!/a/b/c.cpp\n')).toEqual([
+      '!/a/', '/a/*', '!/a/b/', '/a/b/*', '!/a/b/c.cpp/', '!/a/b/c.cpp',
+    ]);
+    expect(expandAnchoredNegations('!dist/\n')).toEqual([]);   // not root-anchored
+    expect(expandAnchoredNegations('!/a/*/c/\n')).toEqual([]); // glob — left to git semantics
+    expect(expandAnchoredNegations('')).toEqual([]);
   });
 
   // .codegraphignore with negation (!) in a git repo: git ls-files won't

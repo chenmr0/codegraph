@@ -382,6 +382,104 @@ function readGitignorePatterns(giPath: string): string {
 }
 
 /**
+ * Expand CodeGraph's whitelist dialect for `.codegraphignore`.
+ *
+ * Git's ignore spec deliberately forbids a negation from re-including anything
+ * below an excluded parent ("It is not possible to re-include a file if a
+ * parent directory of that file is excluded"), and the `ignore` matcher
+ * enforces that faithfully — so a gitignore-style `/*` + `!/hert_bbu/bbu/api/`
+ * (index ONLY that nested subtree) excludes everything, api included, because
+ * `/*` already excluded `hert_bbu/`. Users keep reaching for that natural
+ * spelling, so `.codegraphignore` — which only CodeGraph ever reads, so no
+ * other tool's behavior is affected — relaxes it:
+ *
+ * Every negation that is ROOT-ANCHORED (`/`-prefixed) and contains no glob
+ * metacharacters (`*?[]\!`) is auto-expanded into the equivalent explicit
+ * per-level rules the spec allows. `!/a/b/c/` becomes
+ * `!/a/`, `/a/*`, `!/a/b/`, `/a/b/*`, `!/a/b/c/` — byte-identical to what a
+ * user hand-writing the spec-compliant form would put. Targets merge into a
+ * prefix tree so sibling negations sharing a prefix (`!/a/b/`, `!/a/c/`)
+ * get ONE `/*`-level exclusion before both re-includes, instead of one
+ * expansion clobbering the other. Non-anchored negations (`!dist/`) and glob
+ * negations (any `*`, `?`, or bracket class in the path) keep plain git
+ * semantics untouched.
+ *
+ * Cost: a handful of extra rules added once at matcher build (µs); the
+ * matcher runs identically in both enumeration paths (git fast path and
+ * filesystem walk both call buildDefaultIgnore), so behavior stays uniform.
+ * Zero extra rules when no negations are present.
+ *
+ * @param patterns Raw `.codegraphignore` text (as returned by
+ *   {@link readGitignorePatterns} — comments/blank lines are fine).
+ * @returns Lines to append AFTER the original patterns (later rules win in
+ *   gitignore semantics, which is exactly what makes the expansion override
+ *   the `/*` above it). Empty when there is nothing to expand.
+ */
+export function expandAnchoredNegations(patterns: string): string[] {
+  interface PrefixNode {
+    children: Map<string, PrefixNode>;
+    terminal: boolean;
+    // Target was written WITHOUT a trailing slash (`!/a/b/c`) — the rule as
+    // written must also be appended verbatim so a bare FILE named `c` is
+    // re-included, not just a directory (the per-level `!/<path>/` lines all
+    // end in `/` and never match a file path).
+    bare: boolean;
+  }
+
+  // Collect the segment chains of every expandable negation.
+  const targets: Array<{ segments: string[]; isDir: boolean }> = [];
+  for (const rawLine of patterns.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('!') || line.length < 2) continue;
+    const target = line.slice(1);
+    // Only root-anchored, glob-free negations can be expanded into concrete
+    // path levels. Everything else keeps stock git semantics.
+    if (!target.startsWith('/')) continue;
+    if (/[*?[\\!]/.test(target)) continue;
+    const segments = target.split('/').filter(Boolean);
+    if (segments.length === 0) continue;
+    targets.push({ segments, isDir: !target.endsWith('/') ? false : true });
+  }
+  if (targets.length === 0) return [];
+
+  // Merge into a prefix tree so shared levels are emitted once and one
+  // sibling's `/<level>/*` can't clobber another sibling's re-include.
+  const root: PrefixNode = { children: new Map(), terminal: false, bare: false };
+  for (const { segments, isDir } of targets) {
+    let node = root;
+    for (const seg of segments) {
+      let child = node.children.get(seg);
+      if (!child) {
+        child = { children: new Map(), terminal: false, bare: false };
+        node.children.set(seg, child);
+      }
+      node = child;
+    }
+    node.terminal = true;
+    if (!isDir) node.bare = true;
+  }
+
+  // Emit per-level: re-include the directory itself, then — only for
+  // INTERMEDIATE levels — exclude its contents so the chain keeps
+  // descending instead of re-including the whole parent subtree. Terminal
+  // levels get no `/<path>/*`: the target subtree re-includes wholesale.
+  const out: string[] = [];
+  const dfs = (node: PrefixNode, prefix: string[]): void => {
+    for (const [seg, child] of node.children) {
+      const rel = [...prefix, seg].join('/');
+      out.push(`!/${rel}/`);
+      if (child.bare) out.push(`!/${rel}`); // also match a bare FILE at this level
+      if (!child.terminal) {
+        out.push(`/${rel}/*`);
+        dfs(child, [...prefix, seg]);
+      }
+    }
+  };
+  dfs(root, []);
+  return out;
+}
+
+/**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, then
  * merged with `.git/info/exclude` (the repo-local uncommitted exclude file), and
@@ -398,7 +496,15 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   const gitExclude = path.join(rootDir, '.git', 'info', 'exclude');
   if (fs.existsSync(gitExclude)) ig.add(readGitignorePatterns(gitExclude));
   const cgIgnore = path.join(rootDir, '.codegraphignore');
-  if (fs.existsSync(cgIgnore)) ig.add(readGitignorePatterns(cgIgnore));
+  if (fs.existsSync(cgIgnore)) {
+    const cgPatterns = readGitignorePatterns(cgIgnore);
+    ig.add(cgPatterns);
+    // Whitelist dialect: a root-anchored negation may re-include a path below
+    // an excluded parent (git's spec forbids this; `.codegraphignore` allows
+    // it). The expansion appends AFTER the raw patterns so it wins.
+    const expanded = expandAnchoredNegations(cgPatterns);
+    if (expanded.length > 0) ig.add(expanded.join('\n'));
+  }
   return ig;
 }
 
